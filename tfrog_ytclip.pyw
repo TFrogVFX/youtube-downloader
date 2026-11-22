@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.7.0"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -173,11 +173,16 @@ MODELS = {"Standard (fast)": ("std", None, None),
           "AI · anime video": ("esr", "realesr-animevideov3", None),
           "AI · anime stills": ("esr", "realesrgan-x4plus-anime", 4)}
 MODEL_LOAD = "Load own model …"
+# volume curve: how the volume goes from a point to the next one
+EASES = {"Linear": "linear", "Easy ease": "ease", "Ease in": "in", "Ease out": "out", "Hold": "hold"}
 CUSTOM_MODELS_DIR = APP_DIR / "models"
 FONTS_DIR = APP_DIR / "fonts"
 SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
              "bold": True, "pos": None}
-BROWSERS = ["Off", "Firefox", "Chrome", "Edge", "Brave", "Opera", "Vivaldi"]
+COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies) from the app's own sign-in window
+WEB_PROFILE_DIR = APP_DIR / "login_browser"
+LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&hl=en"
+             "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3D%252F")
 UPSCALER_DIR = APP_DIR / "upscaler"
 UPSCALER_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
                 "realesrgan-ncnn-vulkan-20220424-windows.zip")
@@ -605,6 +610,14 @@ def collect_files(info) -> list[str]:
     return [d["filepath"] for d in info.get("requested_downloads") or [] if d.get("filepath")]
 
 
+LOGIN_NOTE: list[str] = []   # set when YouTube says the saved login doesn't work any more (shown once)
+
+
+def _watch_login(msg) -> None:
+    if YDL_EXTRA.get("cookiefile") and re.search(r"cookies are no longer valid|account cookies", str(msg), re.I):
+        LOGIN_NOTE[:] = ["YouTube says your login has expired – sign in again: Settings → YouTube login."]
+
+
 class _Log:
     def __init__(self, emit):
         self.emit = emit
@@ -617,6 +630,7 @@ class _Log:
         self.emit("log", ANSI.sub("", msg))
 
     def warning(self, msg):
+        _watch_login(msg)
         self.emit("log", "WARNING: " + ANSI.sub("", msg))
 
     def error(self, msg):
@@ -693,35 +707,11 @@ def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
     }
 
 
-COOKIE_NOTE: list[str] = []   # set when the browser login could not be read (shown once in the app)
-
-
-def _cookie_problem(ex) -> bool:
-    return type(ex).__name__ == "CookieLoadError" or bool(
-        re.search(r"cookie|dpapi|keyring|decrypt", str(ex), re.I))
-
-
 def ydl_extract(opts, url, download=True):
-    """yt-dlp with the browser login – if the login can't be read (Chrome / Edge lock and encrypt it on Windows),
-    it is switched off for this session and the same thing runs again without it."""
+    """One yt-dlp run (the YouTube login, if any, comes in through YDL_EXTRA -> cookiefile)."""
     from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
-    try:
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=download)
-    except Exception as ex:  # noqa: BLE001
-        if not opts.get("cookiesfrombrowser") or not _cookie_problem(ex):
-            raise
-        name = str(opts["cookiesfrombrowser"][0]).title()
-        YDL_EXTRA.pop("cookiesfrombrowser", None)
-        COOKIE_NOTE[:] = [f"The {name} login could not be read ({clean_error(ex).splitlines()[0][:140]}). "
-                          f"Continuing without it. {name} locks its login while it is open – close it, use Firefox, "
-                          "or set Settings → Browser login to Off."]
-        logger = opts.get("logger")
-        if logger is not None and hasattr(logger, "warning"):
-            logger.warning(COOKIE_NOTE[0])
-        opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"}
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=download)
+    with YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=download)
 
 
 def _suffix(start, end) -> str:
@@ -1161,7 +1151,7 @@ def save_thumbnail(source, dst: Path, *, ffmpeg, info=None, at=0.0) -> Path:
 class _Silent:
     def debug(self, msg): pass
     def info(self, msg): pass
-    def warning(self, msg): pass
+    def warning(self, msg): _watch_login(msg)
     def error(self, msg): pass
 
 
@@ -1739,28 +1729,64 @@ def target_dims(cw, ch, up, aspect=None):
     return out_dims(cw, ch, v, aspect)
 
 
+def _vpts(points):
+    """[t, gain] or [t, gain, ease] -> sorted [(t, gain, ease)]"""
+    return sorted(((float(p[0]), max(0.0, float(p[1])), (p[2] if len(p) > 2 else "linear") or "linear")
+                   for p in points), key=lambda q: q[0])
+
+
+def ease_f(kind, u) -> float:
+    """0..1 -> 0..1 for the curve between two points (Easy ease = slow out of the first point, slow into the next)."""
+    u = min(max(u, 0.0), 1.0)
+    if kind == "ease":
+        return u * u * (3 - 2 * u)
+    if kind == "in":
+        return u * u
+    if kind == "out":
+        return u * (2 - u)
+    if kind == "hold":
+        return 0.0
+    return u
+
+
 def vol_at(points, t) -> float:
-    """Value of the volume curve at time t (1.0 = unchanged)."""
-    pts = sorted(points)
+    """Value of the volume curve at time t (1.0 = unchanged). Each point says how it goes on to the next one."""
+    pts = _vpts(points)
     if not pts:
         return 1.0
     if t <= pts[0][0]:
-        return float(pts[0][1])
-    for (t0, g0), (t1, g1) in zip(pts, pts[1:]):
+        return pts[0][1]
+    for (t0, g0, e0), (t1, g1, _e1) in zip(pts, pts[1:]):
         if t < t1:
-            return float(g0 + (g1 - g0) * (t - t0) / (t1 - t0)) if t1 > t0 else float(g1)
-    return float(pts[-1][1])
+            return g0 + (g1 - g0) * ease_f(e0, (t - t0) / (t1 - t0)) if t1 > t0 else g1
+    return pts[-1][1]
+
+
+def _ease_expr(kind, u) -> str:
+    if kind == "ease":
+        return f"({u})*({u})*(3-2*({u}))"
+    if kind == "in":
+        return f"({u})*({u})"
+    if kind == "out":
+        return f"({u})*(2-({u}))"
+    if kind == "hold":
+        return "0"
+    return f"({u})"
 
 
 def vol_filter(points, offset) -> str:
     """FFmpeg filter for the volume curve; t = 0 is `offset` on the source timeline.
     Small audio frames (256 samples ≈ 5 ms) so the curve is smooth without zipper noise."""
-    pts = sorted((float(t) - offset, max(0.0, float(g))) for t, g in points)
-    if not pts or all(abs(g - 1.0) < 1e-4 for _t, g in pts):
+    pts = [(t - offset, g, e) for t, g, e in _vpts(points)]
+    if not pts or all(abs(g - 1.0) < 1e-4 for _t, g, _e in pts):
         return ""
     expr = f"{pts[-1][1]:.4f}"
-    for (t0, g0), (t1, g1) in reversed(list(zip(pts, pts[1:]))):
-        seg = f"{g1:.4f}" if t1 - t0 < 1e-6 else f"{g0:.4f}+({g1 - g0:.4f})*(t-({t0:.4f}))/{t1 - t0:.4f}"
+    for (t0, g0, e0), (t1, g1, _e1) in reversed(list(zip(pts, pts[1:]))):
+        if t1 - t0 < 1e-6:
+            seg = f"{g1:.4f}"
+        else:
+            u = f"(t-({t0:.4f}))/{t1 - t0:.4f}"
+            seg = f"{g0:.4f}+({g1 - g0:.4f})*{_ease_expr(e0, u)}"
         expr = f"if(lt(t,{t1:.4f}),{seg},{expr})"
     expr = f"if(lt(t,{pts[0][0]:.4f}),{pts[0][1]:.4f},{expr})"
     return f"asetnsamples=n=256:p=0,volume=eval=frame:volume='{expr}'"
@@ -1777,7 +1803,7 @@ def fx_needed(kind, fx) -> bool:
         return False
     if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
         return True
-    if kind in ("mp4", "mp3") and any(abs(float(g) - 1.0) > 1e-4 for _t, g in fx.get("vol") or []):
+    if kind in ("mp4", "mp3") and any(abs(float(p[1]) - 1.0) > 1e-4 for p in fx.get("vol") or []):
         return True
     subs = fx.get("subs") or {}
     return bool(subs.get("cues")) and (subs.get("mode") == "burn" and kind in ("mp4", "gif")
@@ -2564,57 +2590,91 @@ def history_clear() -> None:
     HISTORY_FILE.unlink(missing_ok=True)
 
 
-COOKIE_ERR = re.compile(r"cookie|dpapi|decrypt|keyring|keychain", re.I)
+# ---- YouTube login (own sign-in window -> cookies.txt for yt-dlp)
+
+LOGIN_COOKIES = {"LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "SID"}
 
 
-def cookie_problem(msg) -> bool:
-    """Did yt-dlp fail because the browser login (cookies) couldn't be read?"""
-    return bool(YDL_EXTRA) and bool(COOKIE_ERR.search(msg or ""))
+def write_cookie_file(cookies, path=None) -> int:
+    """cookies: [(domain, path, secure, expires (epoch, 0 = session), name, value, http_only)] -> Netscape cookies.txt
+    with the YouTube cookies only. -> number of cookies written."""
+    path = Path(path or COOKIE_FILE)
+    lines = ["# Netscape HTTP Cookie File", "# YouTube login of the YouTube Downloader – keep it private.", ""]
+    n = 0
+    for dom, cpath, secure, exp, name, value, http_only in cookies:
+        if "youtube.com" not in dom or not name:
+            continue
+        dom = dom if dom.startswith(".") or dom.count(".") < 2 else dom
+        sub = "TRUE" if dom.startswith(".") else "FALSE"
+        pre = "#HttpOnly_" if http_only else ""
+        lines.append("\t".join([pre + dom, sub, cpath or "/", "TRUE" if secure else "FALSE", str(int(exp or 0)),
+                                 name, value]))
+        n += 1
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return n
 
 
-class _CookieLog:
-    def __init__(self):
-        self.warnings: list[str] = []
-
-    def debug(self, *a, **k):
-        pass
-
-    def info(self, *a, **k):
-        pass
-
-    def warning(self, msg, *a, **k):
-        self.warnings.append(ANSI.sub("", str(msg)))
-
-    def error(self, msg, *a, **k):
-        self.warnings.append(ANSI.sub("", str(msg)))
-
-
-def check_browser_login(browser) -> str:
-    """'' if the YouTube login of this browser can be read, else why not."""
-    from yt_dlp.cookies import extract_cookies_from_browser
-    log = _CookieLog()
+def read_cookie_names(path=None) -> set:
+    names = set()
     try:
-        jar = extract_cookies_from_browser(str(browser).lower(), logger=log)
-    except Exception as ex:  # noqa: BLE001
-        msg = clean_error(ex)
-        if re.search(r"could not copy", msg, re.I):
-            return f"{browser} is open and keeps its login locked – close {browser} or use Firefox."
-        return msg.splitlines()[0][:200]
-    names = {c.name for c in jar if "youtube.com" in (c.domain or "")}
-    if not names & {"SAPISID", "__Secure-3PSID", "LOGIN_INFO", "SID", "__Secure-1PSID"}:
-        if any("decrypt" in w.lower() for w in log.warnings):
-            return (f"{browser} encrypts its login so other apps can't read it (since 2024) – use Firefox "
-                    "for the browser login.")
-        return f"No YouTube login found in {browser} – sign in to YouTube there first."
-    return ""
+        for line in Path(path or COOKIE_FILE).read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#") or not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and "youtube.com" in parts[0]:
+                names.add(parts[5])
+    except OSError:
+        pass
+    return names
+
+
+def login_state() -> dict:
+    """{'signed_in': bool, 'since': epoch or None}"""
+    ok = bool(read_cookie_names() & LOGIN_COOKIES)
+    try:
+        since = COOKIE_FILE.stat().st_mtime if ok else None
+    except OSError:
+        since = None
+    return {"signed_in": ok, "since": since}
+
+
+def apply_login() -> bool:
+    """Use the saved YouTube login for every yt-dlp call (or nothing if there is none)."""
+    YDL_EXTRA.pop("cookiefile", None)
+    YDL_EXTRA.pop("cookiesfrombrowser", None)
+    if login_state()["signed_in"]:
+        YDL_EXTRA["cookiefile"] = str(COOKIE_FILE)
+        return True
+    return False
+
+
+def import_cookie_file(src) -> int:
+    """A cookies.txt exported from a browser (e.g. with "Get cookies.txt LOCALLY") -> the app's login."""
+    names = read_cookie_names(src)
+    if not names & LOGIN_COOKIES:
+        raise RuntimeError("No YouTube login in this file – export the cookies while you are signed in on youtube.com.")
+    shutil.copyfile(src, COOKIE_FILE)
+    return len(names)
+
+
+def sign_out() -> None:
+    COOKIE_FILE.unlink(missing_ok=True)
+    YDL_EXTRA.pop("cookiefile", None)
 
 
 def login_hint(msg) -> str:
-    """Extra hint when a site wants a login (Instagram, age-restricted or members-only videos)."""
-    if re.search(r"log ?in|sign in|cookies|rate.?limit|private|members|age", msg or "", re.I) and not YDL_EXTRA:
-        return ("\nTip: this needs a login. Sign in to the site in your browser and turn on "
-                "Settings → Browser login.")
-    return ""
+    """Extra hint when YouTube wants a login (age-restricted or members-only videos) or the login expired."""
+    if not re.search(r"log ?in|sign in|cookies|members[- ]only|age[- ]restricted|confirm your age|inappropriate",
+                     msg or "", re.I):
+        return ""
+    if YDL_EXTRA.get("cookiefile"):
+        return "\nTip: your YouTube login may have expired – Settings → YouTube login → Sign in again."
+    return "\nTip: this video needs a YouTube login – Settings → YouTube login → Sign in."
 
 
 # ----------------------------------------------------------------------------- fonts for burned-in subtitles
@@ -2734,6 +2794,7 @@ def install_app_update(info, script, emit) -> Path:
 # ----------------------------------------------------------------------------- GUI (PySide6)
 
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
+from PySide6.QtNetwork import QNetworkCookie as QtNetworkCookie  # noqa: E402
 from PySide6.QtCore import Qt, Signal  # noqa: E402
 
 try:   # video player (PySide6-Addons); the app works without it
@@ -3764,10 +3825,11 @@ class TabBar(QtWidgets.QWidget):
 
 
 class VolumeLane(QtWidgets.QWidget):
-    """Volume curve over the clip: click to add a point, drag to move, right-click / double-click to delete.
-    100 % = unchanged, up to 200 %."""
+    """Volume curve over the clip: click to add a point, drag to move, right-click / double-click / Del to delete.
+    100 % = unchanged, up to 200 %. Points are [time, gain, ease] – the ease shapes the way to the next point."""
     changed = Signal()
     seek = Signal(float)
+    selected = Signal(object)     # the selected point (list) or None
 
     M = 14
     TOP, BOT = 10, 24
@@ -3778,7 +3840,9 @@ class VolumeLane(QtWidgets.QWidget):
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
-        self.pts: list[list[float]] = []
+        self.pts: list[list] = []
+        self.sel = None
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.lo, self.hi = 0.0, 10.0
         self.play = None
         self._drag = None
@@ -3817,37 +3881,55 @@ class VolumeLane(QtWidgets.QWidget):
         return 1.0 if abs(g - 1.0) < 0.05 else round(g, 3)
 
     def _near(self, pos):
-        for i, (t, g) in enumerate(self.pts):
+        for i, pt in enumerate(self.pts):
+            t, g = pt[0], pt[1]
             if self.lo - 0.001 <= t <= self.hi + 0.001 and abs(self._x(t) - pos.x()) <= 8 and abs(self._y(g) - pos.y()) <= 8:
                 return i
         return None
+
+    def select(self, pt):
+        self.sel = pt
+        self.selected.emit(pt)
+        self.update()
+
+    def delete(self, pt):
+        if pt in self.pts:
+            self.pts.remove(pt)
+        if self.sel is pt:
+            self.select(None)
+        self._drag = None
+        self.changed.emit()
+        self.update()
 
     def mousePressEvent(self, e):
         pos = e.position()
         i = self._near(pos)
         if e.button() == Qt.MouseButton.RightButton:
             if i is not None:
-                self.pts.pop(i)
-                self.changed.emit()
-                self.update()
+                self.delete(self.pts[i])
             return
         if e.button() != Qt.MouseButton.LeftButton:
             return
         if i is None:
-            self.pts.append([round(self._t(pos.x()), 3), self._g(pos.y())])
-            self.pts.sort()
-            i = self._near(pos)
+            pt = [round(self._t(pos.x()), 3), self._g(pos.y()), "linear"]
+            self.pts.append(pt)
+            self.pts.sort(key=lambda q: q[0])
             self.changed.emit()
-        self._drag = self.pts[i] if i is not None else None
-        self.update()
+        else:
+            pt = self.pts[i]
+        self._drag = pt
+        self.select(pt)
 
     def mouseDoubleClickEvent(self, e):
         i = self._near(e.position())
         if i is not None:
-            self.pts.pop(i)
-            self._drag = None
-            self.changed.emit()
-            self.update()
+            self.delete(self.pts[i])
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.sel is not None:
+            self.delete(self.sel)
+            return
+        super().keyPressEvent(e)
 
     def mouseMoveEvent(self, e):
         pos = e.position()
@@ -3855,8 +3937,9 @@ class VolumeLane(QtWidgets.QWidget):
         if self._drag is not None:
             self._drag[0] = round(self._t(pos.x()), 3)
             self._drag[1] = self._g(pos.y())
-            self.pts.sort()
+            self.pts.sort(key=lambda q: q[0])
             self.changed.emit()
+            self.selected.emit(self._drag)
         else:
             self._hover = self._near(pos)
             self.setCursor(Qt.CursorShape.SizeAllCursor if self._hover is not None else Qt.CursorShape.CrossCursor)
@@ -3909,13 +3992,20 @@ class VolumeLane(QtWidgets.QWidget):
         p.setPen(QtGui.QPen(QtGui.QColor(c["accent"]), 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPolyline(poly)
-        for i, (t, g) in enumerate(self.pts):
+        for i, pt in enumerate(self.pts):
+            t, g = pt[0], pt[1]
             if not (self.lo - 0.001 <= t <= self.hi + 0.001):
                 continue
-            big = i == self._hover or self.pts[i] is self._drag
+            big = i == self._hover or pt is self._drag or pt is self.sel
             p.setPen(QtGui.QPen(QtGui.QColor(c["accent"]), 2))
-            p.setBrush(QtGui.QColor(c["text"] if c["dark"] else "#fff"))
-            p.drawEllipse(QtCore.QPointF(self._x(t), self._y(min(2.0, g))), 6 if big else 4.5, 6 if big else 4.5)
+            p.setBrush(QtGui.QColor(c["accent"]) if pt is self.sel else QtGui.QColor(c["text"] if c["dark"] else "#fff"))
+            ctr = QtCore.QPointF(self._x(t), self._y(min(2.0, g)))
+            if len(pt) > 2 and pt[2] not in ("linear", None):     # eased points are drawn as diamonds (like AE)
+                rr = 7 if big else 5.5
+                p.drawPolygon(QtGui.QPolygonF([ctr + QtCore.QPointF(0, -rr), ctr + QtCore.QPointF(rr, 0),
+                                               ctr + QtCore.QPointF(0, rr), ctr + QtCore.QPointF(-rr, 0)]))
+            else:
+                p.drawEllipse(ctr, 6 if big else 4.5, 6 if big else 4.5)
         if self.play is not None and self.lo <= self.play <= self.hi:
             xp = self._x(self.play)
             p.setPen(QtGui.QPen(QtGui.QColor(c["text"]), 1.5))
@@ -3926,9 +4016,9 @@ class VolumeLane(QtWidgets.QWidget):
         p.drawText(QtCore.QPointF(x1 - QtGui.QFontMetrics(fn).horizontalAdvance(t2), self.height() - 7), t2)
         if self._mouse is not None and (self._drag is not None or self._hover is not None or True):
             if self._drag is not None:
-                t, g = self._drag
+                t, g = self._drag[0], self._drag[1]
             elif self._hover is not None:
-                t, g = self.pts[self._hover]
+                t, g = self.pts[self._hover][0], self.pts[self._hover][1]
             else:
                 t, g = self._t(self._mouse.x()), self._g(self._mouse.y())
             lab = f"{fmt_tf(t)} · {g * 100:.0f} %"
@@ -4313,6 +4403,128 @@ class SubsEditor(QtWidgets.QDialog):
             write_srt([tuple(c) for c in self.cues], path)
 
 
+def login_profile(create=True):
+    """The app's own little browser profile for the YouTube sign-in (kept on disk, separate from your browsers)."""
+    app = QtWidgets.QApplication.instance()
+    prof = getattr(app, "_yt_login_profile", None)
+    if prof is None and create:
+        from PySide6.QtWebEngineCore import QWebEngineProfile, qWebEngineChromiumVersion
+        prof = QWebEngineProfile("tfrog_youtube_login", app)
+        WEB_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        prof.setPersistentStoragePath(str(WEB_PROFILE_DIR / "storage"))
+        prof.setCachePath(str(WEB_PROFILE_DIR / "cache"))
+        prof.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        major = (qWebEngineChromiumVersion() or "140").split(".")[0]
+        # a normal Chrome user agent – Google refuses sign-ins from browsers that call themselves "QtWebEngine"
+        prof.setHttpUserAgent(f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                              f"Chrome/{major}.0.0.0 Safari/537.36")
+        app._yt_login_profile = prof
+    return prof
+
+
+class LoginDialog(QtWidgets.QDialog):
+    """Sign in to YouTube inside the app. When YouTube shows you as signed in, the YouTube cookies are saved for
+    yt-dlp (cookies.txt in the app folder) and the window closes."""
+
+    def __init__(self, parent):
+        from PySide6.QtWebEngineCore import QWebEnginePage
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        super().__init__(parent)
+        self.setWindowTitle("Sign in to YouTube")
+        self.resize(560, 760)
+        self.saved = False
+        self.cookies: dict = {}
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(label("Sign in to YouTube", "vtitle"))
+        top.addStretch(1)
+        self.state = label("Sign in with your Google account …", "muted")
+        top.addWidget(self.state)
+        lay.addLayout(top)
+        self.profile = login_profile()
+        self.page = QWebEnginePage(self.profile, self)
+        self.view = QWebEngineView()
+        self.view.setPage(self.page)
+        lay.addWidget(self.view, 1)
+        lay.addWidget(label("The login stays on this PC (in the app folder) and is only sent to YouTube. If Google says "
+                            "this browser isn't supported, use Settings → Load cookies.txt instead.", "hint"))
+        bot = QtWidgets.QHBoxLayout()
+        bot.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.btn_done = QtWidgets.QPushButton("Done")
+        self.btn_done.setObjectName("primary")
+        self.btn_done.setEnabled(False)
+        self.btn_done.clicked.connect(self._finish)
+        bot.addWidget(cancel)
+        bot.addWidget(self.btn_done)
+        lay.addLayout(bot)
+        store = self.profile.cookieStore()
+        store.cookieAdded.connect(self._added)
+        store.cookieRemoved.connect(self._removed)
+        store.loadAllCookies()
+        self.page.urlChanged.connect(lambda _u: self._check())
+        self.page.loadFinished.connect(lambda _ok: self._check())
+        self.view.load(QtCore.QUrl(LOGIN_URL))
+
+    @staticmethod
+    def _key(c):
+        return bytes(c.name()).decode("utf-8", "replace"), c.domain(), c.path()
+
+    def _added(self, c):
+        if "youtube.com" in c.domain():
+            self.cookies[self._key(c)] = QtNetworkCookie(c)
+            self._check()
+
+    def _removed(self, c):
+        self.cookies.pop(self._key(c), None)
+
+    def signed_in(self):
+        return any(k[0] in LOGIN_COOKIES for k in self.cookies)
+
+    def _check(self):
+        on_yt = self.page.url().host().endswith("youtube.com")
+        if self.signed_in():
+            self.btn_done.setEnabled(True)
+            self.state.setText("✓ Signed in")
+            if on_yt and not self.saved:
+                QtCore.QTimer.singleShot(1500, self._finish)
+
+    def _rows(self):
+        out = []
+        for c in self.cookies.values():
+            exp = c.expirationDate()
+            out.append((c.domain(), c.path() or "/", c.isSecure(),
+                        int(exp.toSecsSinceEpoch()) if exp.isValid() else 0,
+                        bytes(c.name()).decode("utf-8", "replace"), bytes(c.value()).decode("utf-8", "replace"),
+                        c.isHttpOnly()))
+        return out
+
+    def _finish(self):
+        if self.saved or not self.signed_in():
+            return
+        try:
+            write_cookie_file(self._rows())
+        except OSError as ex:
+            self.state.setText(f"✕ Could not save the login: {ex}")
+            return
+        self.saved = True
+        self.accept()
+
+    def done(self, r):
+        try:
+            store = self.profile.cookieStore()
+            store.cookieAdded.disconnect(self._added)
+            store.cookieRemoved.disconnect(self._removed)
+        except (RuntimeError, TypeError):
+            pass
+        self.view.setPage(None)
+        self.page.deleteLater()
+        super().done(r)
+
+
 class ChaptersDialog(QtWidgets.QDialog):
     """Pick chapters -> they become clips."""
 
@@ -4536,22 +4748,25 @@ class SettingsDialog(QtWidgets.QDialog):
             self.cb_pv.setEnabled(False)
             self.cb_pv.setText("Video preview not available (run the setup again)")
         right.addSpacing(4)
-        right.addWidget(section("Browser login"))
-        br = QtWidgets.QHBoxLayout()
-        self.cb_browser = QtWidgets.QComboBox()
-        self.cb_browser.addItems(BROWSERS)
-        self.cb_browser.setCurrentText(parent.cfg.get("browser", "Off"))
-        self.cb_browser.setCursor(Qt.CursorShape.PointingHandCursor)
-        tip(self.cb_browser, "Browser login",
-            "Uses your YouTube login from this browser – needed for age-restricted or members-only videos. Sign in to "
-            "YouTube in that browser first. Firefox works best; Chrome / Edge sometimes refuse while they are open.")
-        self.cb_browser.currentTextChanged.connect(self._browser_changed)
-        br.addWidget(label("Use the login from", "field"))
-        br.addWidget(self.cb_browser, 1)
-        right.addLayout(br)
-        self.lbl_login = label("Only needed for age-restricted or members-only videos.", "hint")
+        right.addWidget(section("YouTube login"))
+        self.lbl_login = label("", "muted")
         self.lbl_login.setWordWrap(True)
         right.addWidget(self.lbl_login)
+        lr = QtWidgets.QHBoxLayout()
+        lr.setSpacing(6)
+        self.btn_login = QtWidgets.QPushButton()
+        self.btn_login.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_login.clicked.connect(self._login_clicked)
+        self.btn_cookies = tip(QtWidgets.QPushButton("Load cookies.txt …"), "Load cookies.txt",
+                               "Alternative if Google doesn't let you sign in here: export your YouTube cookies from "
+                               "your browser (e.g. with the extension “Get cookies.txt LOCALLY”) and load the file.")
+        self.btn_cookies.setObjectName("ghost")
+        self.btn_cookies.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cookies.clicked.connect(self._load_cookies)
+        lr.addWidget(self.btn_login)
+        lr.addWidget(self.btn_cookies)
+        lr.addStretch(1)
+        right.addLayout(lr)
         right.addSpacing(4)
         right.addWidget(section("AI upscaler"))
         self.lbl_esr = label("", "muted")
@@ -4598,23 +4813,49 @@ class SettingsDialog(QtWidgets.QDialog):
         outer.addLayout(bot)
         self._sync()
 
-    def _browser_changed(self, name):
-        self.main._set_browser(name)
+    def show_login_state(self):
+        st = login_state()
+        waiting = getattr(self.main, "_login_proc", None) is not None
+        self.btn_login.setEnabled(not waiting)
+        self.btn_cookies.setEnabled(not waiting)
+        if waiting:
+            self.lbl_login.setText("The sign-in window is open – sign in with your Google account there.")
+            self.btn_login.setText("Signing in …")
+            return
+        if st["signed_in"]:
+            when = time.strftime("%d.%m.%Y", time.localtime(st["since"])) if st["since"] else ""
+            self.lbl_login.setText(f"✓ Signed in to YouTube{' (since ' + when + ')' if when else ''}. Used for every "
+                                   "download – needed for age-restricted or members-only videos.")
+            self.btn_login.setText("Sign out")
+            tip(self.btn_login, "Sign out", "Removes the YouTube login from this app.")
+        else:
+            self.lbl_login.setText("Not signed in. Only needed for age-restricted or members-only videos – "
+                                   "your login stays on this PC.")
+            self.btn_login.setText("Sign in to YouTube …")
+            tip(self.btn_login, "Sign in", "Opens a small browser window: sign in with your Google account, the app "
+                                           "keeps the login for YouTube. Note: YouTube can limit accounts that are "
+                                           "used with download tools – a second account is the safe choice.")
+
+    def _login_clicked(self):
+        if login_state()["signed_in"]:
+            self.main._sign_out()
+        else:
+            self.main._sign_in()
         self.show_login_state()
 
-    def show_login_state(self):
-        name = self.cb_browser.currentText()
-        prob = getattr(self.main, "login_problem", "")
-        if name == "Off":
-            txt, st = "Only needed for age-restricted or members-only videos.", ""
-        elif prob:
-            txt, st = prob.replace(f"Browser login ({name}) doesn't work: ", "✕ ") + "  Not used right now.", "error"
-        elif YDL_EXTRA:
-            txt, st = f"Checking / using your YouTube login from {name}. Firefox works best.", ""
-        else:
-            txt, st = "Not used.", ""
-        self.lbl_login.setText(txt)
-        set_state(self.lbl_login, st)
+    def _load_cookies(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load cookies.txt", str(Path.home() / "Downloads"),
+                                                        "Cookies (*.txt);;All files (*.*)")
+        if not path:
+            return
+        try:
+            import_cookie_file(path)
+        except Exception as ex:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "YouTube login", clean_error(ex))
+            return
+        apply_login()
+        self.main._on_log("✓ YouTube login loaded from a cookies file.")
+        self.show_login_state()
 
     def refresh_esr(self):
         busy = self.main._esr_job is not None
@@ -4754,7 +4995,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sub_req = 0
         self.lines_dlg = None
         self._esr_job = None
-        self._set_browser(self.cfg.get("browser", "Off"), save=False)
+        self._login_noted = False
+        apply_login()
+        self.cfg.pop("browser", None)
         st = self.cfg.get("sub_style") if isinstance(self.cfg.get("sub_style"), dict) else {}
         self.sub_style = {**SUB_STYLE, **{k: v for k, v in st.items() if k in SUB_STYLE}}
         if self.sub_style.get("pos"):
@@ -5352,16 +5595,54 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lane.set_points(self.vol_pts)
         self.lane.changed.connect(self._vol_changed)
         self.lane.seek.connect(lambda t: self._seek_to(t) if self._has_media() else None)
-        tip(self.lane, "Volume curve", "Shows the clip you are editing. Click to add a point, drag it, right-click "
-                                       "or double-click to remove it. The middle line is 100 % (unchanged).")
+        tip(self.lane, "Volume curve", "Shows the clip you are editing. Click to add a point, drag it, right-click, "
+                                       "double-click or Del removes it. The middle line is 100 % (unchanged). "
+                                       "Click a point to type its time, value and curve below.")
+        self.lane.selected.connect(self._vol_selected)
         v.addWidget(self.lane)
+        pr = QtWidgets.QHBoxLayout()
+        pr.setSpacing(6)
+        self.lbl_pt = label("Point", "field")
+        self.ed_pt_t = tip(QtWidgets.QLineEdit(), "Time of the point",
+                           "Type a timecode and press Enter: 1:31.24 · 1:02:03.50 · 90s.")
+        self.ed_pt_t.setObjectName("time")
+        self.ed_pt_t.setFixedWidth(100)
+        self.ed_pt_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ed_pt_t.returnPressed.connect(self._vol_time_entered)
+        self.ed_pt_t.editingFinished.connect(self._vol_time_entered)
+        self.ed_pt_t.textEdited.connect(lambda _t: set_state(self.ed_pt_t, ""))
+        self.ed_pt_g = tip(QtWidgets.QLineEdit(), "Volume of the point", "0 – 200 %, 100 = unchanged.")
+        self.ed_pt_g.setObjectName("time")
+        self.ed_pt_g.setFixedWidth(58)
+        self.ed_pt_g.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ed_pt_g.returnPressed.connect(self._vol_gain_entered)
+        self.ed_pt_g.editingFinished.connect(self._vol_gain_entered)
+        self.ed_pt_g.textEdited.connect(lambda _t: set_state(self.ed_pt_g, ""))
+        self.cb_ease = self._combo(EASES, "Curve to the next point",
+                                   "Linear: straight line. Easy ease: starts and ends softly (like After Effects F9). "
+                                   "Ease in / out: soft at the start / end only. Hold: stays, then jumps.")
+        self.cb_ease.currentTextChanged.connect(self._vol_ease_picked)
+        self.btn_pt_del = tip(QtWidgets.QPushButton("✕"), "Delete point", "Or press Del in the curve.")
+        self.btn_pt_del.setObjectName("mini")
+        self.btn_pt_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pt_del.clicked.connect(lambda: self.lane.delete(self.lane.sel) if self.lane.sel is not None else None)
+        pr.addWidget(self.lbl_pt)
+        pr.addWidget(self.ed_pt_t)
+        pr.addWidget(self.ed_pt_g)
+        pr.addWidget(label("%", "field"))
+        pr.addWidget(self.cb_ease, 1)
+        pr.addWidget(self.btn_pt_del)
+        v.addLayout(pr)
+        self._vol_selected(None)
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(6)
         for txt, fn, title, text in (
                 ("+ Point here", self._vol_point, "Point at the playhead", "Adds a point at the current preview "
                                                                            "position (with the current volume)."),
-                ("Fade in", lambda: self._vol_fade(True), "Fade in", "Sound comes up over the first second of the clip."),
-                ("Fade out", lambda: self._vol_fade(False), "Fade out", "Sound goes down over the last second."),
+                ("Fade in", lambda: self._vol_fade(True), "Fade in", "Sound comes up over the first second of the clip "
+                                                                     "(Easy ease – change it per point)."),
+                ("Fade out", lambda: self._vol_fade(False), "Fade out", "Sound goes down over the last second "
+                                                                        "(Easy ease)."),
                 ("Reset", self._vol_reset, "Reset", "Removes the whole curve (100 % everywhere).")):
             b = tip(QtWidgets.QPushButton(txt), title, text)
             b.setObjectName("chip")
@@ -5696,7 +5977,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _badges(self):
         mode = self.seg.value()
         self.tabs.set_badge("frame", bool(self._aspect()))
-        self.tabs.set_badge("volume", mode in ("mp4", "mp3") and any(abs(g - 1) > 1e-4 for _t, g in self.vol_pts))
+        self.tabs.set_badge("volume", mode in ("mp4", "mp3") and any(abs(q[1] - 1) > 1e-4 for q in self.vol_pts))
         self.tabs.set_badge("subs", bool(self.sub_cues) and (self.seg_submode.value() != "none" or self.cb_srt.isChecked()))
 
     # ------------------------------------------------------------------ volume tab
@@ -5710,8 +5991,8 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self.seg.value()
         self.lane.setEnabled(mode != "gif")
         self.vol_hint.setText("GIFs have no sound." if mode == "gif" else
-                              "Click the line to add points, drag them up or down. In the preview you hear the "
-                              "curve up to 100 %.")
+                              "Click the line to add points and drag them; click a point to type its exact time, "
+                              "value and curve. In the preview you hear the curve up to 100 %.")
 
     def _vol_changed(self):
         self._badges()
@@ -5725,9 +6006,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if rng:
             t = min(max(t, rng[0]), rng[1])
         g = vol_at(self.vol_pts, t)
-        self.vol_pts[:] = [q for q in self.vol_pts if abs(q[0] - t) > 0.01] + [[round(t, 3), round(g, 3)]]
-        self.vol_pts.sort()
-        self.lane.update()
+        pt = [round(t, 3), round(g, 3), "linear"]
+        self.vol_pts[:] = [q for q in self.vol_pts if abs(q[0] - t) > 0.01] + [pt]
+        self.vol_pts.sort(key=lambda q: q[0])
+        self.lane.select(pt)
         self._vol_changed()
 
     def _vol_fade(self, fade_in):
@@ -5738,13 +6020,89 @@ class MainWindow(QtWidgets.QMainWindow):
         d = min(1.0, (e - s) / 3)
         a, b = (s, s + d) if fade_in else (e - d, e)
         ga, gb = (0.0, vol_at(self.vol_pts, b) or 1.0) if fade_in else (vol_at(self.vol_pts, a) or 1.0, 0.0)
-        self.vol_pts[:] = [q for q in self.vol_pts if not (a - 0.001 <= q[0] <= b + 0.001)] + [[a, ga], [b, gb]]
-        self.vol_pts.sort()
-        self.lane.update()
+        nxt = "linear"
+        self.vol_pts[:] = [q for q in self.vol_pts if not (a - 0.001 <= q[0] <= b + 0.001)] + \
+            [[a, ga, "ease"], [b, gb, nxt]]
+        self.vol_pts.sort(key=lambda q: q[0])
+        self.lane.select(None)
         self._vol_changed()
 
     def _vol_reset(self):
         self.vol_pts.clear()
+        self.lane.select(None)
+        self._vol_changed()
+
+    def _vol_selected(self, pt):
+        on = pt is not None
+        for w_ in (self.lbl_pt, self.ed_pt_t, self.ed_pt_g, self.cb_ease, self.btn_pt_del):
+            w_.setEnabled(on)
+        if not on:
+            for ed in (self.ed_pt_t, self.ed_pt_g):
+                ed.clear()
+            self.ed_pt_t.setPlaceholderText("click a point")
+            return
+        if not self.ed_pt_t.hasFocus():
+            self.ed_pt_t.setText(fmt_tc(pt[0]))
+            set_state(self.ed_pt_t, "")
+        if not self.ed_pt_g.hasFocus():
+            self.ed_pt_g.setText(f"{pt[1] * 100:.0f}")
+            set_state(self.ed_pt_g, "")
+        ease = pt[2] if len(pt) > 2 else "linear"
+        label_ = next((k for k, v_ in EASES.items() if v_ == ease), "Linear")
+        self.cb_ease.blockSignals(True)
+        self.cb_ease.setCurrentText(label_)
+        self.cb_ease.blockSignals(False)
+
+    def _vol_time_entered(self):
+        pt = self.lane.sel
+        if pt is None:
+            return
+        try:
+            t = parse_time(self.ed_pt_t.text())
+            if t is None:
+                raise ValueError
+        except ValueError:
+            set_state(self.ed_pt_t, "error")
+            return
+        dur = self._duration()
+        if dur:
+            t = min(t, dur)
+        if abs(t - pt[0]) < 1e-4:
+            return
+        pt[0] = round(t, 3)
+        self.vol_pts.sort(key=lambda q: q[0])
+        lo, hi = self.lane.lo, self.lane.hi
+        if not lo <= t <= hi and dur:          # point is outside the clip -> show the whole video
+            self.lane.set_range(0, dur)
+        self.ed_pt_t.setText(fmt_tc(pt[0]))
+        set_state(self.ed_pt_t, "")
+        self.lane.update()
+        self._vol_changed()
+
+    def _vol_gain_entered(self):
+        pt = self.lane.sel
+        if pt is None:
+            return
+        try:
+            g = float(self.ed_pt_g.text().replace(",", ".").replace("%", "").strip()) / 100
+        except ValueError:
+            set_state(self.ed_pt_g, "error")
+            return
+        g = min(max(g, 0.0), 2.0)
+        if abs(g - pt[1]) < 1e-4:
+            return
+        pt[1] = round(g, 4)
+        self.ed_pt_g.setText(f"{g * 100:.0f}")
+        self.lane.update()
+        self._vol_changed()
+
+    def _vol_ease_picked(self, label_):
+        pt = self.lane.sel
+        if pt is None:
+            return
+        while len(pt) < 3:
+            pt.append("linear")
+        pt[2] = EASES.get(label_, "linear")
         self.lane.update()
         self._vol_changed()
 
@@ -6009,52 +6367,58 @@ class MainWindow(QtWidgets.QMainWindow):
         if job:
             job()
 
-    def _set_browser(self, name, save=True):
-        name = name if name in BROWSERS else "Off"
-        YDL_EXTRA.clear()
-        COOKIE_NOTE.clear()
-        self.login_problem = ""
-        if name != "Off":
-            YDL_EXTRA["cookiesfrombrowser"] = (name.lower(),)
+    def _login_cmd(self):
+        return [sys.executable, str(Path(__file__).resolve()), "--yt-login"]
 
-            def work():
-                try:
-                    self.emit("cookie", (name, check_browser_login(name)))
-                except Exception as ex:  # noqa: BLE001
-                    self.emit("cookie", (name, clean_error(ex)))
-            threading.Thread(target=work, daemon=True).start()
-        self.cfg["browser"] = name
-        if save:
-            save_cfg(self.cfg)
-
-    def _on_login_failed(self, msg):
-        if not YDL_EXTRA:
-            name = self.cfg.get("browser", "browser")
-            self.login_problem = f"Browser login ({name}) doesn't work: {msg.splitlines()[0][:160]}"
-            self._on_log(f"WARNING: {self.login_problem} – continuing without login.")
-
-    def _on_cookie(self, val):
-        name, msg = val
-        if self.cfg.get("browser") != name:
+    def _sign_in(self):
+        """Opens the sign-in window as its own little process and waits for it (the app stays usable)."""
+        if getattr(self, "_login_proc", None) is not None:
             return
-        if msg:
-            self._drop_login(f"Browser login ({name}) doesn't work: {msg}")
+        proc = QtCore.QProcess(self)
+        cmd = self._login_cmd()
+        proc.setProgram(cmd[0])
+        proc.setArguments(cmd[1:])
+        proc.setWorkingDirectory(str(Path(__file__).resolve().parent))
+        proc.finished.connect(lambda code, _st: self._login_finished(code))
+        proc.errorOccurred.connect(lambda _e: self._login_finished(-1) if proc.state() ==
+                                   QtCore.QProcess.ProcessState.NotRunning else None)
+        self._login_proc = proc
+        self._on_status("Sign-in window open – sign in with your Google account …")
+        proc.start()
+        self._login_state_changed()
+
+    def _login_finished(self, code):
+        proc, self._login_proc = getattr(self, "_login_proc", None), None
+        if proc is None:
+            return
+        err = bytes(proc.readAllStandardError()).decode("utf-8", "replace").strip()
+        proc.deleteLater()
+        if code == 0 and apply_login():
+            LOGIN_NOTE.clear()
+            self._login_noted = False
+            self._on_log("✓ Signed in to YouTube – the login is used for every download.")
+            self._on_status("✓  Signed in to YouTube.")
+            set_state(self.status, "ok")
+        elif code == 1:
+            self._on_status("Sign-in cancelled.")
         else:
-            self._on_log(f"Browser login: using your YouTube login from {name}.")
+            if err:
+                self._on_log("Sign-in window: " + err[-600:])
+            self._on_error("The sign-in window didn't work on this PC. Use Settings → YouTube login → "
+                           "Load cookies.txt instead.")
+        self._login_state_changed()
+
+    def _login_state_changed(self):
         dlg = getattr(self, "settings_dlg", None)
         if dlg is not None:
             dlg.show_login_state()
 
-    def _drop_login(self, why):
-        """The browser login breaks yt-dlp -> work without it (for this session) and say why."""
-        if not YDL_EXTRA:
-            return
-        YDL_EXTRA.clear()
-        self.login_problem = why
-        self._on_log(f"WARNING: {why} – continuing without login.")
-        if not self.busy:
-            self.status.setText(f"⚠  {why.splitlines()[0][:150]} – continuing without login.")
-            set_state(self.status, "error")
+    def _sign_out(self):
+        sign_out()
+        shutil.rmtree(WEB_PROFILE_DIR, ignore_errors=True)     # next sign-in starts fresh (another account possible)
+        self._on_log("Signed out of YouTube.")
+        self._on_status("Signed out of YouTube.")
+        self._login_state_changed()
 
     def _fx(self, mode):
         """Crop / size / volume / subtitles for export_multi (None if nothing is switched on)."""
@@ -6294,7 +6658,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_button_text()
         self.btn_chapters.hide()
         self.vol_pts.clear()
-        self.lane.update()
+        self.lane.select(None)
         self._sub_req += 1
         self._fill_subs([])
         self.box = None
@@ -6352,15 +6716,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def work():
             try:
                 self.update_done.wait()
-                try:
-                    info = fetch_info(url)
-                except Exception as ex:  # noqa: BLE001
-                    msg = clean_error(ex)
-                    if not cookie_problem(msg):
-                        raise
-                    self.emit("login_failed", msg)
-                    YDL_EXTRA.clear()
-                    info = fetch_info(url)
+                info = fetch_info(url)
                 data = None
                 if info.get("thumb"):
                     try:
@@ -6712,10 +7068,6 @@ class MainWindow(QtWidgets.QMainWindow):
         req, msg = val
         if req != self._req:
             return
-        if cookie_problem(msg):
-            self._drop_login(f"Browser login ({self.cfg.get('browser')}) doesn't work")
-            self._pv_state = "offer"
-            return self._load_preview()
         self._pv_state = "error"
         self.thumb.set_overlay("▶  Preview failed – click to try again")
         self._on_log("Preview: " + msg)
@@ -7116,18 +7468,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _dispatch(self, kind, val):
         getattr(self, f"_on_{kind}")(val)
-        if COOKIE_NOTE and not self.login_problem:      # yt-dlp switched the browser login off by itself
-            self.login_problem = COOKIE_NOTE[0]
-            self._on_log("WARNING: " + COOKIE_NOTE[0])
+        if LOGIN_NOTE and not self._login_noted:
+            self._login_noted = True
+            self._on_log("WARNING: " + LOGIN_NOTE[0])
             if not self.busy:
-                self.status.setText("⚠  " + COOKIE_NOTE[0][:200])
+                self.status.setText("⚠  " + LOGIN_NOTE[0])
                 set_state(self.status, "error")
-            dlg = getattr(self, "settings_dlg", None)
-            if dlg is not None:
-                dlg.show_login_state()
 
     def _on_log(self, msg):
         self.log.appendPlainText(str(msg).rstrip())
+        if YDL_EXTRA.get("cookiefile") and re.search(r"no longer valid|likely been rotated", str(msg), re.I) \
+                and not getattr(self, "_login_warned", False):
+            self._login_warned = True
+            self.status.setText("⚠  Your YouTube login has expired – Settings → YouTube login → Sign out, then sign in "
+                                "again.")
+            set_state(self.status, "error")
 
     def _on_status(self, text):
         set_state(self.status, "")
@@ -7431,10 +7786,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.emit("error", "yt-dlp is not installed – please run the setup again.")
         except Exception as ex:  # noqa: BLE001
             msg = clean_error(ex)
-            if cookie_problem(msg):
-                YDL_EXTRA.clear()
-                self.emit("error", "The browser login couldn't be read – it is off for now. Please try again.\n" + msg)
-                return
             self.emit("error", msg + login_hint(msg))
 
     def _save_thumb_now(self):
@@ -7675,11 +8026,42 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, lambda: os._exit(0))
 
 
+def run_login_window() -> int:
+    """`tfrog_ytclip.pyw --yt-login`: only the sign-in window, in its own process (the browser engine and the
+    video player don't share one process well). Exit code 0 = signed in and saved."""
+    QtCore.QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+    app = QtWidgets.QApplication(sys.argv[:1])
+    app.setApplicationName(APP + " – sign in")
+    app.setStyle("Fusion")
+    font = QtGui.QFont()
+    font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter", "Helvetica Neue", "Arial"])
+    font.setPointSize(10)
+    app.setFont(font)
+    icon = Path(__file__).with_name("icon.ico")
+    if icon.exists():
+        app.setWindowIcon(QtGui.QIcon(str(icon)))
+    cfg = load_cfg()
+    theme = cfg.get("theme") if cfg.get("theme") in THEMES else DEFAULT_THEME
+    app.setStyleSheet(build_qss(theme_colors(theme, cfg.get("accent") or DEFAULT_ACCENT)))
+    try:
+        dlg = LoginDialog(None)
+    except Exception as ex:  # noqa: BLE001
+        print(f"Sign-in window not available: {ex}", file=sys.stderr)
+        return 3
+    dlg.show()
+    set_dark_titlebar(dlg, THEMES[theme]["dark"])
+    dlg.raise_()
+    dlg.activateWindow()
+    return 0 if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and dlg.saved else 1
+
+
 def main():
+    login_mode = "--yt-login" in sys.argv[1:]
     if sys.stdout is None or sys.stderr is None:  # pythonw has no console -> write to a log file
         try:
             APP_DIR.mkdir(parents=True, exist_ok=True)
-            sink = open(APP_DIR / "last_run.log", "w", encoding="utf-8", buffering=1)
+            sink = open(APP_DIR / ("login_run.log" if login_mode else "last_run.log"), "w", encoding="utf-8",
+                        buffering=1)
         except OSError:
             sink = open(os.devnull, "w")
         sys.stdout = sys.stdout or sink
@@ -7690,6 +8072,8 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
+    if login_mode:
+        sys.exit(run_login_window())
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setOrganizationName("tfrog")

@@ -394,6 +394,14 @@ def collect_files(info) -> list[str]:
     return [d["filepath"] for d in info.get("requested_downloads") or [] if d.get("filepath")]
 
 
+LOGIN_NOTE: list[str] = []   # set when YouTube says the saved login doesn't work any more (shown once)
+
+
+def _watch_login(msg) -> None:
+    if YDL_EXTRA.get("cookiefile") and re.search(r"cookies are no longer valid|account cookies", str(msg), re.I):
+        LOGIN_NOTE[:] = ["YouTube says your login has expired – sign in again: Settings → YouTube login."]
+
+
 class _Log:
     def __init__(self, emit):
         self.emit = emit
@@ -406,6 +414,7 @@ class _Log:
         self.emit("log", ANSI.sub("", msg))
 
     def warning(self, msg):
+        _watch_login(msg)
         self.emit("log", "WARNING: " + ANSI.sub("", msg))
 
     def error(self, msg):
@@ -482,35 +491,11 @@ def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
     }
 
 
-COOKIE_NOTE: list[str] = []   # set when the browser login could not be read (shown once in the app)
-
-
-def _cookie_problem(ex) -> bool:
-    return type(ex).__name__ == "CookieLoadError" or bool(
-        re.search(r"cookie|dpapi|keyring|decrypt", str(ex), re.I))
-
-
 def ydl_extract(opts, url, download=True):
-    """yt-dlp with the browser login – if the login can't be read (Chrome / Edge lock and encrypt it on Windows),
-    it is switched off for this session and the same thing runs again without it."""
+    """One yt-dlp run (the YouTube login, if any, comes in through YDL_EXTRA -> cookiefile)."""
     from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
-    try:
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=download)
-    except Exception as ex:  # noqa: BLE001
-        if not opts.get("cookiesfrombrowser") or not _cookie_problem(ex):
-            raise
-        name = str(opts["cookiesfrombrowser"][0]).title()
-        YDL_EXTRA.pop("cookiesfrombrowser", None)
-        COOKIE_NOTE[:] = [f"The {name} login could not be read ({clean_error(ex).splitlines()[0][:140]}). "
-                          f"Continuing without it. {name} locks its login while it is open – close it, use Firefox, "
-                          "or set Settings → Browser login to Off."]
-        logger = opts.get("logger")
-        if logger is not None and hasattr(logger, "warning"):
-            logger.warning(COOKIE_NOTE[0])
-        opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"}
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=download)
+    with YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=download)
 
 
 def _suffix(start, end) -> str:
@@ -950,7 +935,7 @@ def save_thumbnail(source, dst: Path, *, ffmpeg, info=None, at=0.0) -> Path:
 class _Silent:
     def debug(self, msg): pass
     def info(self, msg): pass
-    def warning(self, msg): pass
+    def warning(self, msg): _watch_login(msg)
     def error(self, msg): pass
 
 

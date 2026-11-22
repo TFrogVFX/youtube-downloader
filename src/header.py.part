@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.7.0"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -173,11 +173,16 @@ MODELS = {"Standard (fast)": ("std", None, None),
           "AI · anime video": ("esr", "realesr-animevideov3", None),
           "AI · anime stills": ("esr", "realesrgan-x4plus-anime", 4)}
 MODEL_LOAD = "Load own model …"
+# volume curve: how the volume goes from a point to the next one
+EASES = {"Linear": "linear", "Easy ease": "ease", "Ease in": "in", "Ease out": "out", "Hold": "hold"}
 CUSTOM_MODELS_DIR = APP_DIR / "models"
 FONTS_DIR = APP_DIR / "fonts"
 SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
              "bold": True, "pos": None}
-BROWSERS = ["Off", "Firefox", "Chrome", "Edge", "Brave", "Opera", "Vivaldi"]
+COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies) from the app's own sign-in window
+WEB_PROFILE_DIR = APP_DIR / "login_browser"
+LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&hl=en"
+             "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3D%252F")
 UPSCALER_DIR = APP_DIR / "upscaler"
 UPSCALER_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
                 "realesrgan-ncnn-vulkan-20220424-windows.zip")

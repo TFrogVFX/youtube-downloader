@@ -53,28 +53,64 @@ def target_dims(cw, ch, up, aspect=None):
     return out_dims(cw, ch, v, aspect)
 
 
+def _vpts(points):
+    """[t, gain] or [t, gain, ease] -> sorted [(t, gain, ease)]"""
+    return sorted(((float(p[0]), max(0.0, float(p[1])), (p[2] if len(p) > 2 else "linear") or "linear")
+                   for p in points), key=lambda q: q[0])
+
+
+def ease_f(kind, u) -> float:
+    """0..1 -> 0..1 for the curve between two points (Easy ease = slow out of the first point, slow into the next)."""
+    u = min(max(u, 0.0), 1.0)
+    if kind == "ease":
+        return u * u * (3 - 2 * u)
+    if kind == "in":
+        return u * u
+    if kind == "out":
+        return u * (2 - u)
+    if kind == "hold":
+        return 0.0
+    return u
+
+
 def vol_at(points, t) -> float:
-    """Value of the volume curve at time t (1.0 = unchanged)."""
-    pts = sorted(points)
+    """Value of the volume curve at time t (1.0 = unchanged). Each point says how it goes on to the next one."""
+    pts = _vpts(points)
     if not pts:
         return 1.0
     if t <= pts[0][0]:
-        return float(pts[0][1])
-    for (t0, g0), (t1, g1) in zip(pts, pts[1:]):
+        return pts[0][1]
+    for (t0, g0, e0), (t1, g1, _e1) in zip(pts, pts[1:]):
         if t < t1:
-            return float(g0 + (g1 - g0) * (t - t0) / (t1 - t0)) if t1 > t0 else float(g1)
-    return float(pts[-1][1])
+            return g0 + (g1 - g0) * ease_f(e0, (t - t0) / (t1 - t0)) if t1 > t0 else g1
+    return pts[-1][1]
+
+
+def _ease_expr(kind, u) -> str:
+    if kind == "ease":
+        return f"({u})*({u})*(3-2*({u}))"
+    if kind == "in":
+        return f"({u})*({u})"
+    if kind == "out":
+        return f"({u})*(2-({u}))"
+    if kind == "hold":
+        return "0"
+    return f"({u})"
 
 
 def vol_filter(points, offset) -> str:
     """FFmpeg filter for the volume curve; t = 0 is `offset` on the source timeline.
     Small audio frames (256 samples ≈ 5 ms) so the curve is smooth without zipper noise."""
-    pts = sorted((float(t) - offset, max(0.0, float(g))) for t, g in points)
-    if not pts or all(abs(g - 1.0) < 1e-4 for _t, g in pts):
+    pts = [(t - offset, g, e) for t, g, e in _vpts(points)]
+    if not pts or all(abs(g - 1.0) < 1e-4 for _t, g, _e in pts):
         return ""
     expr = f"{pts[-1][1]:.4f}"
-    for (t0, g0), (t1, g1) in reversed(list(zip(pts, pts[1:]))):
-        seg = f"{g1:.4f}" if t1 - t0 < 1e-6 else f"{g0:.4f}+({g1 - g0:.4f})*(t-({t0:.4f}))/{t1 - t0:.4f}"
+    for (t0, g0, e0), (t1, g1, _e1) in reversed(list(zip(pts, pts[1:]))):
+        if t1 - t0 < 1e-6:
+            seg = f"{g1:.4f}"
+        else:
+            u = f"(t-({t0:.4f}))/{t1 - t0:.4f}"
+            seg = f"{g0:.4f}+({g1 - g0:.4f})*{_ease_expr(e0, u)}"
         expr = f"if(lt(t,{t1:.4f}),{seg},{expr})"
     expr = f"if(lt(t,{pts[0][0]:.4f}),{pts[0][1]:.4f},{expr})"
     return f"asetnsamples=n=256:p=0,volume=eval=frame:volume='{expr}'"
@@ -91,7 +127,7 @@ def fx_needed(kind, fx) -> bool:
         return False
     if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
         return True
-    if kind in ("mp4", "mp3") and any(abs(float(g) - 1.0) > 1e-4 for _t, g in fx.get("vol") or []):
+    if kind in ("mp4", "mp3") and any(abs(float(p[1]) - 1.0) > 1e-4 for p in fx.get("vol") or []):
         return True
     subs = fx.get("subs") or {}
     return bool(subs.get("cues")) and (subs.get("mode") == "burn" and kind in ("mp4", "gif")
@@ -878,57 +914,91 @@ def history_clear() -> None:
     HISTORY_FILE.unlink(missing_ok=True)
 
 
-COOKIE_ERR = re.compile(r"cookie|dpapi|decrypt|keyring|keychain", re.I)
+# ---- YouTube login (own sign-in window -> cookies.txt for yt-dlp)
+
+LOGIN_COOKIES = {"LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "SID"}
 
 
-def cookie_problem(msg) -> bool:
-    """Did yt-dlp fail because the browser login (cookies) couldn't be read?"""
-    return bool(YDL_EXTRA) and bool(COOKIE_ERR.search(msg or ""))
+def write_cookie_file(cookies, path=None) -> int:
+    """cookies: [(domain, path, secure, expires (epoch, 0 = session), name, value, http_only)] -> Netscape cookies.txt
+    with the YouTube cookies only. -> number of cookies written."""
+    path = Path(path or COOKIE_FILE)
+    lines = ["# Netscape HTTP Cookie File", "# YouTube login of the YouTube Downloader – keep it private.", ""]
+    n = 0
+    for dom, cpath, secure, exp, name, value, http_only in cookies:
+        if "youtube.com" not in dom or not name:
+            continue
+        dom = dom if dom.startswith(".") or dom.count(".") < 2 else dom
+        sub = "TRUE" if dom.startswith(".") else "FALSE"
+        pre = "#HttpOnly_" if http_only else ""
+        lines.append("\t".join([pre + dom, sub, cpath or "/", "TRUE" if secure else "FALSE", str(int(exp or 0)),
+                                 name, value]))
+        n += 1
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return n
 
 
-class _CookieLog:
-    def __init__(self):
-        self.warnings: list[str] = []
-
-    def debug(self, *a, **k):
-        pass
-
-    def info(self, *a, **k):
-        pass
-
-    def warning(self, msg, *a, **k):
-        self.warnings.append(ANSI.sub("", str(msg)))
-
-    def error(self, msg, *a, **k):
-        self.warnings.append(ANSI.sub("", str(msg)))
-
-
-def check_browser_login(browser) -> str:
-    """'' if the YouTube login of this browser can be read, else why not."""
-    from yt_dlp.cookies import extract_cookies_from_browser
-    log = _CookieLog()
+def read_cookie_names(path=None) -> set:
+    names = set()
     try:
-        jar = extract_cookies_from_browser(str(browser).lower(), logger=log)
-    except Exception as ex:  # noqa: BLE001
-        msg = clean_error(ex)
-        if re.search(r"could not copy", msg, re.I):
-            return f"{browser} is open and keeps its login locked – close {browser} or use Firefox."
-        return msg.splitlines()[0][:200]
-    names = {c.name for c in jar if "youtube.com" in (c.domain or "")}
-    if not names & {"SAPISID", "__Secure-3PSID", "LOGIN_INFO", "SID", "__Secure-1PSID"}:
-        if any("decrypt" in w.lower() for w in log.warnings):
-            return (f"{browser} encrypts its login so other apps can't read it (since 2024) – use Firefox "
-                    "for the browser login.")
-        return f"No YouTube login found in {browser} – sign in to YouTube there first."
-    return ""
+        for line in Path(path or COOKIE_FILE).read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#") or not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and "youtube.com" in parts[0]:
+                names.add(parts[5])
+    except OSError:
+        pass
+    return names
+
+
+def login_state() -> dict:
+    """{'signed_in': bool, 'since': epoch or None}"""
+    ok = bool(read_cookie_names() & LOGIN_COOKIES)
+    try:
+        since = COOKIE_FILE.stat().st_mtime if ok else None
+    except OSError:
+        since = None
+    return {"signed_in": ok, "since": since}
+
+
+def apply_login() -> bool:
+    """Use the saved YouTube login for every yt-dlp call (or nothing if there is none)."""
+    YDL_EXTRA.pop("cookiefile", None)
+    YDL_EXTRA.pop("cookiesfrombrowser", None)
+    if login_state()["signed_in"]:
+        YDL_EXTRA["cookiefile"] = str(COOKIE_FILE)
+        return True
+    return False
+
+
+def import_cookie_file(src) -> int:
+    """A cookies.txt exported from a browser (e.g. with "Get cookies.txt LOCALLY") -> the app's login."""
+    names = read_cookie_names(src)
+    if not names & LOGIN_COOKIES:
+        raise RuntimeError("No YouTube login in this file – export the cookies while you are signed in on youtube.com.")
+    shutil.copyfile(src, COOKIE_FILE)
+    return len(names)
+
+
+def sign_out() -> None:
+    COOKIE_FILE.unlink(missing_ok=True)
+    YDL_EXTRA.pop("cookiefile", None)
 
 
 def login_hint(msg) -> str:
-    """Extra hint when a site wants a login (Instagram, age-restricted or members-only videos)."""
-    if re.search(r"log ?in|sign in|cookies|rate.?limit|private|members|age", msg or "", re.I) and not YDL_EXTRA:
-        return ("\nTip: this needs a login. Sign in to the site in your browser and turn on "
-                "Settings → Browser login.")
-    return ""
+    """Extra hint when YouTube wants a login (age-restricted or members-only videos) or the login expired."""
+    if not re.search(r"log ?in|sign in|cookies|members[- ]only|age[- ]restricted|confirm your age|inappropriate",
+                     msg or "", re.I):
+        return ""
+    if YDL_EXTRA.get("cookiefile"):
+        return "\nTip: your YouTube login may have expired – Settings → YouTube login → Sign in again."
+    return "\nTip: this video needs a YouTube login – Settings → YouTube login → Sign in."
 
 
 # ----------------------------------------------------------------------------- fonts for burned-in subtitles

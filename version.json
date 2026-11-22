@@ -1,8 +1,8 @@
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "5d781e0b129e16878396ae1d1df3ba725fb51c4f1202dd0d8579984836885374",
-  "notes": "Faster subtitle editing (also with thousands of lines). Browser login that can't be read (Chrome/Edge) is switched off by itself instead of breaking previews and downloads. Smaller preview copies for long videos, preview errors are shown.",
+  "sha256": "25bbc9bef8e760bca838a17ce72978e948f09cdbc3423ed6191a6ff24ce8b060",
+  "notes": "YouTube login inside the app (Settings → YouTube login → Sign in) instead of reading Chrome/Firefox. Volume curve: click a point to type its exact time and value and choose its curve (Easy ease, Ease in/out, Hold).",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
