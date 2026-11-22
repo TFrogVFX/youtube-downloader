@@ -1,0 +1,14 @@
+{
+  "version": "2.6.0",
+  "file": "tfrog_ytclip.pyw",
+  "sha256": "dd19002936ce05d3ee6a33cda5519d85e3f79cf8e31f01345cd330726a5898d7",
+  "notes": "Edit subtitles, own fonts and colors, place subtitles anywhere. Upscaling moved to Output with own models. Update button. YouTube only.",
+  "pip": [
+    "yt-dlp[default]",
+    "PySide6-Essentials",
+    "PySide6-Addons"
+  ],
+  "extra": [
+    "icon.ico"
+  ]
+}

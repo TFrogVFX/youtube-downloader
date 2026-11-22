@@ -1,0 +1,1005 @@
+
+
+# ----------------------------------------------------------------------------- crop / size / volume / subtitles
+
+def _even(x) -> int:
+    return max(2, int(round(float(x) / 2.0)) * 2)
+
+
+def crop_rect(box, W, H, aspect):
+    """box: (x, y, w, h) as fractions of the frame -> (cw, ch, cx, cy) in pixels with exactly this aspect."""
+    aw, ah = aspect
+    x, y, w, h = box if box else (0.0, 0.0, 1.0, 1.0)
+    cw = max(16.0, w * W, h * H * aw / ah)   # the box was drawn on the (smaller) preview -> don't lose a pixel
+    ch = cw * ah / aw
+    if ch > H:
+        ch, cw = H, H * aw / ah
+    if cw > W:
+        cw, ch = W, W * ah / aw
+    cw, ch = min(_even(cw), W - W % 2), min(_even(ch), H - H % 2)
+    if box is None:   # centered
+        cx, cy = (W - cw) // 2, (H - ch) // 2
+    else:
+        cx = min(max(0, int(round(x * W))), W - cw)
+        cy = min(max(0, int(round(y * H))), H - ch)
+    return cw, ch, cx, cy
+
+
+def center_box(aspect, W, H):
+    """Biggest centered box with this aspect, as fractions."""
+    cw, ch, cx, cy = crop_rect(None, W, H, aspect)
+    return (cx / W, cy / H, cw / W, ch / H)
+
+
+def out_dims(cw, ch, short, aspect=None):
+    """Size of the result: the crop itself, or scaled so that the short side is `short` px
+    (with a crop format the exact ratio of the format, e.g. 1080 × 1920 for 9:16)."""
+    if not short:
+        return _even(cw), _even(ch)
+    if aspect:
+        cw, ch = aspect
+    if cw <= ch:
+        return _even(short), _even(short * ch / cw)
+    return _even(short * cw / ch), _even(short)
+
+
+def target_dims(cw, ch, up, aspect=None):
+    """Size of the result for an upscale setting: None (keep), ("x", factor) or ("short", px)."""
+    if not up:
+        return _even(cw), _even(ch)
+    kind, v = up
+    if kind == "x":
+        return _even(cw * v), _even(ch * v)
+    return out_dims(cw, ch, v, aspect)
+
+
+def vol_at(points, t) -> float:
+    """Value of the volume curve at time t (1.0 = unchanged)."""
+    pts = sorted(points)
+    if not pts:
+        return 1.0
+    if t <= pts[0][0]:
+        return float(pts[0][1])
+    for (t0, g0), (t1, g1) in zip(pts, pts[1:]):
+        if t < t1:
+            return float(g0 + (g1 - g0) * (t - t0) / (t1 - t0)) if t1 > t0 else float(g1)
+    return float(pts[-1][1])
+
+
+def vol_filter(points, offset) -> str:
+    """FFmpeg filter for the volume curve; t = 0 is `offset` on the source timeline.
+    Small audio frames (256 samples ≈ 5 ms) so the curve is smooth without zipper noise."""
+    pts = sorted((float(t) - offset, max(0.0, float(g))) for t, g in points)
+    if not pts or all(abs(g - 1.0) < 1e-4 for _t, g in pts):
+        return ""
+    expr = f"{pts[-1][1]:.4f}"
+    for (t0, g0), (t1, g1) in reversed(list(zip(pts, pts[1:]))):
+        seg = f"{g1:.4f}" if t1 - t0 < 1e-6 else f"{g0:.4f}+({g1 - g0:.4f})*(t-({t0:.4f}))/{t1 - t0:.4f}"
+        expr = f"if(lt(t,{t1:.4f}),{seg},{expr})"
+    expr = f"if(lt(t,{pts[0][0]:.4f}),{pts[0][1]:.4f},{expr})"
+    return f"asetnsamples=n=256:p=0,volume=eval=frame:volume='{expr}'"
+
+
+def clip_file_name(base, k, label="") -> str:
+    lab = safe_name(label)[:60].strip() if label else ""
+    return f"{base}_{k + 1:02d}" + (f" {lab}" if lab else "")
+
+
+def fx_needed(kind, fx) -> bool:
+    """Does this export need the extra encode step (crop, size, volume curve, subtitles in the picture)?"""
+    if not fx:
+        return False
+    if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
+        return True
+    if kind in ("mp4", "mp3") and any(abs(float(g) - 1.0) > 1e-4 for _t, g in fx.get("vol") or []):
+        return True
+    subs = fx.get("subs") or {}
+    return bool(subs.get("cues")) and (subs.get("mode") == "burn" and kind in ("mp4", "gif")
+                                       or subs.get("mode") == "track" and kind == "mp4")
+
+
+# ---- subtitles
+
+_TS = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?")
+_TAG = re.compile(r"<[^>]*>")
+
+
+def _ts(text) -> float:
+    m = _TS.search(text)
+    if not m:
+        raise ValueError(text)
+    h, mi, s, ms = m.groups()
+    return int(h or 0) * 3600 + int(mi) * 60 + int(s) + (int((ms or "0").ljust(3, "0")) / 1000)
+
+
+def _clean_text(t) -> str:
+    import html
+    t = html.unescape(_TAG.sub("", t)).replace("​", "")
+    return "\n".join(x.strip() for x in t.splitlines() if x.strip())
+
+
+def parse_srt_vtt(text):
+    """SRT or WebVTT -> [(start, end, text)]. Rolling YouTube auto captions (each line repeated in the next
+    cue) are reduced to the new lines."""
+    cues, prev = [], []
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+    for block in re.split(r"\n\s*\n", text):
+        lines = block.strip("\n").split("\n")
+        idx = next((i for i, x in enumerate(lines) if "-->" in x), None)
+        if idx is None:
+            continue
+        a, b = lines[idx].split("-->", 1)
+        try:
+            s, e = _ts(a), _ts(b.strip().split(" ")[0])
+        except ValueError:
+            continue
+        body = [x for x in _clean_text("\n".join(lines[idx + 1:])).split("\n") if x]
+        new = [x for x in body if x not in prev]
+        prev = body
+        if not new or e <= s:
+            continue
+        cues.append([s, e, "\n".join(new)])
+    return _tidy_cues(cues)
+
+
+def parse_json3(data):
+    import json as _json
+    d = _json.loads(data) if isinstance(data, (str, bytes)) else data
+    cues = []
+    for ev in d.get("events") or []:
+        if ev.get("aAppend") or not ev.get("segs"):
+            continue
+        txt = _clean_text("".join(s.get("utf8", "") for s in ev["segs"]))
+        if not txt:
+            continue
+        s = ev.get("tStartMs", 0) / 1000
+        e = s + (ev.get("dDurationMs") or 2000) / 1000
+        cues.append([s, e, txt])
+    return _tidy_cues(cues)
+
+
+def parse_ass(text):
+    cues, fmt = [], None
+    for line in text.replace("\r", "").splitlines():
+        if line.startswith("Format:") and fmt is None:
+            fmt = [x.strip().lower() for x in line[7:].split(",")]
+        elif line.startswith("Dialogue:"):
+            f = fmt or ["layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"]
+            parts = line[9:].split(",", len(f) - 1)
+            try:
+                s, e = _ts(parts[f.index("start")]), _ts(parts[f.index("end")])
+            except (ValueError, IndexError):
+                continue
+            txt = re.sub(r"\{[^}]*\}", "", parts[-1]).replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
+            txt = _clean_text(txt)
+            if txt and e > s:
+                cues.append([s, e, txt])
+    return _tidy_cues(cues)
+
+
+def parse_subs(data, ext="") -> list:
+    if isinstance(data, bytes):
+        data = data.decode("utf-8-sig", errors="replace")
+    ext = ext.lower().lstrip(".")
+    if ext == "json3" or data.lstrip().startswith("{"):
+        return parse_json3(data)
+    if ext in ("ass", "ssa") or "[Script Info]" in data[:200]:
+        return parse_ass(data)
+    return parse_srt_vtt(data)
+
+
+def _tidy_cues(cues):
+    """Sorted, no overlaps (one line after the other), at least 0.2 s each."""
+    cues = sorted(([float(s), float(e), t] for s, e, t in cues), key=lambda c: c[0])
+    out = []
+    for i, c in enumerate(cues):
+        if i + 1 < len(cues) and cues[i + 1][0] > c[0]:
+            c[1] = min(c[1], cues[i + 1][0])
+        if c[1] - c[0] >= 0.05:
+            out.append((round(c[0], 3), round(c[1], 3), c[2]))
+    return out
+
+
+def cue_at(cues, t):
+    for s, e, txt in cues:
+        if s <= t < e:
+            return txt
+        if s > t:
+            break
+    return ""
+
+
+def _srt_ts(t) -> str:
+    ms = int(round(max(0.0, t) * 1000))
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+
+def write_srt(cues, dst) -> Path:
+    lines = []
+    for i, (s, e, txt) in enumerate(cues, 1):
+        lines += [str(i), f"{_srt_ts(s)} --> {_srt_ts(e)}", txt, ""]
+    Path(dst).write_text("\n".join(lines), encoding="utf-8")
+    return Path(dst)
+
+
+def map_cues(cues, segs):
+    """Cues of the source timeline -> cues of the result. segs: [(start, end, offset_in_result)]."""
+    out = []
+    for s0, e0, off in segs:
+        for s, e, txt in cues:
+            if e <= s0 or s >= e0:
+                continue
+            a, b = max(s, s0) - s0 + off, min(e, e0) - s0 + off
+            if b - a >= 0.05:
+                out.append((a, b, txt))
+    return out
+
+
+def _ass_color(hexcol, alpha=0) -> str:
+    c = str(hexcol or "#ffffff").lstrip("#")
+    c = (c + "ffffff")[:6]
+    return f"&H{alpha:02X}{c[4:6]}{c[2:4]}{c[0:2]}".upper()
+
+
+def sub_layout(w, h, style=None):
+    """Font size, outline and position of the subtitles for a w × h picture (same for preview and export).
+    -> (font px, outline px, anchor x, anchor y) – the anchor is the bottom center of the text."""
+    st = {**SUB_STYLE, **(style or {})}
+    fs = max(8.0, min(w, h) * 0.055 * float(st.get("size") or 100) / 100)
+    pos = st.get("pos")
+    if pos:
+        ax, ay = pos[0] * w, pos[1] * h
+    else:
+        ax, ay = w / 2, h * (1 - (0.17 if h > w * 1.2 else 0.06))
+    return fs, max(1.5, fs * 0.075), ax, ay
+
+
+def write_ass(cues, dst, w, h, style=None) -> Path:
+    """Burned-in subtitles in the chosen font, size, colors and position (default: bottom center, on tall
+    9:16 videos a bit higher so TikTok / Reels / Shorts buttons don't cover them)."""
+    def ts(t):
+        cs = int(round(max(0.0, t) * 100))
+        return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+    st = {**SUB_STYLE, **(style or {})}
+    fs, ol, ax, ay = sub_layout(w, h, st)
+    fs = round(fs)
+    mv = round(h - ay)
+    ml = round(w * 0.07)
+    font = str(st.get("font") or "Arial").replace(",", " ")
+    bold = -1 if st.get("bold") else 0
+    pos = f"{{\\an2\\pos({ax:.0f},{ay:.0f})}}" if st.get("pos") else ""
+    head = ("[Script Info]\nScriptType: v4.00+\nWrapStyle: 0\nScaledBorderAndShadow: yes\n"
+            f"PlayResX: {w}\nPlayResY: {h}\n\n[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+            "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            f"Style: Default,{font},{fs},{_ass_color(st.get('color'))},{_ass_color(st.get('color'))},"
+            f"{_ass_color(st.get('outline'))},{_ass_color(st.get('outline'), 0x64)},{bold},0,0,0,100,100,0,0,1,"
+            f"{ol:.1f},{max(0.0, fs * 0.03):.1f},2,{ml},{ml},{mv},1\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    ev = []
+    for s, e, txt in cues:
+        t = txt.replace("{", "(").replace("}", ")").replace("\n", "\\N")
+        ev.append(f"Dialogue: 0,{ts(s)},{ts(e)},Default,,0,0,0,,{pos}{t}")
+    Path(dst).write_text(head + "\n".join(ev) + "\n", encoding="utf-8")
+    return Path(dst)
+
+
+_ISO2 = {"en": "eng", "de": "ger", "fr": "fre", "es": "spa", "it": "ita", "ja": "jpn", "ko": "kor", "zh": "chi",
+         "pt": "por", "ru": "rus", "nl": "dut", "pl": "pol", "tr": "tur", "ar": "ara", "hi": "hin", "sv": "swe"}
+
+
+def _iso639_2(lang) -> str:
+    code = str(lang or "").split("-")[0].lower()
+    return _ISO2.get(code, code if len(code) == 3 else "und")
+
+
+def _lang_name(code) -> str:
+    names = {"en": "English", "de": "German", "fr": "French", "es": "Spanish", "it": "Italian", "ja": "Japanese",
+             "ko": "Korean", "zh": "Chinese", "pt": "Portuguese", "ru": "Russian", "nl": "Dutch", "pl": "Polish",
+             "tr": "Turkish", "ar": "Arabic", "hi": "Hindi", "sv": "Swedish", "id": "Indonesian", "vi": "Vietnamese"}
+    base = str(code).split("-")[0].lower()
+    return names.get(base, str(code))
+
+
+def list_subs(info) -> list:
+    """Subtitles of a video for the menu: the real ones first, then the automatic ones (original language,
+    English and German translations)."""
+    out = []
+    for key, fmts in (info.get("subtitles") or {}).items():
+        if key == "live_chat" or not fmts:
+            continue
+        name = next((f.get("name") for f in fmts if f.get("name")), "") or _lang_name(key)
+        out.append({"label": name, "kind": "yt", "key": key})
+    auto = info.get("automatic_captions") or {}
+    orig = [k for k in auto if k.endswith("-orig")]
+    lang = info.get("language")
+    seen = set()
+    for key in orig + ([lang] if lang in auto else []):
+        base = key.replace("-orig", "")
+        if base in seen:
+            continue
+        seen.add(base)
+        out.append({"label": f"{_lang_name(base)} (automatic)", "kind": "yt-auto", "key": key})
+    for key in ("en", "de"):
+        if key in auto and key not in seen:
+            seen.add(key)
+            out.append({"label": f"{_lang_name(key)} (automatic, translated)", "kind": "yt-auto", "key": key})
+    return out
+
+
+def sidecar_subs(path) -> list:
+    """Subtitle files next to a video: movie.srt, movie.en.srt, movie.de.vtt …"""
+    p = Path(path)
+    out = []
+    try:
+        for f in sorted(p.parent.iterdir()):
+            if f.suffix.lower() in (".srt", ".vtt", ".ass", ".ssa") and f.name.lower().startswith(p.stem.lower()):
+                out.append({"label": f"{f.name} (file next to the video)", "kind": "file", "key": str(f)})
+    except OSError:
+        pass
+    return out
+
+
+def fetch_subs(url, item, ffmpeg=None) -> list:
+    """Loads one entry of list_subs / local_info['subs'] (or a file) -> cues."""
+    kind, key = item.get("kind"), item.get("key")
+    if kind == "file":
+        p = Path(key)
+        return parse_subs(p.read_bytes(), p.suffix)
+    if kind == "embedded":
+        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(url), "-map", f"0:s:{key}",
+                            "-f", "srt", "-"], capture_output=True, timeout=180, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("Could not read the subtitles: " + r.stderr.decode("utf-8", "replace").strip()[-200:])
+        return parse_srt_vtt(r.stdout.decode("utf-8", "replace"))
+    import tempfile
+    from yt_dlp import YoutubeDL
+    with tempfile.TemporaryDirectory(prefix="ytclip_subs_") as td:
+        opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+                "writesubtitles": kind == "yt", "writeautomaticsub": kind == "yt-auto",
+                "subtitleslangs": [key], "subtitlesformat": "json3/srt/vtt/best",
+                "outtmpl": str(Path(td) / "subs.%(ext)s"), "logger": _Silent(), **YDL_EXTRA}
+        with YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+        files = [f for f in Path(td).iterdir() if f.is_file()]
+        if not files:
+            raise RuntimeError("These subtitles could not be downloaded.")
+        f = files[0]
+        return parse_subs(f.read_bytes(), f.suffix)
+
+
+def save_srts(files, clips, cues, join) -> list:
+    """.srt next to the results (times of the result). files: the media files in clip order."""
+    out = []
+    if not cues or not files:
+        return out
+    groups = [list(range(len(clips)))] if join else [[k] for k in range(len(clips))]
+    for f, g in zip(files, groups):
+        segs, off = [], 0.0
+        for k in g:
+            s, e = clips[k][0], clips[k][1]
+            segs.append((s, e, off))
+            off += e - s
+        mapped = map_cues(cues, segs)
+        if mapped:
+            out.append(write_srt(mapped, Path(f).with_suffix(".srt")))
+    return out
+
+
+# ---- the export with effects
+
+def _clip_names(outdir, name, labels, join, ext, base):
+    if join:
+        return [name or unique_name(outdir, base, ext)]
+    return [unique_name(outdir, clip_file_name(name or base, k, labels[k]), ext) for k in range(len(labels))]
+
+
+def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx, ffmpeg, ffprobe, emit, info=None):
+    """Clips -> pieces in a good intermediate quality -> crop / scale (AI upscale) / volume curve / subtitles
+    in one more encode. join: all clips in one file, else one file per clip."""
+    n = len(clips)
+    ext = _kind_ext(kind, params)
+    base = safe_name((info or {}).get("title") or Path(str(src)).stem or "clip")
+    names = _clip_names(outdir, name, labels, join, ext, base)
+    groups = [list(range(n))] if join else [[k] for k in range(n)]
+    aspect = fx.get("aspect") if kind in ("mp4", "gif") else None
+    boxes = list(fx.get("boxes") or []) + [None] * n
+    subs = fx.get("subs") or {}
+    cues = subs.get("cues") or []
+    mode = subs.get("mode") if cues else None
+    if kind == "mp3":
+        mode = None
+    elif kind == "gif" and mode == "track":
+        mode = "burn"
+    vol = fx.get("vol") or []
+    model = fx.get("model") or {"kind": "std"}
+    steps = n + len(groups)
+    step = [0]
+
+    def sub(label):
+        e = _sub_emit(emit, step[0], steps, label)
+        step[0] += 1
+        return e
+
+    tmp = (Path(outdir) / f".ytclip_fx_{os.getpid()}_{int(time.time() * 1000) % 100000}").resolve()
+    tmp.mkdir(parents=True, exist_ok=True)
+    results = []
+    try:
+        pieces = []
+        for k, (s, e) in enumerate(clips):
+            pieces.append(_piece(kind, src, s, e, tmp, k, local, params, ffmpeg, ffprobe,
+                                 sub(f"Clip {k + 1}/{n}" if n > 1 else "Clip")))
+        for gi, g in enumerate(groups):
+            gemit = sub("Saving" if len(groups) == 1 else f"File {gi + 1}/{len(groups)}")
+            dst = Path(outdir) / (names[gi] + ext)
+            ps = [pieces[k] for k in g]
+            infos = [media_info(p, ffprobe) for p in ps]
+            afx = [vol_filter(vol, clips[k][0]) if kind in ("mp4", "mp3") else "" for k in g]
+            if kind == "mp3":
+                cover = None
+                if params["afmt"] in ("mp3", "m4a"):
+                    try:
+                        at = clips[g[0]][0] + min(1.0, (clips[g[0]][1] - clips[g[0]][0]) / 2)
+                        cover = save_thumbnail(src if not local else str(src), tmp / f"cover{gi}.jpg", ffmpeg=ffmpeg,
+                                               info=info, at=at)
+                    except Exception:  # noqa: BLE001
+                        cover = None
+                results.append(join_audio(ps, dst, afmt=params["afmt"], kbps=params["kbps"], ffmpeg=ffmpeg,
+                                          ffprobe=ffprobe, emit=gemit, title=dst.stem, cover=cover, afx=afx,
+                                          label="Saving"))
+                continue
+            # picture: crop per clip, one output size for the file
+            crops = []
+            for k, inf in zip(g, infos):
+                crops.append(crop_rect(boxes[k], inf["width"], inf["height"], aspect) if aspect else None)
+            cw, ch = (crops[0][0], crops[0][1]) if aspect else (infos[0]["width"], infos[0]["height"])
+            W, H = target_dims(cw, ch, fx.get("up") if kind == "mp4" else None, aspect)
+            if kind == "mp4" and model.get("kind") == "esr" and W > cw * 1.05:
+                for j, (p, cr) in enumerate(zip(ps, crops)):
+                    ps[j] = ai_upscale_video(p, cr, (W, H), model, tmp, f"{gi}_{j}", ffmpeg=ffmpeg,
+                                             ffprobe=ffprobe, emit=gemit)
+                    crops[j] = None
+                infos = [media_info(p, ffprobe) for p in ps]
+            segs, off = [], 0.0
+            for k, inf in zip(g, infos):
+                segs.append((clips[k][0], clips[k][1], off))
+                off += inf["vdur"]
+            mapped = map_cues(cues, segs) if mode else []
+            post_vf, track = "", None
+            if mode == "burn" and mapped:
+                style = subs.get("style") or {}
+                write_ass(mapped, tmp / f"subs{gi}.ass", W, H, style)
+                fdir = tmp / "fonts"
+                n_fonts = collect_fonts(style, fdir)
+                post_vf = f"ass=subs{gi}.ass" + (":fontsdir=fonts" if n_fonts else "")
+            elif mode == "track" and mapped:
+                track = write_srt(mapped, tmp / f"subs{gi}.srt").name
+            if kind == "mp4":
+                codec, profile = params["codec"], params["profile"]
+                enc = check_encoder(params["encoder"], ffmpeg, emit, codec)
+                total = sum(inf["vdur"] for inf in infos)
+                vargs, aargs = encode_args(enc, params["size"], params["target_mb"], total, codec, profile)
+                results.append(join_video(ps, dst, vargs=vargs, aargs=aargs, ffmpeg=ffmpeg, ffprobe=ffprobe,
+                                          emit=gemit, crops=crops, size=(W, H), afx=afx, post_vf=post_vf,
+                                          sub_track=track, sub_lang=subs.get("lang"), cwd=str(tmp),
+                                          label="Saving", infos=infos))
+            else:  # GIF: clean intermediate with crop + subtitles, then the usual palette
+                mid = tmp / f"gif{gi}.mp4"
+                join_video(ps, mid, vargs=["-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-pix_fmt",
+                                           "yuv420p"], aargs=[], ffmpeg=ffmpeg, ffprobe=ffprobe, emit=gemit,
+                           audio=False, crops=crops, size=(W, H), post_vf=post_vf, cwd=str(tmp), infos=infos)
+                dur = media_info(mid, ffprobe)["duration"]
+                results.append(gif_encode(mid, dst, None, None, dur, params["width"], params["fps"], params["colors"],
+                                          ffmpeg, gemit))
+        return results
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------- AI upscaler (Real-ESRGAN)
+
+def upscaler_exe() -> Path | None:
+    for name in ("realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan"):
+        p = UPSCALER_DIR / name
+        if p.is_file() and (UPSCALER_DIR / "models").is_dir():
+            return p
+    return None
+
+
+def install_upscaler(progress=None) -> Path:
+    """Downloads Real-ESRGAN (ncnn / Vulkan – runs on NVIDIA, AMD and Intel graphics, no CUDA needed)."""
+    import hashlib
+    import urllib.request
+    import zipfile
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    zpath = APP_DIR / "upscaler_download.zip"
+    h = hashlib.sha256()
+    req = urllib.request.Request(UPSCALER_URL, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(zpath, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0) or UPSCALER_MB * 1048576
+            done = 0
+            while True:
+                chunk = r.read(1 << 18)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(min(99.0, done / total * 100))
+        if h.hexdigest() != UPSCALER_SHA256:
+            raise RuntimeError("The download is damaged (checksum does not match) – please try again.")
+        tmp = UPSCALER_DIR.with_name("upscaler_new")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        with zipfile.ZipFile(zpath) as z:
+            for m in z.infolist():
+                nm = m.filename.replace("\\", "/")
+                if nm.endswith("/") or ".." in nm:
+                    continue
+                if nm.startswith("models/") or nm.lower().endswith((".exe", ".dll")):
+                    out = tmp / nm
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(m) as src, open(out, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
+        os.replace(tmp, UPSCALER_DIR)
+    finally:
+        zpath.unlink(missing_ok=True)
+    if progress:
+        progress(100.0)
+    exe = upscaler_exe()
+    if not exe:
+        raise RuntimeError("The upscaler could not be installed.")
+    return exe
+
+
+def remove_upscaler() -> None:
+    shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
+
+
+def list_custom_models() -> list:
+    """Own models: [{'name', 'scale'}] (files: CUSTOM_MODELS_DIR/<name>.param + .bin)."""
+    try:
+        items = json.loads((CUSTOM_MODELS_DIR / "models.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [x for x in items if isinstance(x, dict) and (CUSTOM_MODELS_DIR / f"{x.get('name')}.param").is_file()
+            and (CUSTOM_MODELS_DIR / f"{x.get('name')}.bin").is_file()]
+
+
+def import_model(param_path, scale=None) -> dict:
+    """Copies an ncnn model (.param + .bin next to it) into the app. The scale is read from the name
+    (4x-UltraSharp, RealESRGAN_x2plus …) if not given, else 4."""
+    src = Path(param_path)
+    if src.suffix.lower() == ".bin":
+        src = src.with_suffix(".param")
+    binf = src.with_suffix(".bin")
+    if not src.is_file() or not binf.is_file():
+        raise RuntimeError("A model needs two files with the same name: NAME.param and NAME.bin.")
+    head = src.read_text(encoding="utf-8", errors="replace")[:200]
+    if not head.strip().startswith("7767517"):
+        raise RuntimeError("This is not an ncnn model (.param). Real-ESRGAN needs ncnn models, not .pth / .onnx.")
+    name = re.sub(r"[^\w.+-]+", "-", src.stem).strip("-") or "model"
+    if "realesr-animevideov3" in name or name in {m[1] for m in MODELS.values()}:
+        name += "-own"
+    if not scale:
+        m = re.search(r"(?i)(?:^|[^a-z0-9])(?:x([1-8])|([1-8])x)(?=[^a-z0-9]|plus|$)", src.stem)
+        scale = int(m.group(1) or m.group(2)) if m else 4
+    CUSTOM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, CUSTOM_MODELS_DIR / f"{name}.param")
+    shutil.copyfile(binf, CUSTOM_MODELS_DIR / f"{name}.bin")
+    items = [x for x in list_custom_models() if x["name"] != name] + [{"name": name, "scale": int(scale)}]
+    (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
+    return {"name": name, "scale": int(scale)}
+
+
+def remove_model(name) -> None:
+    for ext in (".param", ".bin"):
+        (CUSTOM_MODELS_DIR / f"{name}{ext}").unlink(missing_ok=True)
+    items = [x for x in list_custom_models() if x["name"] != name]
+    if CUSTOM_MODELS_DIR.is_dir():
+        (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
+
+
+def model_spec(label) -> dict:
+    """Menu entry -> {'kind': 'std'} or {'kind': 'esr', 'name', 'scale', 'dir'}."""
+    if label in MODELS:
+        kind, name, scale = MODELS[label]
+        return {"kind": kind, "name": name, "scale": scale, "dir": None, "label": label}
+    for x in list_custom_models():
+        if label == f"Own · {x['name']}":
+            return {"kind": "esr", "name": x["name"], "scale": x["scale"], "dir": str(CUSTOM_MODELS_DIR),
+                    "label": label}
+    return {"kind": "std", "label": label}
+
+
+def _esr_model(model, need):
+    """-> (model name, scale, folder). The anime video model can do 2×/3×/4×, the others their own scale."""
+    if isinstance(model, str):     # old style: "real" / "anime"
+        model = model_spec("AI · anime video" if model == "anime" else "AI · real footage")
+    name = model.get("name") or "realesrgan-x4plus"
+    if name == "realesr-animevideov3":
+        scale = 2 if need <= 2 else 3 if need <= 3 else 4
+    else:
+        scale = int(model.get("scale") or 4)
+    return name, scale, model.get("dir")
+
+
+def _run_esr(src_dir, out_dir, model, scale, on_tick=None, model_dir=None):
+    exe = upscaler_exe()
+    if not exe:
+        raise RuntimeError("The AI upscaler is not installed – Settings → AI upscaler → Install.")
+    cmd = [str(exe), "-i", str(src_dir), "-o", str(out_dir), "-n", model, "-s", str(scale), "-f", "png",
+           "-m", str(model_dir or exe.parent / "models")]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=str(exe.parent),
+                            creationflags=NO_WINDOW)
+    err: list[bytes] = []
+    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
+    reader.start()
+    while proc.poll() is None:
+        if on_tick:
+            on_tick()
+        time.sleep(0.4)
+    reader.join(5)
+    if proc.returncode != 0:
+        lines = [x for x in b"".join(err).decode("utf-8", "replace").splitlines()
+                 if x.strip() and not re.match(r"^\s*\d+(\.\d+)?%\s*$", x)]
+        tail = "\n".join(lines[-4:])
+        hint = (" Your graphics card needs Vulkan support (current NVIDIA / AMD / Intel driver)."
+                if re.search(r"vulkan|gpu|device", tail, re.I) or not tail else "")
+        raise RuntimeError(f"AI upscaling failed.{hint}" + (f"\n{tail}" if tail else ""))
+
+
+def ai_upscale_video(piece, crop, size, model, tmp, tag, *, ffmpeg, ffprobe, emit) -> Path:
+    """One piece -> frames (cropped) -> Real-ESRGAN in batches -> scaled to `size` and encoded again.
+    Batches keep the disk usage small (big PNG frames are deleted as soon as they are encoded)."""
+    inf = media_info(piece, ffprobe)
+    W, H = size
+    cw, ch = (crop[0], crop[1]) if crop else (inf["width"], inf["height"])
+    name, scale, mdir = _esr_model(model, max(W / cw, H / ch))
+    label_ = (model.get("label") if isinstance(model, dict) else "") or name
+    fin = Path(tmp) / f"esr_in_{tag}"
+    fin.mkdir(parents=True, exist_ok=True)
+    emit("status", "Preparing frames for AI upscaling …")
+    emit("progress", None)
+    vf = [f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
+    r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(piece),
+                        *(["-vf", ",".join(vf)] if vf else []), "-fps_mode", "passthrough",
+                        str(fin / "%06d.png")], capture_output=True, creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-400:])
+    frames = sorted(fin.glob("*.png"))
+    total = len(frames)
+    if not total:
+        raise RuntimeError("No frames to upscale.")
+    per = max(1, (cw * scale) * (ch * scale) * 2)     # rough PNG size of one upscaled frame
+    batch = int(min(200, max(8, 1.5e9 // per)))
+    dst = Path(tmp) / f"esr_{tag}.mp4"
+    enc = subprocess.Popen(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", inf["rate"],
+         "-c:v", "png", "-i", "-", "-i", str(piece), "-map", "0:v:0", "-map", "1:a:0?",
+         "-vf", f"scale={W}:{H}:flags=lanczos,setsar=1", "-c:v", "libx264", "-preset", "medium",
+         "-crf", str(PIECE_CRF - 2), "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(dst)],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
+    t0 = time.time()
+    done = 0
+    try:
+        for b0 in range(0, total, batch):
+            bin_ = Path(tmp) / f"esr_b_{tag}"
+            bout = Path(tmp) / f"esr_o_{tag}"
+            for d in (bin_, bout):
+                shutil.rmtree(d, ignore_errors=True)
+                d.mkdir()
+            chunk = frames[b0:b0 + batch]
+            for f in chunk:
+                os.replace(f, bin_ / f.name)
+
+            def tick(b0=b0, bout=bout):
+                k = b0 + len(list(bout.glob("*.png")))
+                el = time.time() - t0
+                eta = el / k * (total - k) if k else 0
+                emit("progress", k / total * 100)
+                emit("status", f"AI upscaling ({label_}) · "
+                               f"frame {k}/{total}" + (f" · {int(eta) // 60}:{int(eta) % 60:02d} left" if k else ""))
+            _run_esr(bin_, bout, name, scale, tick, mdir)
+            for f in chunk:
+                out = bout / f.name
+                if not out.is_file():
+                    raise RuntimeError(f"AI upscaling stopped at frame {done + 1}.")
+                enc.stdin.write(out.read_bytes())
+                out.unlink()
+                done += 1
+            shutil.rmtree(bin_, ignore_errors=True)
+            shutil.rmtree(bout, ignore_errors=True)
+        enc.stdin.close()
+        rc = enc.wait()
+        if rc != 0:
+            raise RuntimeError("FFmpeg error:\n" + enc.stderr.read().decode("utf-8", "replace").strip()[-400:])
+    except BaseException:
+        try:
+            enc.kill()
+        except OSError:
+            pass
+        raise
+    finally:
+        shutil.rmtree(fin, ignore_errors=True)
+    return dst
+
+
+# ----------------------------------------------------------------------------- still frame
+
+def _cookie_header(s) -> str:
+    """yt-dlp's cookie string (name=value; Domain=…; Path=…) -> value of an HTTP Cookie header."""
+    attrs = {"domain", "path", "expires", "version", "max-age", "secure", "httponly", "samesite", "comment"}
+    out = []
+    for part in str(s or "").split(";"):
+        part = part.strip()
+        if "=" in part and part.split("=", 1)[0].strip().lower() not in attrs:
+            out.append(part)
+    return "; ".join(out)
+
+
+def media_url(url, height=None):
+    """Direct address (+ HTTP headers) of the best picture up to `height` – for grabbing single frames."""
+    from yt_dlp import YoutubeDL
+    fmt = f"bv*[height<={height}]/b[height<={height}]/bv*/b" if height else "bv*/b"
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "format": fmt,
+            "logger": _Silent(), **YDL_EXTRA}
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    f = (info.get("requested_formats") or [info])[0]
+    hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
+            if k.lower() not in ("accept-encoding", "range")}
+    ck = _cookie_header(f.get("cookies") or info.get("cookies"))
+    if ck:
+        hdrs["Cookie"] = ck
+    return f["url"], hdrs
+
+
+def _png_size(path):
+    import struct
+    with open(path, "rb") as f:
+        head = f.read(24)
+    return struct.unpack(">II", head[16:24])
+
+
+def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model=None, ffmpeg, ffprobe, emit,
+                 short=None, enlarge=None) -> Path:
+    """The frame shown in the preview at time t, in full quality, as PNG (with crop / size / AI upscaling)."""
+    import tempfile
+    fps = fps if fps and fps > 1 else 30.0
+    frame = int(t * fps + 1e-3)
+    seek = max(0.0, frame / fps - 0.5 / fps)        # first frame at or after this = the frame on screen
+    with tempfile.TemporaryDirectory(prefix="ytclip_still_") as td:
+        raw = Path(td) / "frame.png"
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        if local:
+            inp = str(src)
+        else:
+            emit("status", "Finding the full-quality video …")
+            inp, hdrs = media_url(src, height)
+            if hdrs:
+                cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())]
+        emit("status", "Grabbing the frame …")
+        cmd += ["-ss", f"{seek:.4f}", "-i", inp, "-frames:v", "1", "-update", "1", str(raw)]
+        r = subprocess.run(cmd, capture_output=True, timeout=300, creationflags=NO_WINDOW)
+        if r.returncode != 0 or not raw.is_file():
+            raise RuntimeError("Could not grab the frame:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+        W, H = _png_size(raw)
+        crop = crop_rect(box, W, H, aspect) if aspect else None
+        cw, ch = (crop[0], crop[1]) if crop else (W, H)
+        if up is None and short:
+            up = ("short", short)
+        if model is None and enlarge in ("real", "anime"):
+            model = model_spec("AI · anime video" if enlarge == "anime" else "AI · real footage")
+        model = model or {"kind": "std"}
+        ow, oh = target_dims(cw, ch, up, aspect)
+        img = raw
+        if crop:
+            img = Path(td) / "crop.png"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-vf",
+                            f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}", str(img)],
+                           check=True, capture_output=True, creationflags=NO_WINDOW)
+        if model.get("kind") == "esr" and ow > cw * 1.05:
+            emit("status", "AI upscaling the frame …")
+            emit("progress", None)
+            din, dout = Path(td) / "esr_in", Path(td) / "esr_out"
+            din.mkdir()
+            dout.mkdir()
+            shutil.copy(img, din / "f.png")
+            name, scale, mdir = _esr_model(model, max(ow / cw, oh / ch))
+            _run_esr(din, dout, name, scale, model_dir=mdir)
+            img = dout / "f.png"
+            if not img.is_file():
+                raise RuntimeError("AI upscaling produced no image.")
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(img)]
+        if _png_size(img) != (ow, oh):
+            cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
+        r = subprocess.run(cmd + [str(dst)], capture_output=True, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+    return Path(dst)
+
+
+# ----------------------------------------------------------------------------- history of links
+
+def history_load() -> list:
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        return [x for x in data if isinstance(x, dict) and x.get("url")]
+    except (OSError, ValueError):
+        return []
+
+
+def _history_save(items) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items[:HISTORY_MAX], indent=1, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, HISTORY_FILE)
+    except OSError:
+        pass
+
+
+def history_thumb_path(url) -> Path:
+    import hashlib
+    return HISTORY_DIR / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
+
+
+def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
+    items = [x for x in history_load() if x.get("url") != url]
+    entry = {"url": url, "title": info.get("title") or url, "channel": info.get("channel") or "",
+             "duration": info.get("duration"), "added": time.time(),
+             "site": {"Youtube": "YouTube", "YoutubeTab": "YouTube"}.get(info.get("site") or "", info.get("site") or "")}
+    if thumb_jpg:
+        try:
+            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            p = history_thumb_path(url)
+            p.write_bytes(thumb_jpg)
+            entry["thumb"] = p.name
+        except OSError:
+            pass
+    items.insert(0, entry)
+    for old in items[HISTORY_MAX:]:
+        if old.get("thumb"):
+            (HISTORY_DIR / old["thumb"]).unlink(missing_ok=True)
+    _history_save(items)
+
+
+def history_remove(url) -> None:
+    items = history_load()
+    for x in items:
+        if x.get("url") == url and x.get("thumb"):
+            (HISTORY_DIR / x["thumb"]).unlink(missing_ok=True)
+    _history_save([x for x in items if x.get("url") != url])
+
+
+def history_clear() -> None:
+    shutil.rmtree(HISTORY_DIR, ignore_errors=True)
+    HISTORY_FILE.unlink(missing_ok=True)
+
+
+def login_hint(msg) -> str:
+    """Extra hint when a site wants a login (Instagram, age-restricted or members-only videos)."""
+    if re.search(r"log ?in|sign in|cookies|rate.?limit|private|members|age", msg or "", re.I) and not YDL_EXTRA:
+        return ("\nTip: this needs a login. Sign in to the site in your browser and turn on "
+                "Settings → Browser login.")
+    return ""
+
+
+# ----------------------------------------------------------------------------- fonts for burned-in subtitles
+
+def system_font_files(family) -> list:
+    """Font files of an installed font family (Windows registry: for all users and per user)."""
+    if not WIN or not family:
+        return []
+    import winreg
+    out, fam = [], family.lower()
+    windir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            key = winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+        except OSError:
+            continue
+        with key:
+            i = 0
+            while True:
+                try:
+                    name, val, _t = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                i += 1
+                n = name.lower()
+                if n == fam or n.startswith(fam + " ") or n.startswith(fam + " (") or n.startswith(fam + " & "):
+                    f = Path(val) if os.path.isabs(val) else windir / val
+                    if f.is_file():
+                        out.append(f)
+    return out
+
+
+def collect_fonts(style, dst_dir) -> int:
+    """Copies the subtitle font (own file, or the installed family) next to the .ass so libass finds it."""
+    files = []
+    ff = (style or {}).get("font_file")
+    if ff and Path(ff).is_file():
+        files.append(Path(ff))
+    files += system_font_files((style or {}).get("font"))
+    if not files:
+        return 0
+    Path(dst_dir).mkdir(parents=True, exist_ok=True)
+    for f in files[:12]:
+        try:
+            shutil.copyfile(f, Path(dst_dir) / f.name)
+        except OSError:
+            pass
+    return len(files)
+
+
+def install_font(path) -> Path:
+    """Keeps a copy of a font file in the app folder (loaded again at every start)."""
+    src = Path(path)
+    FONTS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = FONTS_DIR / src.name
+    if src.resolve() != dst.resolve():
+        shutil.copyfile(src, dst)
+    return dst
+
+
+# ----------------------------------------------------------------------------- app update from GitHub
+
+def _ver(v) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "0"))[:4])
+
+
+def check_app_update(timeout=15.0) -> dict:
+    """version.json of the repo -> {'version', 'newer': bool, 'notes', …}"""
+    data = fetch_bytes(UPDATE_BASE + f"version.json?t={int(time.time())}", timeout=timeout)
+    info = json.loads(data.decode("utf-8-sig"))
+    info["newer"] = _ver(info.get("version")) > _ver(APP_VERSION)
+    return info
+
+
+def install_app_update(info, script, emit) -> Path:
+    """Downloads the new app file, checks it (checksum + Python syntax), installs new packages if needed,
+    keeps the old one as .bak and puts the new one in place. The app restarts afterwards."""
+    import hashlib
+    script = Path(script)
+    name = info.get("file") or "tfrog_ytclip.pyw"
+    if "/" in name or "\\" in name:
+        raise RuntimeError("Invalid update file name.")
+    emit("status", f"Downloading version {info.get('version')} …")
+    data = fetch_bytes(UPDATE_BASE + f"{name}?t={int(time.time())}", timeout=60)
+    if info.get("sha256") and hashlib.sha256(data).hexdigest() != info["sha256"]:
+        raise RuntimeError("The download doesn't match the checksum – try again in a few minutes.")
+    compile(data.decode("utf-8"), name, "exec")         # never install a broken file
+    extra = {}
+    for f in info.get("extra") or []:
+        if isinstance(f, str) and "/" not in f and "\\" not in f and f != name:
+            try:
+                extra[f] = fetch_bytes(UPDATE_BASE + f, timeout=60)
+            except Exception:  # noqa: BLE001 - optional files (icon …)
+                pass
+    pip = [x for x in info.get("pip") or [] if isinstance(x, str) and re.match(r"^[\w.\[\],<>=!-]+$", x)]
+    if pip:
+        emit("status", "Installing new packages …")
+        py = Path(sys.executable)
+        if py.name.lower() == "pythonw.exe" and py.with_name("python.exe").exists():
+            py = py.with_name("python.exe")
+        r = subprocess.run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", *pip],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("Installing packages failed:\n" + (r.stderr or r.stdout).strip()[-500:])
+    if script.exists():
+        shutil.copyfile(script, script.with_name(script.name + ".bak"))
+    tmp = script.with_name(script.name + ".new")
+    tmp.write_bytes(data)
+    os.replace(tmp, script)
+    for f, b in extra.items():
+        try:
+            (script.parent / f).write_bytes(b)
+        except OSError:
+            pass
+    return script

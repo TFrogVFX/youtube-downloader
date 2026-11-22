@@ -1,0 +1,7499 @@
+# -*- coding: utf-8 -*-
+"""
+YouTube Downloader (by tfrog)
+Paste a link (or open your own video), optionally pick a time range,
+get an MP4 (H.264 + AAC), an MP3 or a GIF - and the thumbnail as JPG.
+
+Requires: Python 3.10+, yt-dlp[default], PySide6, FFmpeg, Deno  ->  installed by the setup.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+APP = "YouTube Downloader"
+APP_VERSION = "2.6.0"
+UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
+UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
+APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
+APP_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "tfrog_ytclip"
+CFG_FILE = APP_DIR / "config.json"
+WIN = os.name == "nt"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+YT_URL = re.compile(r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/\S+", re.I)
+ANY_URL = re.compile(r"https?://\S+", re.I)
+YDL_EXTRA: dict = {}   # options for every yt-dlp call (browser login / cookies), set by the app
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+UPDATE_INTERVAL = 20 * 3600  # auto-update yt-dlp at most once a day
+
+QUALITIES = {
+    "Best available": None,
+    "2160p (4K)": 2160,
+    "1440p": 1440,
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+}
+MP3_QUALITIES = {"320 kbps": 320, "256 kbps": 256, "192 kbps": 192, "128 kbps": 128}
+ENCODERS = ["CPU", "NVIDIA GPU (NVENC)"]
+CODECS = {  # label -> (codec, ProRes profile)
+    "H.264 (MP4)": ("h264", None),
+    "H.265 / HEVC (MP4)": ("hevc", None),
+    "ProRes 422 (MOV)": ("prores", 2),
+    "ProRes 422 HQ (MOV)": ("prores", 3),
+}
+AUDIO_FORMATS = {"MP3": "mp3", "WAV": "wav", "M4A (AAC)": "m4a"}
+DEFAULT_CODEC = "H.264 (MP4)"
+DEFAULT_AUDIO = "MP3"
+SIZES = {  # name -> CRF  (None = original, "mb" = target size)
+    "Original": None,
+    "High": 20,
+    "Medium": 23,
+    "Small": 26,
+    "Target MB": "mb",
+}
+SIZE_HINTS = {
+    "Original": "YouTube file without re-encoding when possible",
+    "High": "CRF 20 · barely visible difference",
+    "Medium": "CRF 23 · good balance",
+    "Small": "CRF 26 · much smaller, fine detail suffers",
+    "Target MB": "file ends up about this size",
+}
+GIF_WIDTHS = {"320 px": 320, "480 px": 480, "640 px": 640, "800 px": 800}
+GIF_FPS = {"10 fps": 10, "12 fps": 12, "15 fps": 15, "20 fps": 20, "25 fps": 25}
+GIF_COLORS = {"Best (256 colors)": 256, "Smaller (128 colors)": 128, "Smallest (64 colors)": 64}
+GIF_MAX = 30          # seconds
+GIF_RECOMMENDED = 10  # seconds
+ORIGINAL_CRF = 18  # used when "Original" still has to encode (clips, VP9/AV1 sources)
+PIECE_CRF = 14     # intermediate clips that get encoded once more (joining, crop, subtitles …)
+DEFAULT_QUALITY = "Best available"
+DEFAULT_MP3 = "320 kbps"
+DEFAULT_ENCODER = ENCODERS[0]
+DEFAULT_SIZE = "Original"
+VIDEO_TAIL = ["-pix_fmt", "yuv420p"]
+PP_NAMES = {
+    "Merger": "Merging video + audio",
+    "ExtractAudio": "Converting audio",
+    "Metadata": "Writing tags",
+    "EmbedThumbnail": "Embedding cover art",
+    "ThumbnailsConvertor": "Preparing cover art",
+    "MoveFiles": "Finishing",
+}
+EXT = {"mp4": ".mp4", "mp3": ".mp3", "gif": ".gif"}  # mode keys (kept for old settings files)
+PRORES_HINTS = {2: "Editing codec · 10-bit 4:2:2 · roughly 1 GB per minute at 1080p",
+                3: "Editing codec · 10-bit 4:2:2 · roughly 1.5 GB per minute at 1080p"}
+AUDIO_HINTS = {"mp3": "With title, artist and cover art.",
+               "wav": "Uncompressed 16-bit PCM for editing · ~10 MB per minute · no cover art",
+               "m4a": "AAC with title and cover art · YouTube audio is kept without re-encoding"}
+
+# ---- hover help (Settings → "Show help when hovering")
+ITEM_HELP = {
+    # quality
+    "Best available": "The highest resolution this video has.",
+    "2160p (4K)": "Up to 3840 × 2160. Big files.",
+    "1440p": "Up to 2560 × 1440.",
+    "1080p": "Up to 1920 × 1080 (Full HD).",
+    "720p": "Up to 1280 × 720. Small and quick.",
+    "480p": "Up to 854 × 480. Smallest.",
+    # codec
+    "H.264 (MP4)": "Plays everywhere: phones, browsers, editing apps, WhatsApp, Discord …",
+    "H.265 / HEVC (MP4)": "Same look at roughly half the size. Needs a newer device or player "
+                          "and takes longer to encode.",
+    "ProRes 422 (MOV)": "Editing codec for Premiere, After Effects, Resolve … "
+                        "Scrubs smoothly, but the files are very large.",
+    "ProRes 422 HQ (MOV)": "Higher-quality ProRes for grading and compositing. Even larger files.",
+    # size
+    "Original": "Keeps the YouTube file as it is when possible – best quality, no waiting for an encode.",
+    "High": "Re-encodes with almost no visible difference. Noticeably smaller.",
+    "Medium": "Good balance of quality and size.",
+    "Small": "Much smaller files. Fine detail and dark areas suffer.",
+    "Target MB": "Type a size in MB – the bitrate is chosen so the file ends up about that big "
+                 "(e.g. for upload limits).",
+    # encoder
+    "CPU": "Encodes on the processor. Works on every PC and gives the best quality per MB.",
+    "NVIDIA GPU (NVENC)": "Encodes on an NVIDIA graphics card – much faster. "
+                          "Falls back to the CPU automatically if the card or driver can't do it.",
+    # audio format
+    "MP3": "Plays everywhere. Small, with title, artist and cover art.",
+    "WAV": "Uncompressed audio for editing and DAWs. Large, no cover art.",
+    "M4A (AAC)": "Better quality per MB than MP3. YouTube's own AAC audio is copied without re-encoding.",
+    # bitrate
+    "320 kbps": "Highest quality · about 2.4 MB per minute.",
+    "256 kbps": "Very good · about 1.9 MB per minute.",
+    "192 kbps": "Good · about 1.4 MB per minute.",
+    "128 kbps": "OK for speech and podcasts · about 1 MB per minute.",
+    # gif
+    "320 px": "Tiny – stickers and reactions.",
+    "480 px": "Good default for chats and forums.",
+    "640 px": "Sharper, but noticeably bigger files.",
+    "800 px": "Large – only for very short clips.",
+    "10 fps": "Choppy but very small.",
+    "12 fps": "Slightly smoother, still small.",
+    "15 fps": "Good default – smooth enough, reasonable size.",
+    "20 fps": "Smooth motion, bigger files.",
+    "25 fps": "Smoothest, biggest files.",
+    "Best (256 colors)": "Best-looking gradients and skin tones.",
+    "Smaller (128 colors)": "Smaller file, slight banding in gradients.",
+    "Smallest (64 colors)": "Smallest file, visible banding.",
+    # upscaling
+    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",
+    "2×": "Twice as wide and high.",
+    "3×": "Three times as wide and high.",
+    "4×": "Four times as wide and high.",
+    "To 1080p": "Short side 1080 px: 1920 × 1080, or 1080 × 1920 for a 9:16 crop (Reels / Shorts / TikTok).",
+    "To 1440p": "Short side 1440 px: 2560 × 1440, or 1440 × 2560 for 9:16.",
+    "To 4K (2160p)": "Short side 2160 px: 3840 × 2160, or 2160 × 3840 for 9:16.",
+    "Standard (fast)": "Normal scaling (Lanczos) – instant, a bit soft when enlarging a lot.",
+    "AI · real footage": "Real-ESRGAN x4plus: invents fine detail. Slow (about 0.3–2 s per frame on a graphics card) – "
+                         "best for stills and short clips.",
+    "AI · anime video": "Real-ESRGAN anime video model: clean lines, fast, steady from frame to frame.",
+    "AI · anime stills": "Real-ESRGAN x4plus-anime: the sharpest anime model, slower – great for single frames.",
+    "Load own model …": "Add a Real-ESRGAN compatible ncnn model (a .param + .bin pair, e.g. 4x-UltraSharp from the "
+                "Upscayl model collection).",
+    # theme
+    "Dark": "Neutral dark grey.",
+    "Midnight": "Dark blue.",
+    "Light": "Bright theme for daylight.",
+}
+# ---- frame (crop / output size / upscaling)
+ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "3:4": (3, 4)}
+# upscaling (Output tab): target of the result -> ("x", factor) or ("short", short side in px)
+UPSCALES = {"Off": None, "2×": ("x", 2), "3×": ("x", 3), "4×": ("x", 4), "To 1080p": ("short", 1080),
+            "To 1440p": ("short", 1440), "To 4K (2160p)": ("short", 2160)}
+# built-in models: label -> (kind, Real-ESRGAN model name, native scale; None = the model can do 2/3/4)
+MODELS = {"Standard (fast)": ("std", None, None),
+          "AI · real footage": ("esr", "realesrgan-x4plus", 4),
+          "AI · anime video": ("esr", "realesr-animevideov3", None),
+          "AI · anime stills": ("esr", "realesrgan-x4plus-anime", 4)}
+MODEL_LOAD = "Load own model …"
+CUSTOM_MODELS_DIR = APP_DIR / "models"
+FONTS_DIR = APP_DIR / "fonts"
+SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
+             "bold": True, "pos": None}
+BROWSERS = ["Off", "Firefox", "Chrome", "Edge", "Brave", "Opera", "Vivaldi"]
+UPSCALER_DIR = APP_DIR / "upscaler"
+UPSCALER_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+                "realesrgan-ncnn-vulkan-20220424-windows.zip")
+UPSCALER_SHA256 = "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d"
+UPSCALER_MB = 45
+HISTORY_FILE = APP_DIR / "history.json"
+HISTORY_DIR = APP_DIR / "history"
+HISTORY_MAX = 500
+SUB_TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+
+LOCAL_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".m2ts", ".mts", ".flv", ".wmv", ".mpg",
+              ".mpeg", ".3gp", ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+
+# ---- appearance (user can change theme + accent color in the app)
+THEMES = {
+    "Dark": dict(bg="#0d0e10", panel="#15161a", panel2="#1d1f24", field="#111216", border="#272a31",
+                 border_hi="#3a3e47", text="#ececee", muted="#8b8f99", dark=True),
+    "Midnight": dict(bg="#0a0f1c", panel="#101829", panel2="#172036", field="#0c1323", border="#22304a",
+                     border_hi="#33456a", text="#e6ebf5", muted="#8792aa", dark=True),
+    "Light": dict(bg="#eef0f3", panel="#ffffff", panel2="#f2f3f6", field="#f7f8fa", border="#dcdfe5",
+                  border_hi="#c3c8d1", text="#16181d", muted="#6b7280", dark=False),
+}
+ACCENTS = [("Lime", "#c4f240"), ("Mint", "#3ddc97"), ("Cyan", "#22d3ee"), ("Blue", "#4d8bff"),
+           ("Violet", "#a78bfa"), ("Pink", "#ff5fa2"), ("Red", "#ff4d4d"), ("Orange", "#ff9f43"),
+           ("Yellow", "#ffd43b")]
+DEFAULT_THEME = "Dark"
+DEFAULT_ACCENT = "#c4f240"
+WARN_COLOR = "#f0b429"
+ERR_COLOR = "#ff6b6b"
+
+
+# ----------------------------------------------------------------------------- helpers
+
+def refresh_path() -> None:
+    """Reload PATH from the registry so fresh winget installs are found without logging off."""
+    if not WIN:
+        return
+    import winreg
+    dirs: list[str] = []
+    for hive, key in (
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                dirs += os.path.expandvars(winreg.QueryValueEx(k, "Path")[0]).split(";")
+        except OSError:
+            pass
+    dirs += [
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+        os.path.expandvars(r"%ProgramFiles%\WinGet\Links"),
+        os.path.expanduser(r"~\.deno\bin"),
+    ]
+    seen, merged = set(), []
+    for d in os.environ.get("PATH", "").split(os.pathsep) + dirs:
+        if d and d.lower() not in seen:
+            seen.add(d.lower())
+            merged.append(d)
+    os.environ["PATH"] = os.pathsep.join(merged)
+
+
+def find_tool(name: str) -> str | None:
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    if WIN:  # fallback: search winget package folders
+        base = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+        for pattern in (f"*/*/bin/{name}.exe", f"*/{name}.exe"):
+            for p in base.glob(pattern):
+                os.environ["PATH"] = str(p.parent) + os.pathsep + os.environ.get("PATH", "")
+                return str(p)
+    return None
+
+
+def parse_time(text: str) -> float | None:
+    """'10' = minute 10 · '10:30' · '1:02:30' · '90s' · '1.5h'  ->  seconds"""
+    s = text.strip().lower().replace(",", ".")
+    if not s:
+        return None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) > 3:
+            raise ValueError(text)
+        sec = 0.0
+        for p in parts:
+            sec = sec * 60 + float(p or 0)
+        if sec < 0:
+            raise ValueError(text)
+        return sec
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(h|hr|m|min|s|sec)?", s)
+    if not m:
+        raise ValueError(text)
+    mult = {"h": 3600, "hr": 3600, "s": 1, "sec": 1}.get(m.group(2), 60)
+    return float(m.group(1)) * mult
+
+
+def fmt_t(sec: float) -> str:
+    sec = int(round(sec))
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+
+
+def fmt_ts(sec: float) -> str:
+    """Display format for time fields: 1:05, 1:05.5, 1:02:03"""
+    sec = max(0.0, float(sec))
+    whole = int(sec)
+    frac = sec - whole
+    h, rest = divmod(whole, 3600)
+    m, s = divmod(rest, 60)
+    out = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    if frac >= 0.05:
+        out += f".{int(round(frac * 10)) % 10}"
+    return out
+
+
+def fmt_tf(sec: float) -> str:
+    """Time fields: as exact as needed (frame-accurate cuts) - 1:05, 1:05.5, 1:05.52"""
+    cs = int(round(max(0.0, float(sec)) * 100))
+    s_, c_ = divmod(cs, 100)
+    h, rest = divmod(s_, 3600)
+    m, s_ = divmod(rest, 60)
+    out = f"{h}:{m:02d}:{s_:02d}" if h else f"{m}:{s_:02d}"
+    return out + (f".{c_:02d}".rstrip("0") if c_ else "")
+
+
+def fmt_tc(sec: float) -> str:
+    """Timecode of the preview with 1/100 s: 1:31.24, 1:02:03.50"""
+    cs = int(round(max(0.0, float(sec)) * 100))
+    s, c = divmod(cs, 100)
+    h, rest = divmod(s, 3600)
+    m, s = divmod(rest, 60)
+    return (f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}") + f".{c:02d}"
+
+
+def safe_name(name: str) -> str:
+    """File name without characters Windows does not allow."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip(" .")
+    return name[:150]
+
+
+def unique_name(outdir, name: str, ext: str) -> str:
+    """name -> name (2) -> name (3) ... if a file with that name already exists."""
+    base = safe_name(name) or "download"
+    cand, i = base, 2
+    while (Path(outdir) / f"{cand}{ext}").exists():
+        cand = f"{base} ({i})"
+        i += 1
+    return cand
+
+
+def load_cfg() -> dict:
+    try:
+        return json.loads(CFG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cfg(cfg: dict) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        CFG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def probe(ffprobe: str | None, path: Path):
+    """-> (video_codec, audio_codec, duration_sec)"""
+    if not ffprobe:
+        return None, None, 0.0
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name:stream_disposition=attached_pic:format=duration",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
+    )
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+    streams = data.get("streams", [])
+    v = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"
+              and not (s.get("disposition") or {}).get("attached_pic")), None)
+    a = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), None)
+    try:
+        dur = float(data.get("format", {}).get("duration") or 0)
+    except ValueError:
+        dur = 0.0
+    return v, a, dur
+
+
+def video_ext(codec: str) -> str:
+    return ".mov" if codec == "prores" else ".mp4"
+
+
+def video_args(encoder: str, crf: int | None = None, kbps: int | None = None,
+               codec: str = "h264", profile: int | None = None) -> list[str]:
+    if codec == "prores":  # editing codec: 10-bit 4:2:2, size is fixed by the profile
+        return ["-c:v", "prores_ks", "-profile:v", str(profile or 2), "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
+    nv = encoder.startswith("NVIDIA")
+    rate = (["-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{kbps * 2}k"] if kbps else None)
+    if codec == "hevc":  # CRF scale of x265 is ~4 higher than x264 for the same look
+        if nv:
+            v = ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr"] + (rate or ["-cq", str(crf + 3), "-b:v", "0"])
+        else:
+            v = ["-c:v", "libx265", "-preset", "medium", "-x265-params", "log-level=error"] + \
+                (rate or ["-crf", str(crf + 4)])
+        return v + ["-tag:v", "hvc1"] + VIDEO_TAIL  # hvc1 tag: plays in QuickTime / Apple devices
+    if nv:
+        v = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr"] + (rate or ["-cq", str(crf + 1), "-b:v", "0"])
+    else:
+        v = ["-c:v", "libx264", "-preset", "medium"] + (rate or ["-crf", str(crf)])
+    return v + VIDEO_TAIL
+
+
+def encode_args(encoder: str, size: str, target_mb: float | None, duration: float | None,
+                codec: str = "h264", profile: int | None = None):
+    """-> (video_args, audio_args) for the selected size and codec"""
+    if codec == "prores":
+        return video_args(encoder, codec="prores", profile=profile), ["-c:a", "pcm_s16le"]
+    mode = SIZES.get(size)
+    abr = 128 if mode in ("mb", 26) else 192
+    aargs = ["-c:a", "aac", "-b:a", f"{abr}k"]
+    if mode == "mb":
+        if not duration:
+            raise RuntimeError("Video length unknown – 'Target MB' can't be used here.")
+        total_kbit = target_mb * 1048576 * 8 / 1000
+        kbps = int(total_kbit / duration * 0.96) - abr  # 4 % headroom for container/variance
+        if kbps < 200:
+            need = (200 + abr) * duration / 0.96 / (1048576 * 8 / 1000)
+            raise RuntimeError(f"{target_mb:g} MB is too small for {fmt_t(duration)} – "
+                               f"you need at least ~{need:.0f} MB (or a shorter clip).")
+        return video_args(encoder, kbps=kbps, codec=codec), aargs
+    crf = PIECE_CRF if size == "_piece" else (mode if isinstance(mode, int) else ORIGINAL_CRF)
+    return video_args(encoder, crf=crf, codec=codec), aargs
+
+
+FF_REPORT = APP_DIR / "ffmpeg_report_ffmpeg.log"  # written by ffmpeg itself (FFREPORT)
+
+
+def enable_ffmpeg_report() -> None:
+    """Every ffmpeg run (also the ones started by yt-dlp) writes its warnings/errors to a file.
+    Without this, ffmpeg's error text is lost under pythonw and only an exit code remains."""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    base = str(APP_DIR).replace("%", "%%").replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    os.environ["FFREPORT"] = f"file={base}/ffmpeg_report_%p.log:level=24"
+
+
+def ffmpeg_report_tail(since: float, n: int = 6) -> str:
+    """Last error lines of the most recent ffmpeg run (only if it ran after `since`)."""
+    try:
+        if FF_REPORT.stat().st_mtime < since - 1:
+            return ""
+        lines = FF_REPORT.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for i, line in enumerate(lines):
+        if line.startswith("Command line:"):
+            lines = lines[i + 2:]
+            break
+    lines = [x.strip() for x in lines if x.strip() and not x.startswith("Report written")]
+    return "\n".join(lines[-n:])
+
+
+def clean_error(ex) -> str:
+    msg = ANSI.sub("", str(ex)).strip() or ex.__class__.__name__
+    return re.sub(r"^ERROR:\s*", "", msg)
+
+
+_NVENC: dict = {}
+
+
+def check_encoder(encoder: str, ffmpeg, emit, codec: str = "h264") -> str:
+    """NVENC needs an NVIDIA GPU with a recent driver - fall back to the CPU instead of failing."""
+    if codec == "prores" or not encoder.startswith("NVIDIA") or not ffmpeg:
+        return encoder
+    nv = "hevc_nvenc" if codec == "hevc" else "h264_nvenc"
+    key = (ffmpeg, nv)
+    if key not in _NVENC:
+        try:
+            r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                                "-i", "color=c=black:s=256x256:d=0.2", "-c:v", nv, "-f", "null", "-"],
+                               capture_output=True, timeout=60, creationflags=NO_WINDOW)
+            _NVENC[key] = r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _NVENC[key] = False
+    if _NVENC[key]:
+        return encoder
+    emit("log", f"NVENC ({nv}) is not available on this PC (no NVIDIA GPU or driver too old) – using the CPU.")
+    return DEFAULT_ENCODER
+
+
+def run_encode(cmd, dur, emit, label, cwd=None) -> None:
+    """Run ffmpeg (with -progress pipe:1), report progress, raise with ffmpeg's own error text."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd,
+                            encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    err: list[str] = []
+    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
+    reader.start()
+    last = 0.0
+    for line in proc.stdout:
+        if dur and line.startswith(("out_time_us=", "out_time_ms=")):
+            try:
+                pct = min(100.0, int(line.split("=", 1)[1]) / 1e6 / dur * 100)
+            except ValueError:
+                continue
+            if pct - last >= 0.5:
+                last = pct
+                emit("progress", pct)
+                emit("status", f"{label} … {pct:.0f} %")
+    rc = proc.wait()
+    reader.join(5)
+    if rc != 0:
+        lines = [x for x in "".join(err).splitlines() if x.strip() and not x.startswith("Report written")]
+        raise RuntimeError("FFmpeg error:\n" + ("\n".join(lines[-8:]) or f"exit code {rc}"))
+
+
+def cut_local(src: Path, dst: Path, start: float, end, extra_args, ffmpeg, emit, label) -> Path:
+    """Frame-accurate cut of a local file (input seeking + the given codec args)."""
+    length = (end - start) if end is not None else None
+    tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(src)]
+    if length:
+        cmd += ["-t", f"{length:.3f}"]
+    cmd += [*extra_args, "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0 if length else None)
+    try:
+        run_encode(cmd, length, emit, label)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def _clip_bounds(start, end, dur):
+    s = start or 0.0
+    if dur and s >= dur:
+        raise ValueError(f"Start time {fmt_t(s)} is past the end of the video ({fmt_t(dur)}).")
+    e = end
+    if dur:
+        e = dur if e is None else min(e, dur)
+    return s, e
+
+
+def _remove_leftovers(dst: Path) -> None:
+    """Delete what the failed direct attempt left next to the result (thumbnail, .part files)."""
+    import glob
+    for f in Path(dst.parent).glob(glob.escape(dst.stem) + ".*"):
+        if f.name != dst.name and f.is_file():
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def _note_fallback(ex, since, emit) -> None:
+    emit("log", f"Direct clip download failed: {clean_error(ex)}")
+    tail = ffmpeg_report_tail(since)
+    if tail:
+        emit("log", "ffmpeg said:\n" + tail)
+    emit("log", "Falling back: downloading the whole video and cutting it locally …")
+
+
+def finalize(src: Path, encoder, size, target_mb, ffmpeg, ffprobe, emit, encoded: bool,
+             codec: str = "h264", profile: int | None = None) -> Path:
+    """Make sure the result has the requested codec (H.264/H.265 MP4 or ProRes MOV) and size."""
+    v, a, dur = probe(ffprobe, src)
+    if ffprobe and v is None and a is None:
+        src.unlink(missing_ok=True)
+        raise RuntimeError("The file is empty – is the start time past the end of the video?")
+    ext = video_ext(codec)
+    a_ok = ("pcm_s16le", "pcm_s24le") if codec == "prores" else ("aac",)
+    force = codec != "prores" and SIZES.get(size) is not None and not encoded  # a size was picked
+    usable = src.suffix.lower() == ext and v in (codec, None) and a in (*a_ok, None)
+    if usable and not force:
+        return src
+
+    need_v = force or (v is not None and v != codec)
+    need_a = force or (a is not None and a not in a_ok)
+    enc_v, enc_a = (encode_args(encoder, size, target_mb, dur, codec, profile) if (need_v or need_a)
+                    else ([], []))
+    vargs = enc_v if need_v else ["-c:v", "copy"]
+    aargs = enc_a if need_a else ["-c:a", "copy"]
+
+    dst = src.with_suffix(ext)
+    tmp = src.with_name(src.stem + ".encoding" + ext)
+    what = "ProRes" if codec == "prores" else ("H.265" if codec == "hevc" else "H.264")
+    label_ = (f"Encoding {what}" + ("" if codec == "prores" or size == "_piece" else f" ({size})")) if need_v \
+        else f"Remuxing to {ext[1:].upper()}"
+    emit("status", f"{label_} …")
+    emit("progress", 0 if dur else None)
+
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+           "-map", "0:v:0?", "-map", "0:a:0?", *vargs, *aargs, "-movflags", "+faststart",
+           "-progress", "pipe:1", "-nostats", str(tmp)]
+    try:
+        run_encode(cmd, dur, emit, label_)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    if usable and tmp.stat().st_size >= src.stat().st_size:
+        # the YouTube file was already smaller -> re-encoding would only lose quality
+        tmp.unlink(missing_ok=True)
+        emit("log", f"'{size}' would be larger than the YouTube original – kept the original.")
+        return src
+    os.replace(tmp, dst)
+    if src != dst:
+        src.unlink(missing_ok=True)
+    return dst
+
+
+def collect_files(info) -> list[str]:
+    if not info:
+        return []
+    if info.get("entries") is not None:
+        out: list[str] = []
+        for e in info["entries"]:
+            out += collect_files(e)
+        return out
+    return [d["filepath"] for d in info.get("requested_downloads") or [] if d.get("filepath")]
+
+
+class _Log:
+    def __init__(self, emit):
+        self.emit = emit
+
+    def debug(self, msg):
+        if not msg.startswith("[debug] "):
+            self.emit("log", ANSI.sub("", msg))
+
+    def info(self, msg):
+        self.emit("log", ANSI.sub("", msg))
+
+    def warning(self, msg):
+        self.emit("log", "WARNING: " + ANSI.sub("", msg))
+
+    def error(self, msg):
+        self.emit("log", ANSI.sub("", msg))
+
+
+def make_ranges(start, end, on_section=None):
+    def ranges(info, _ydl):
+        s = start or 0.0
+        e = end
+        dur = info.get("duration")
+        known = True
+        if dur:
+            if s >= dur:
+                raise ValueError(f"Start time {fmt_t(s)} is past the end of the video ({fmt_t(dur)}).")
+            e = dur if e is None else min(e, dur)
+        elif e is None:
+            e = s + 12 * 3600  # length unknown: ffmpeg stops at end of file
+            known = False
+        if on_section:
+            on_section(e - s if known else None)
+        yield {"start_time": s, "end_time": e}
+    return ranges
+
+
+def format_sort(height, prefer_h264: bool = True) -> list[str]:
+    # best resolution <= limit (else the next larger one); at equal resolution prefer H.264/AAC
+    # -> the YouTube file can often be used 1:1 without re-encoding
+    res = [f"res:{height}" if height else "res", "fps"]
+    return res + ["vcodec:h264", "acodec:aac"] if prefer_h264 else res
+
+
+def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
+    stem = safe_name(name).replace("%", "%%") if name else f"%(title).120B{suffix}"
+    tmpl = str(Path(outdir)).replace("%", "%%") + os.sep + stem + ".%(ext)s"
+
+    def hook(d):
+        st = d.get("status")
+        if st == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes") or 0
+            pct = done / total * 100 if total else None
+            what = "clip" if section else (
+                "audio" if (d.get("info_dict") or {}).get("vcodec") == "none" else "video")
+            parts = [f"Downloading {what}"]
+            if pct is not None:
+                parts.append(f"{pct:.0f} %")
+            elif done:
+                parts.append(f"{done / 1048576:.1f} MB")
+            if d.get("speed"):
+                parts.append(f"{d['speed'] / 1048576:.1f} MB/s")
+            if d.get("eta"):
+                parts.append(f"{int(d['eta']) // 60}:{int(d['eta']) % 60:02d} left")
+            emit("progress", pct)
+            emit("status", " · ".join(parts))
+        elif st == "finished":
+            emit("progress", 100)
+
+    def pp_hook(d):
+        if d.get("status") == "started":
+            name = d.get("postprocessor", "")
+            emit("status", f"{PP_NAMES.get(name, 'Post-processing: ' + name)} …")
+            emit("progress", None)
+
+    return {
+        "outtmpl": tmpl,
+        "noplaylist": True,
+        "progress_hooks": [hook],
+        "postprocessor_hooks": [pp_hook],
+        "logger": _Log(emit),
+        "noprogress": True,
+        "concurrent_fragment_downloads": 4,
+        **YDL_EXTRA,
+    }
+
+
+def _suffix(start, end) -> str:
+    if start is None and end is None:
+        return ""
+    return f"_{fmt_t(start or 0)}-{fmt_t(end) if end is not None else 'end'}"
+
+
+def download(url, start, end, height, encoder, size, target_mb, outdir, *,
+             ffmpeg, ffprobe, emit, extra_opts=None, name=None, codec="h264", profile=None):
+    """Video -> H.264/H.265 MP4 or ProRes MOV"""
+    from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
+
+    section = start is not None or end is not None
+    t_start = time.time()
+    enable_ffmpeg_report()
+    encoder = check_encoder(encoder, ffmpeg, emit, codec)
+    opts = _base_opts(outdir, _suffix(start, end), section, emit, name=name)
+    opts.update({
+        "format": "bv*+ba/b",
+        "format_sort": format_sort(height, codec == "h264"),
+        "merge_output_format": "mp4/mkv" if codec == "h264" else "mkv",
+    })
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    if section:
+        out_args: list[str] = []  # filled in once the clip length is known
+
+        container = "mov" if codec == "prores" else "mp4"
+
+        def on_section(dur):
+            vargs, aargs = encode_args(encoder, size, target_mb, dur, codec, profile)
+            # -f overrides yt-dlp's container choice (e.g. if the source is webm)
+            out_args[:] = vargs + aargs + ["-movflags", "+faststart", "-f", container]
+
+        opts.update({
+            "download_ranges": make_ranges(start, end, on_section),
+            "force_keyframes_at_cuts": True,  # frame-accurate cut (re-encodes)
+            "merge_output_format": container,
+            "external_downloader_args": {"ffmpeg_o": out_args},
+        })
+    if extra_opts:
+        opts.update(extra_opts)
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            if section:
+                emit("status", "Downloading clip and encoding frame-accurately …")
+                emit("progress", None)
+            info = ydl.extract_info(url, download=True)
+    except ValueError:
+        raise
+    except Exception as ex:
+        if not section:
+            tail = ffmpeg_report_tail(t_start)
+            raise RuntimeError(clean_error(ex) + (f"\nffmpeg said:\n{tail}" if tail else "")) from ex
+        _note_fallback(ex, t_start, emit)
+        return [_full_then_cut_video(url, start, end, height, encoder, size, target_mb, outdir,
+                                     ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, name=name,
+                                     codec=codec, profile=profile)]
+
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("No file was downloaded.")
+    return [finalize(Path(f), encoder, size, target_mb, ffmpeg, ffprobe, emit, encoded=section,
+                     codec=codec, profile=profile) for f in files]
+
+
+def _full_then_cut_video(url, start, end, height, encoder, size, target_mb, outdir, *, ffmpeg, ffprobe, emit,
+                         name=None, codec="h264", profile=None):
+    """Fallback for clips: normal (robust) download of the whole video, then cut locally."""
+    from yt_dlp import YoutubeDL
+
+    tmpdir = Path(outdir) / ".ytclip_tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    try:
+        opts = _base_opts(tmpdir, "", False, emit)
+        opts.update({"format": "bv*+ba/b", "format_sort": format_sort(height, codec == "h264"),
+                     "merge_output_format": "mkv"})
+        if ffmpeg:
+            opts["ffmpeg_location"] = ffmpeg
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        files = collect_files(info)
+        if not files:
+            raise RuntimeError("No file was downloaded.")
+        src = Path(files[0])
+        _v, _a, dur = probe(ffprobe, src)
+        s, e = _clip_bounds(start, end, dur or (info or {}).get("duration"))
+        vargs, aargs = encode_args(encoder, size, target_mb, (e - s) if e is not None else None, codec, profile)
+        ext = video_ext(codec)
+        dst = Path(outdir) / (f"{safe_name(name)}{ext}" if name else f"{src.stem}{_suffix(start, end)}{ext}")
+        cut_local(src, dst, s, e, ["-map", "0:v:0?", "-map", "0:a:0?", *vargs, *aargs,
+                                   "-movflags", "+faststart"],
+                  ffmpeg, emit, "Cutting + encoding" + ("" if size == "_piece" else f" ({size})"))
+        _remove_leftovers(dst)
+        return dst
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def download_mp3(url, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, extra_opts=None, name=None,
+                 afmt="mp3"):
+    """Audio -> MP3 / M4A (tags + cover art) or WAV (lossless PCM, for editing)"""
+    from yt_dlp import YoutubeDL
+
+    section = start is not None or end is not None
+    t_start = time.time()
+    enable_ffmpeg_report()
+    opts = _base_opts(outdir, _suffix(start, end), section, emit, name=name)
+    cover = afmt in ("mp3", "m4a")
+    pps = [{"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"}] if cover else []
+    pps.append({"key": "FFmpegExtractAudio", "preferredcodec": afmt,
+                "preferredquality": None if afmt == "wav" else str(kbps)})
+    if cover:
+        pps += [{"key": "FFmpegMetadata", "add_metadata": True}, {"key": "EmbedThumbnail"}]
+    opts.update({
+        # M4A: take YouTube's AAC stream -> copied without re-encoding
+        "format": "ba[ext=m4a]/ba/b" if afmt == "m4a" else "ba/b",
+        "writethumbnail": cover,
+        "postprocessors": pps,
+    })
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    if section:
+        opts["download_ranges"] = make_ranges(start, end)
+        # copying the stream would only cut at WebM cluster borders (seconds off) -> decode to a
+        # lossless intermediate (ALAC) so ffmpeg seeks sample-accurately; the final format comes after
+        opts["external_downloader_args"] = {"ffmpeg_o": ["-vn", "-c:a", "alac", "-f", "mp4"]}
+    if extra_opts:
+        opts.update(extra_opts)
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            if section:
+                emit("status", "Downloading clip …")
+                emit("progress", None)
+            info = ydl.extract_info(url, download=True)
+    except ValueError:
+        raise
+    except Exception as ex:
+        if not section:
+            tail = ffmpeg_report_tail(t_start)
+            raise RuntimeError(clean_error(ex) + (f"\nffmpeg said:\n{tail}" if tail else "")) from ex
+        _note_fallback(ex, t_start, emit)
+        return [_full_then_cut_mp3(url, start, end, kbps, outdir, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit,
+                                   name=name, afmt=afmt)]
+
+    files = [Path(f) for f in collect_files(info)]
+    if not files:
+        raise RuntimeError("No file was downloaded.")
+    for f in files:
+        _v, a, _d = probe(ffprobe, f)
+        if ffprobe and a is None:
+            f.unlink(missing_ok=True)
+            raise RuntimeError("The file is empty – is the start time past the end of the video?")
+    return files
+
+
+def _full_then_cut_mp3(url, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, name=None, afmt="mp3"):
+    """Fallback for audio clips: whole track (with tags + cover), then cut locally without re-encoding."""
+    tmpdir = Path(outdir) / ".ytclip_tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    try:
+        src = download_mp3(url, None, None, kbps, tmpdir, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, afmt=afmt)[0]
+        _v, _a, dur = probe(ffprobe, src)
+        s, e = _clip_bounds(start, end, dur)
+        ext = "." + afmt
+        dst = Path(outdir) / (f"{safe_name(name)}{ext}" if name else f"{src.stem}{_suffix(start, end)}{ext}")
+        maps = {"mp3": ["-map", "0:a:0", "-map", "0:v?", "-c", "copy", "-id3v2_version", "3", "-write_id3v1", "1"],
+                "m4a": ["-map", "0:a:0", "-map", "0:v?", "-c", "copy", "-disposition:v", "attached_pic",
+                        "-movflags", "+faststart"],
+                "wav": ["-map", "0:a:0", "-c", "copy"]}[afmt]
+        cut_local(src, dst, s, e, maps, ffmpeg, emit, f"Cutting {afmt.upper()}")
+        _remove_leftovers(dst)
+        return dst
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def make_gif(url, start, end, width, fps, colors, outdir, *, ffmpeg, ffprobe, emit, name=None, extra_opts=None):
+    """Short clip -> animated GIF (two-pass palette for clean colors, loops forever)."""
+    tmpdir = Path(outdir) / ".ytclip_tmp_gif"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    try:
+        height = 1080 if width > 640 else 720
+        clip = download(url, start, end, height, DEFAULT_ENCODER, "Original", None, tmpdir,
+                        ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, extra_opts=extra_opts)[0]
+        _v, _a, dur = probe(ffprobe, clip)
+        if dur and dur > GIF_MAX + 0.5:
+            raise RuntimeError(f"GIFs can be at most {GIF_MAX} s long – set a shorter time range.")
+        dst = Path(outdir) / ((safe_name(name) if name else clip.stem) + ".gif")
+        return [gif_encode(clip, dst, None, None, dur, width, fps, colors, ffmpeg, emit)]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def gif_encode(src, dst, start, length, dur, width, fps, colors, ffmpeg, emit) -> Path:
+    """Two-pass palette GIF (clean colors, small file), loops forever."""
+    tmp = dst.with_name(dst.stem + ".part.gif")
+    vf = (f"fps={fps},scale=w='min({width},iw)':h=-1:flags=lanczos,split[a][b];"
+          f"[a]palettegen=max_colors={colors}:stats_mode=diff[p];"
+          f"[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle")
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    if length:
+        cmd += ["-t", f"{length:.3f}"]
+    cmd += ["-i", str(src), "-an", "-vf", vf, "-loop", "0", "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, length or dur, emit, "Creating GIF")
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+# ----------------------------------------------------------------------------- local files
+
+def local_path(text):
+    """Path of an existing local file (also accepts "quoted" paths and file:// URLs), else None."""
+    t = (text or "").strip().strip('"').strip("'")
+    if not t or ANY_URL.match(t):
+        return None
+    if t.lower().startswith("file:"):
+        from urllib.parse import unquote, urlparse
+        t = unquote(urlparse(t).path)
+        if re.match(r"^/[A-Za-z]:", t):
+            t = t[1:]
+    try:
+        p = Path(t)
+        return p if p.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def local_info(path, ffprobe) -> dict:
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries",
+         "stream=index,codec_type,codec_name,width,height,avg_frame_rate:stream_tags=language,title"
+         ":stream_disposition=attached_pic:format=duration", "-show_chapters", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+    streams = data.get("streams", [])
+    v = next((x for x in streams if x.get("codec_type") == "video"
+              and not (x.get("disposition") or {}).get("attached_pic")), None)
+    a = next((x for x in streams if x.get("codec_type") == "audio"), None)
+    if not v and not a:
+        raise RuntimeError("This file has no video or audio that FFmpeg can read.")
+    fps = None
+    if v and v.get("avg_frame_rate") not in (None, "0/0"):
+        try:
+            n, d = v["avg_frame_rate"].split("/")
+            fps = float(n) / float(d) if float(d) else None
+        except (ValueError, ZeroDivisionError):
+            fps = None
+    try:
+        dur = float(data.get("format", {}).get("duration") or 0) or None
+    except ValueError:
+        dur = None
+    chapters = []
+    for ch in data.get("chapters") or []:
+        try:
+            chapters.append((float(ch["start_time"]), float(ch["end_time"]), (ch.get("tags") or {}).get("title") or ""))
+        except (KeyError, ValueError):
+            pass
+    subs, k = [], 0
+    for x in streams:
+        if x.get("codec_type") != "subtitle":
+            continue
+        tags = x.get("tags") or {}
+        if x.get("codec_name") in SUB_TEXT_CODECS:
+            name = " · ".join(t for t in (tags.get("language"), tags.get("title")) if t) or f"Track {k + 1}"
+            subs.append({"label": f"{name} (in the file)", "kind": "embedded", "key": k})
+        k += 1
+    subs += sidecar_subs(path)
+    return {"duration": dur, "vcodec": v.get("codec_name") if v else None,
+            "acodec": a.get("codec_name") if a else None,
+            "width": v.get("width") if v else None, "height": v.get("height") if v else None, "fps": fps,
+            "chapters": chapters, "subs": subs}
+
+
+def grab_frame(path, t, ffmpeg, width=None) -> bytes | None:
+    """One frame as JPEG bytes."""
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(path),
+           "-frames:v", "1"]
+    if width:
+        cmd += ["-vf", f"scale='min({width},iw)':-2"]
+    cmd += ["-q:v", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout[:2] == b"\xff\xd8" else None
+
+
+def _local_dst(src, outdir, name, start, end, ext) -> Path:
+    dst = Path(outdir) / ((safe_name(name) if name else f"{Path(src).stem}{_suffix(start, end)}") + ext)
+    if dst.resolve() == Path(src).resolve():  # never overwrite the source
+        dst = dst.with_name(unique_name(dst.parent, dst.stem, ext) + ext)
+    return dst
+
+
+def local_mp4(src, start, end, height, encoder, size, target_mb, outdir, *, ffmpeg, ffprobe, emit, name=None,
+              codec="h264", profile=None):
+    """Cut / convert a local file to H.264/H.265 MP4 or ProRes MOV (frame-accurate)."""
+    src = Path(src)
+    info = local_info(src, ffprobe)
+    if not info["vcodec"]:
+        raise RuntimeError("This file has no video – choose Audio instead.")
+    dur = info["duration"]
+    s, e = _clip_bounds(start, end, dur)
+    whole = not s and (e is None or (dur and e >= dur - 0.01))
+    encoder = check_encoder(encoder, ffmpeg, emit, codec)
+    dst = _local_dst(src, outdir, name, start, end, video_ext(codec))
+    too_big = bool(height and info["height"] and info["height"] > height)
+    if (whole and codec in ("h264", "hevc") and SIZES.get(size) is None and info["vcodec"] == codec
+            and info["acodec"] in ("aac", None) and not too_big):
+        args, label_ = ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart"], "Remuxing"
+    else:
+        length = ((e if e is not None else dur) or 0) - s or None
+        vargs, aargs = encode_args(encoder, size, target_mb, length, codec, profile)
+        vf = ["-vf", f"scale=-2:{height}"] if too_big else []
+        args = ["-map", "0:v:0", "-map", "0:a:0?", *vf, *vargs, *aargs, "-movflags", "+faststart"]
+        what = "ProRes" if codec == "prores" else ("H.265" if codec == "hevc" else "H.264")
+        label_ = f"Encoding {what}" + ("" if codec == "prores" or size == "_piece" else f" ({size})")
+    emit("status", f"{label_} …")
+    return [cut_local(src, dst, s, None if whole else e, args, ffmpeg, emit, label_)]
+
+
+def local_mp3(src, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, name=None, afmt="mp3"):
+    """Audio of a local file -> MP3 / M4A (title tag + a video frame as cover) or WAV."""
+    src = Path(src)
+    info = local_info(src, ffprobe)
+    if not info["acodec"]:
+        raise RuntimeError("This file has no audio track.")
+    dur = info["duration"]
+    s, e = _clip_bounds(start, end, dur)
+    length = (e - s) if e is not None else None
+    ext = "." + afmt
+    dst = _local_dst(src, outdir, name, start, end, ext)
+    tmp = dst.with_name(dst.stem + ".part" + ext)
+    cover = None
+    if info["vcodec"] and afmt != "wav":
+        span = length or ((dur or 2) - s)
+        data = grab_frame(src, s + min(1.0, span / 2), ffmpeg, width=800)
+        if data:
+            cover = dst.with_name(dst.stem + ".cover.jpg")
+            cover.write_bytes(data)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if s:
+        cmd += ["-ss", f"{s:.3f}"]
+    if length:
+        cmd += ["-t", f"{length:.3f}"]
+    cmd += ["-i", str(src)]
+    if cover:
+        cmd += ["-i", str(cover)]
+    cmd += ["-map", "0:a:0"]
+    if cover:
+        cmd += ["-map", "1:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+        if afmt == "mp3":
+            cmd += ["-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+    if afmt == "mp3":
+        cmd += ["-c:a", "libmp3lame", "-b:a", f"{kbps}k", "-id3v2_version", "3", "-write_id3v1", "1"]
+    elif afmt == "m4a":
+        cmd += (["-c:a", "copy"] if info["acodec"] == "aac" else ["-c:a", "aac", "-b:a", f"{kbps}k"])
+        cmd += ["-movflags", "+faststart"]
+    else:  # wav: 24-bit if the source is lossless, else 16-bit
+        lossless = info["acodec"] and (info["acodec"].startswith("pcm_") or info["acodec"] in ("flac", "alac", "truehd"))
+        cmd += ["-c:a", "pcm_s24le" if lossless else "pcm_s16le"]
+    cmd += ["-metadata", f"title={dst.stem}", "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, length or ((dur or 0) - s) or None, emit, f"Converting to {afmt.upper()}")
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+        if cover:
+            cover.unlink(missing_ok=True)
+    return [dst]
+
+
+def local_gif(src, start, end, width, fps, colors, outdir, *, ffmpeg, ffprobe, emit, name=None):
+    src = Path(src)
+    info = local_info(src, ffprobe)
+    if not info["vcodec"]:
+        raise RuntimeError("This file has no video – a GIF needs a picture.")
+    dur = info["duration"]
+    s, e = _clip_bounds(start, end, dur)
+    end_t = e if e is not None else dur
+    if end_t is None:
+        raise RuntimeError(f"Set a time range for the GIF (max {GIF_MAX} s).")
+    length = end_t - s
+    if length > GIF_MAX + 0.01:
+        raise RuntimeError(f"GIFs can be at most {GIF_MAX} s long – set a shorter time range.")
+    dst = _local_dst(src, outdir, name, start, end, ".gif")
+    return [gif_encode(src, dst, s, length, length, width, fps, colors, ffmpeg, emit)]
+
+
+# ----------------------------------------------------------------------------- thumbnails
+
+def save_jpg(data: bytes, dst: Path, ffmpeg) -> Path:
+    """Write image bytes as JPG (converts WebP/PNG with ffmpeg)."""
+    if data[:3] == b"\xff\xd8\xff":
+        dst.write_bytes(data)
+        return dst
+    tmp = dst.with_name(dst.stem + ".src.img")
+    tmp.write_bytes(data)
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(tmp), "-q:v", "2",
+                            str(dst)], capture_output=True, timeout=60, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("Could not convert the thumbnail to JPG.")
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def save_thumbnail(source, dst: Path, *, ffmpeg, info=None, at=0.0) -> Path:
+    """Best available YouTube thumbnail -> JPG, or for local files a full-size frame at `at` seconds."""
+    lp = local_path(source)
+    if lp:
+        data = grab_frame(lp, at, ffmpeg)
+        if not data:
+            raise RuntimeError("Could not read a frame from the file.")
+        dst.write_bytes(data)
+        return dst
+    info = info or fetch_info(source)
+    for u in info.get("thumbs") or ([info["thumb"]] if info.get("thumb") else []):
+        try:
+            data = fetch_bytes(u)
+        except Exception:  # noqa: BLE001 - try the next (smaller) one
+            continue
+        if data:
+            return save_jpg(data, dst, ffmpeg)
+    raise RuntimeError("No thumbnail found for this video.")
+
+
+class _Silent:
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
+def fetch_info(url: str) -> dict:
+    """Title, channel, duration and thumbnail URL for the preview card."""
+    from yt_dlp import YoutubeDL
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+            "extract_flat": "in_playlist", "logger": _Silent(), **YDL_EXTRA}
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = info.get("entries")
+    vids = [f for f in info.get("formats") or [] if f.get("vcodec") not in (None, "none") and f.get("height")]
+    best = max(vids, key=lambda f: (f.get("height") or 0, f.get("width") or 0), default=None)
+    return {
+        "id": info.get("id") or "",
+        "site": info.get("extractor_key") or info.get("extractor") or "",
+        "width": (best or {}).get("width") or info.get("width"),
+        "height": (best or {}).get("height") or info.get("height"),
+        "chapters": [(float(c.get("start_time") or 0), float(c.get("end_time") or 0), c.get("title") or "")
+                     for c in info.get("chapters") or [] if c.get("end_time")],
+        "subs": list_subs(info),
+        "title": info.get("title") or "",
+        "channel": info.get("channel") or info.get("uploader") or "",
+        "duration": float(info["duration"]) if info.get("duration") else None,
+        "thumb": pick_thumb(info),
+        "thumbs": [t["url"] for t in reversed(info.get("thumbnails") or []) if t.get("url")],
+        "playlist": len(list(entries)) if entries is not None else 0,
+        "fps": info.get("fps") or max((f.get("fps") or 0 for f in info.get("formats") or []), default=0) or None,
+        "stream": pick_streams(info) if entries is None else None,
+    }
+
+
+def pick_thumb(info: dict) -> str | None:
+    """Prefer a JPG thumbnail (Qt can always decode those), biggest up to 1280 px wide."""
+    thumbs = [t for t in (info.get("thumbnails") or []) if t.get("url")]
+    jpgs = [t for t in thumbs if t["url"].split("?")[0].lower().endswith(".jpg")
+            and (t.get("width") or 0) <= 1280]
+    if jpgs:
+        jpgs.sort(key=lambda t: ((t.get("width") or 0), t.get("preference") or 0))
+        return jpgs[-1]["url"]
+    url = info.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None)
+    if url and "i.ytimg.com" in url:
+        url = url.replace("/vi_webp/", "/vi/").replace(".webp", ".jpg")
+    return url
+
+
+def fetch_bytes(url: str, timeout: float = 15.0) -> bytes:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def update_ytdlp(emit) -> bool:
+    py = Path(sys.executable)
+    if py.name.lower() == "pythonw.exe" and py.with_name("python.exe").exists():
+        py = py.with_name("python.exe")
+    emit("log", "Checking for yt-dlp update …")
+    base = [str(py), "-m", "pip", "install", "-U", "-q", "--disable-pip-version-check", "yt-dlp[default]"]
+    r = None
+    for extra in ([], ["--user"]):
+        r = subprocess.run(base + extra, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", creationflags=NO_WINDOW)
+        if r.returncode == 0:
+            break
+    else:
+        emit("log", "yt-dlp update failed:\n" + ((r.stderr or r.stdout) if r else "").strip()[-600:])
+        return False
+    v = subprocess.run([str(py), "-m", "yt_dlp", "--version"], capture_output=True, text=True,
+                       creationflags=NO_WINDOW)
+    emit("log", f"yt-dlp {v.stdout.strip()} is up to date.")
+    return True
+
+
+
+
+# ----------------------------------------------------------------------------- video preview for the player
+
+PREVIEW_HEIGHT = 360
+PREVIEW_AUTO_MAX = 20 * 60       # load the preview by itself for videos up to 20 minutes
+PREVIEW_MB_PER_MIN = 4.0         # rough size of the 360p preview (for the "≈ N MB" hint)
+
+
+def preview_video(url, outdir, *, ffmpeg, emit) -> Path:
+    """Small (≤360p) copy of a YouTube video for the built-in player. H.264/AAC is preferred
+    (plays everywhere); yt-dlp does the downloading, so it works wherever downloads work."""
+    from yt_dlp import YoutubeDL
+    opts = _base_opts(outdir, "", False, emit, name="preview")
+    opts.update({
+        "format": f"bv*[height<={PREVIEW_HEIGHT}]+ba/b[height<={PREVIEW_HEIGHT}]/wv*+wa/w",
+        "format_sort": [f"res:{PREVIEW_HEIGHT}", "vcodec:h264", "acodec:aac", "+size"],
+        "merge_output_format": "mp4/mkv",
+        "overwrites": True,
+    })
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("The preview could not be downloaded.")
+    return Path(files[0])
+
+
+# ----------------------------------------------------------------------------- several clips
+
+def _sub_emit(emit, k, n, label):
+    """Progress of step k of n -> overall progress; status gets a 'Clip 2/3 · ' prefix."""
+    def sub(kind, val=None):
+        if kind == "progress":
+            emit("progress", None if val is None else (k + min(100.0, float(val)) / 100.0) / n * 100.0)
+        elif kind == "status":
+            emit("status", f"{label} · {val}")
+        else:
+            emit(kind, val)
+    return sub
+
+
+def _single_export(kind, src, s, e, outdir, local, p, name, ffmpeg, ffprobe, emit):
+    kw = dict(ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, name=name)
+    if kind == "mp4":
+        fn = local_mp4 if local else download
+        return fn(src, s, e, p["height"], p["encoder"], p["size"], p["target_mb"], outdir,
+                  codec=p["codec"], profile=p["profile"], **kw)
+    if kind == "mp3":
+        fn = local_mp3 if local else download_mp3
+        return fn(src, s, e, p["kbps"], outdir, afmt=p["afmt"], **kw)
+    fn = local_gif if local else make_gif
+    return fn(src, s, e, p["width"], p["fps"], p["colors"], outdir, **kw)
+
+
+def _kind_ext(kind, p):
+    if kind == "mp4":
+        return video_ext(p["codec"])
+    if kind == "mp3":
+        return "." + p["afmt"]
+    return ".gif"
+
+
+def _piece(kind, src, s, e, tmp, k, local, p, ffmpeg, ffprobe, emit) -> Path:
+    """One clip in a good intermediate quality (it gets encoded once more when joining)."""
+    kw = dict(ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, name=f"piece_{k:02d}")
+    if kind == "mp3":
+        fn = local_mp3 if local else download_mp3
+        return fn(src, s, e, 320, tmp, afmt="wav", **kw)[0]
+    height = p.get("height") if kind == "mp4" else (1080 if p.get("width", 480) > 640 else 720)
+    enc = p.get("encoder", DEFAULT_ENCODER) if kind == "mp4" else DEFAULT_ENCODER
+    fn = local_mp4 if local else download
+    return fn(src, s, e, height, enc, "_piece", None, tmp, codec="h264", **kw)[0]
+
+
+def media_info(path, ffprobe) -> dict:
+    """Size, frame rate and sample rate of a piece."""
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,duration"
+         ":stream_disposition=attached_pic:format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+    streams = data.get("streams", [])
+    v = next((x for x in streams if x.get("codec_type") == "video"
+              and not (x.get("disposition") or {}).get("attached_pic")), None)
+    a = next((x for x in streams if x.get("codec_type") == "audio"), None)
+    rate = (v or {}).get("r_frame_rate") or "30/1"
+    if rate in ("0/0", "0/1"):
+        rate = "30/1"
+    try:
+        dur = float(data.get("format", {}).get("duration") or 0)
+    except ValueError:
+        dur = 0.0
+    def _d(x):
+        try:
+            return float((x or {}).get("duration") or 0) or dur
+        except ValueError:
+            return dur
+    return {"duration": dur, "vdur": _d(v), "adur": _d(a), "video": bool(v), "audio": bool(a),
+            "width": (v or {}).get("width"),
+            "height": (v or {}).get("height"), "rate": rate,
+            "sr": int((a or {}).get("sample_rate") or 48000), "acodec": (a or {}).get("codec_name")}
+
+
+def _audio_chain(i, dur, sr, exact=False, extra=""):
+    """Same format for every piece + 10 ms fades at the cuts (no clicks). exact: audio gets exactly
+    `dur` long (the video length) - otherwise AAC padding would push the next clip by a frame.
+    extra: more filters (e.g. the volume curve), time 0 = start of the piece."""
+    fo = max(0.0, dur - 0.012)
+    fit = f"apad=whole_dur={dur:.6f},atrim=duration={dur:.6f}," if exact else ""
+    ex = f"{extra}," if extra else ""
+    return (f"[{i}:a:0]aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,"
+            f"{fit}{ex}afade=t=in:d=0.01,afade=t=out:st={fo:.3f}:d=0.01[a{i}]")
+
+
+def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, label="Joining clips",
+               crops=None, size=None, afx=None, post_vf="", sub_track=None, sub_lang=None, cwd=None,
+               infos=None) -> Path:
+    """Puts the pieces one after another (frame-accurate, one encode). All pieces get the size and
+    frame rate of the first one.
+    crops: per piece None or (w, h, x, y) in pixels · size: (w, h) of the result · afx: per piece extra audio
+    filters · post_vf: filter on the joined picture (burned-in subtitles) · sub_track: .srt as subtitle track.
+    File names in post_vf / sub_track are relative to `cwd`."""
+    infos = infos or [media_info(p, ffprobe) for p in pieces]
+    first = infos[0]
+    if not first["video"]:
+        raise RuntimeError("The clips have no video.")
+    w, h, rate = first["width"], first["height"], first["rate"]
+    if size:
+        w, h = size
+    has_a = audio and all(i["audio"] for i in infos)
+    total = sum(i["vdur"] for i in infos)
+    parts, labels = [], ""
+    for i, inf in enumerate(infos):
+        fps = "" if inf["rate"] == rate else f"fps={rate},"   # fps adds a frame at the end -> only if needed
+        cr = (crops or [None] * len(infos))[i]
+        crop = f"crop={cr[0]}:{cr[1]}:{cr[2]}:{cr[3]}," if cr else ""
+        parts.append(f"[{i}:v:0]{crop}scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                     f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,{fps}setpts=PTS-STARTPTS[v{i}]")
+        if has_a:
+            parts.append(_audio_chain(i, inf["vdur"], first["sr"], exact=True, extra=(afx or [""] * len(infos))[i]))
+        labels += f"[v{i}]" + (f"[a{i}]" if has_a else "")
+    vout = "[vc]" if post_vf else "[v]"
+    graph = ";".join(parts) + f";{labels}concat=n={len(pieces)}:v=1:a={1 if has_a else 0}{vout}" + ("[a]" if has_a else "")
+    if post_vf:
+        graph += f";[vc]{post_vf}[v]"
+    tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for p in pieces:
+        cmd += ["-i", str(p)]
+    if sub_track:
+        cmd += ["-i", str(sub_track)]
+    cmd += ["-filter_complex", graph, "-map", "[v]"]
+    if has_a:
+        cmd += ["-map", "[a]"]
+    if sub_track:
+        cmd += ["-map", f"{len(pieces)}:s", "-c:s", "mov_text"]
+        if sub_lang:
+            cmd += ["-metadata:s:s:0", f"language={_iso639_2(sub_lang)}"]
+    cmd += [*vargs, *(aargs if has_a else ["-an"]), "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, total, emit, label, cwd=cwd)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def join_audio(pieces, dst, *, afmt, kbps, ffmpeg, ffprobe, emit, title=None, cover=None, afx=None,
+               label="Joining clips") -> Path:
+    infos = [media_info(p, ffprobe) for p in pieces]
+    sr = infos[0]["sr"]
+    total = sum(i["duration"] for i in infos)
+    graph = ";".join(_audio_chain(i, inf["adur"], sr, extra=(afx or [""] * len(infos))[i])
+                     for i, inf in enumerate(infos))
+    graph += ";" + "".join(f"[a{i}]" for i in range(len(pieces))) + f"concat=n={len(pieces)}:v=0:a=1[a]"
+    tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for p in pieces:
+        cmd += ["-i", str(p)]
+    use_cover = bool(cover) and afmt in ("mp3", "m4a")
+    if use_cover:
+        cmd += ["-i", str(cover)]
+    cmd += ["-filter_complex", graph, "-map", "[a]"]
+    if use_cover:
+        cmd += ["-map", f"{len(pieces)}:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+    if afmt == "mp3":
+        cmd += ["-c:a", "libmp3lame", "-b:a", f"{kbps}k", "-id3v2_version", "3", "-write_id3v1", "1"]
+    elif afmt == "m4a":
+        cmd += ["-c:a", "aac", "-b:a", f"{kbps}k", "-movflags", "+faststart"]
+    else:
+        s24 = any(str(i["acodec"]).endswith("24le") for i in infos)
+        cmd += ["-c:a", "pcm_s24le" if s24 else "pcm_s16le"]
+    if title:
+        cmd += ["-metadata", f"title={title}"]
+    cmd += ["-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, total, emit, label)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def export_multi(kind, src, clips, outdir, *, local, join, name, params, ffmpeg, ffprobe, emit, info=None, fx=None):
+    """Several clips of one source -> one file (clips one after another) or one file per clip.
+    kind: 'mp4' | 'mp3' | 'gif'   clips: [(start, end[, label]), ...] in seconds   params: settings of the format.
+    fx: crop / output size / upscaling / volume curve / subtitles (see export_fx)."""
+    labels = [str(c[2]) if len(c) > 2 and c[2] else "" for c in clips]
+    clips = [(float(c[0] or 0.0), float(c[1])) for c in clips]
+    if not clips:
+        raise RuntimeError("Add at least one clip.")
+    for s, e in clips:
+        if e <= s:
+            raise RuntimeError(f"Clip {fmt_t(s)} – {fmt_t(e)}: the end must be after the start.")
+    n = len(clips)
+    outdir = Path(outdir)
+    ext = _kind_ext(kind, params)
+    if kind == "gif":
+        too_long = [k + 1 for k, (s, e) in enumerate(clips) if e - s > GIF_MAX + 0.01]
+        if join and sum(e - s for s, e in clips) > GIF_MAX + 0.01:
+            raise RuntimeError(f"Joined GIFs can be at most {GIF_MAX} s – shorten or remove clips.")
+        if not join and too_long:
+            raise RuntimeError(f"GIFs can be at most {GIF_MAX} s – clip {too_long[0]} is longer.")
+
+    if fx_needed(kind, fx):
+        return export_fx(kind, src, clips, labels, outdir, local=local, join=join, name=name, params=params,
+                         fx=fx, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, info=info)
+    if not join:
+        files = []
+        for k, (s, e) in enumerate(clips):
+            nm = unique_name(outdir, clip_file_name(name, k, labels[k]), ext) if name else None
+            files += _single_export(kind, src, s, e, outdir, local, params, nm, ffmpeg, ffprobe,
+                                    _sub_emit(emit, k, n, f"Clip {k + 1}/{n}"))
+        return [Path(f) for f in files]
+
+    tmp = outdir / f".ytclip_join_{os.getpid()}_{int(time.time() * 1000) % 100000}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        pieces = []
+        for k, (s, e) in enumerate(clips):
+            pieces.append(_piece(kind, src, s, e, tmp, k, local, params, ffmpeg, ffprobe,
+                                 _sub_emit(emit, k, n + 1, f"Clip {k + 1}/{n}")))
+        jemit = _sub_emit(emit, n, n + 1, "Joining")
+        dst = outdir / ((safe_name(name) if name else "clips") + ext)
+        if kind == "mp4":
+            codec, profile = params["codec"], params["profile"]
+            enc = check_encoder(params["encoder"], ffmpeg, emit, codec)
+            total = sum(e - s for s, e in clips)
+            vargs, aargs = encode_args(enc, params["size"], params["target_mb"], total, codec, profile)
+            jemit("status", f"{n} clips …")
+            return [join_video(pieces, dst, vargs=vargs, aargs=aargs, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=jemit)]
+        if kind == "mp3":
+            cover = None
+            if params["afmt"] in ("mp3", "m4a"):
+                try:
+                    at = clips[0][0] + min(1.0, (clips[0][1] - clips[0][0]) / 2)
+                    cover = save_thumbnail(src if not local else str(src), tmp / "cover.jpg", ffmpeg=ffmpeg,
+                                           info=info, at=at)
+                except Exception:  # noqa: BLE001 - no cover is fine
+                    cover = None
+            return [join_audio(pieces, dst, afmt=params["afmt"], kbps=params["kbps"], ffmpeg=ffmpeg,
+                               ffprobe=ffprobe, emit=jemit, title=dst.stem, cover=cover)]
+        # GIF: join to a clean intermediate, then the usual two-pass palette
+        mid = tmp / "joined.mp4"
+        join_video(pieces, mid, vargs=["-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-pix_fmt", "yuv420p"],
+                   aargs=[], ffmpeg=ffmpeg, ffprobe=ffprobe, emit=_sub_emit(emit, n, n + 2, "Joining"), audio=False)
+        dur = media_info(mid, ffprobe)["duration"]
+        return [gif_encode(mid, dst, None, None, dur, params["width"], params["fps"], params["colors"], ffmpeg,
+                           _sub_emit(emit, n + 1, n + 2, "GIF"))]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------- streamed preview (no download)
+
+STREAM_CHUNK = 2 * 1024 * 1024   # bytes per request to YouTube (big open requests get throttled)
+
+
+def _stream_fmt(f, info) -> dict:
+    hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
+            if k.lower() not in ("accept-encoding", "range")}
+    ck = _cookie_header(f.get("cookies") or info.get("cookies"))   # TikTok & co. need their cookies
+    if ck:
+        hdrs["Cookie"] = ck
+    return {"url": f["url"], "headers": hdrs, "size": f.get("filesize") or None, "ext": f.get("ext") or "mp4",
+            "height": f.get("height"), "fps": f.get("fps")}
+
+
+def pick_streams(info) -> dict | None:
+    """Plain HTTP files of the video for the player: one with picture + sound if there is one (≤720p),
+    else a picture-only file (around 480p, H.264 preferred) plus a sound-only file."""
+    fmts = [f for f in info.get("formats") or []
+            if f.get("url") and str(f.get("protocol") or "") in ("http", "https")
+            and not f.get("fragments") and f.get("ext") in ("mp4", "webm", "m4a")]
+
+    def has_v(f):
+        return f.get("vcodec") not in (None, "none")
+
+    def has_a(f):
+        return f.get("acodec") not in (None, "none")
+
+    def short(f):   # vertical videos (TikTok, Reels, Shorts): the short side counts
+        w, h = f.get("width") or 0, f.get("height") or 0
+        return min(w, h) if w and h else h
+
+    def vrank(f):
+        h = short(f)
+        return (abs(min(h, 720) - 480) if h else 9999, 0 if str(f.get("vcodec") or "").startswith("avc") else 1,
+                f.get("tbr") or 0)
+
+    both = [f for f in fmts if has_v(f) and has_a(f) and short(f) <= 720]
+    if both:
+        best = min(both, key=vrank)
+        return {"video": _stream_fmt(best, info), "audio": None, "fps": best.get("fps")}
+    vids = [f for f in fmts if has_v(f) and not has_a(f) and short(f) <= 720]
+    auds = [f for f in fmts if has_a(f) and not has_v(f)]
+    if not vids:
+        big = [f for f in fmts if has_v(f) and has_a(f)]      # only big files with picture + sound: take the smallest
+        if not big:
+            return None
+        best = min(big, key=lambda f: (short(f) or 9999, f.get("tbr") or 0))
+        return {"video": _stream_fmt(best, info), "audio": None, "fps": best.get("fps")}
+    v = min(vids, key=vrank)
+    a = min(auds, key=lambda f: (0 if f.get("ext") == "m4a" else 1, abs((f.get("abr") or 128) - 128))) if auds else None
+    return {"video": _stream_fmt(v, info), "audio": _stream_fmt(a, info) if a else None, "fps": v.get("fps")}
+
+
+class StreamProxy:
+    """Tiny local web server for the player: it asks for byte ranges, the proxy fetches them from YouTube in
+    small pieces (with the same headers yt-dlp uses). Nothing is written to disk, there are no ads."""
+
+    def __init__(self):
+        import http.server
+        proxy = self
+        self.items: dict[str, dict] = {}
+        self._n = 0
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_HEAD(self):
+                proxy._serve(self, head=True)
+
+            def do_GET(self):
+                proxy._serve(self, head=False)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def add(self, item: dict) -> str:
+        self._n += 1
+        key = f"s{self._n}"
+        self.items[key] = dict(item)
+        return f"http://127.0.0.1:{self.port}/{key}.{item.get('ext') or 'mp4'}"
+
+    def close(self):
+        try:
+            self.server.shutdown()
+            self.server.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _open(item, a, b):
+        import urllib.request
+        req = urllib.request.Request(item["url"], headers={**item["headers"], "Range": f"bytes={a}-{b}"})
+        return urllib.request.urlopen(req, timeout=20)
+
+    def _size(self, item) -> int:
+        if not item.get("size"):
+            with self._open(item, 0, 0) as r:
+                m = re.search(r"/(\d+)", r.headers.get("Content-Range", ""))
+                item["size"] = int(m.group(1)) if m else int(r.headers.get("Content-Length") or 0)
+        return int(item["size"])
+
+    def _serve(self, h, head):
+        item = self.items.get(h.path.lstrip("/").split(".")[0])
+        if item is None:
+            h.send_error(404)
+            return
+        try:
+            total = self._size(item)
+        except Exception:  # noqa: BLE001 - expired link, no internet …
+            h.send_error(502)
+            return
+        m = re.match(r"bytes=(\d*)-(\d*)", h.headers.get("Range") or "")
+        start, end = 0, total - 1
+        if m and m.group(1):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total - 1
+        elif m and m.group(2):
+            start = max(0, total - int(m.group(2)))
+        end = min(end, total - 1)
+        if start > end:
+            h.send_response(416)
+            h.send_header("Content-Range", f"bytes */{total}")
+            h.send_header("Content-Length", "0")
+            h.end_headers()
+            return
+        h.send_response(206 if m else 200)
+        h.send_header("Content-Type", {"mp4": "video/mp4", "m4a": "audio/mp4", "webm": "video/webm"}
+                      .get(item.get("ext"), "application/octet-stream"))
+        h.send_header("Accept-Ranges", "bytes")
+        h.send_header("Content-Length", str(end - start + 1))
+        if m:
+            h.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        h.end_headers()
+        if head:
+            return
+        pos = start
+        try:
+            while pos <= end:
+                b = min(end, pos + STREAM_CHUNK - 1)
+                with self._open(item, pos, b) as r:
+                    while True:
+                        data = r.read(65536)
+                        if not data:
+                            break
+                        h.wfile.write(data)
+                        pos += len(data)
+                if pos <= b:          # YouTube sent less than asked -> stop cleanly
+                    break
+        except OSError:               # the player jumped elsewhere or stopped - normal
+            pass
+        if pos <= end:
+            h.close_connection = True
+
+
+# ----------------------------------------------------------------------------- crop / size / volume / subtitles
+
+def _even(x) -> int:
+    return max(2, int(round(float(x) / 2.0)) * 2)
+
+
+def crop_rect(box, W, H, aspect):
+    """box: (x, y, w, h) as fractions of the frame -> (cw, ch, cx, cy) in pixels with exactly this aspect."""
+    aw, ah = aspect
+    x, y, w, h = box if box else (0.0, 0.0, 1.0, 1.0)
+    cw = max(16.0, w * W, h * H * aw / ah)   # the box was drawn on the (smaller) preview -> don't lose a pixel
+    ch = cw * ah / aw
+    if ch > H:
+        ch, cw = H, H * aw / ah
+    if cw > W:
+        cw, ch = W, W * ah / aw
+    cw, ch = min(_even(cw), W - W % 2), min(_even(ch), H - H % 2)
+    if box is None:   # centered
+        cx, cy = (W - cw) // 2, (H - ch) // 2
+    else:
+        cx = min(max(0, int(round(x * W))), W - cw)
+        cy = min(max(0, int(round(y * H))), H - ch)
+    return cw, ch, cx, cy
+
+
+def center_box(aspect, W, H):
+    """Biggest centered box with this aspect, as fractions."""
+    cw, ch, cx, cy = crop_rect(None, W, H, aspect)
+    return (cx / W, cy / H, cw / W, ch / H)
+
+
+def out_dims(cw, ch, short, aspect=None):
+    """Size of the result: the crop itself, or scaled so that the short side is `short` px
+    (with a crop format the exact ratio of the format, e.g. 1080 × 1920 for 9:16)."""
+    if not short:
+        return _even(cw), _even(ch)
+    if aspect:
+        cw, ch = aspect
+    if cw <= ch:
+        return _even(short), _even(short * ch / cw)
+    return _even(short * cw / ch), _even(short)
+
+
+def target_dims(cw, ch, up, aspect=None):
+    """Size of the result for an upscale setting: None (keep), ("x", factor) or ("short", px)."""
+    if not up:
+        return _even(cw), _even(ch)
+    kind, v = up
+    if kind == "x":
+        return _even(cw * v), _even(ch * v)
+    return out_dims(cw, ch, v, aspect)
+
+
+def vol_at(points, t) -> float:
+    """Value of the volume curve at time t (1.0 = unchanged)."""
+    pts = sorted(points)
+    if not pts:
+        return 1.0
+    if t <= pts[0][0]:
+        return float(pts[0][1])
+    for (t0, g0), (t1, g1) in zip(pts, pts[1:]):
+        if t < t1:
+            return float(g0 + (g1 - g0) * (t - t0) / (t1 - t0)) if t1 > t0 else float(g1)
+    return float(pts[-1][1])
+
+
+def vol_filter(points, offset) -> str:
+    """FFmpeg filter for the volume curve; t = 0 is `offset` on the source timeline.
+    Small audio frames (256 samples ≈ 5 ms) so the curve is smooth without zipper noise."""
+    pts = sorted((float(t) - offset, max(0.0, float(g))) for t, g in points)
+    if not pts or all(abs(g - 1.0) < 1e-4 for _t, g in pts):
+        return ""
+    expr = f"{pts[-1][1]:.4f}"
+    for (t0, g0), (t1, g1) in reversed(list(zip(pts, pts[1:]))):
+        seg = f"{g1:.4f}" if t1 - t0 < 1e-6 else f"{g0:.4f}+({g1 - g0:.4f})*(t-({t0:.4f}))/{t1 - t0:.4f}"
+        expr = f"if(lt(t,{t1:.4f}),{seg},{expr})"
+    expr = f"if(lt(t,{pts[0][0]:.4f}),{pts[0][1]:.4f},{expr})"
+    return f"asetnsamples=n=256:p=0,volume=eval=frame:volume='{expr}'"
+
+
+def clip_file_name(base, k, label="") -> str:
+    lab = safe_name(label)[:60].strip() if label else ""
+    return f"{base}_{k + 1:02d}" + (f" {lab}" if lab else "")
+
+
+def fx_needed(kind, fx) -> bool:
+    """Does this export need the extra encode step (crop, size, volume curve, subtitles in the picture)?"""
+    if not fx:
+        return False
+    if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
+        return True
+    if kind in ("mp4", "mp3") and any(abs(float(g) - 1.0) > 1e-4 for _t, g in fx.get("vol") or []):
+        return True
+    subs = fx.get("subs") or {}
+    return bool(subs.get("cues")) and (subs.get("mode") == "burn" and kind in ("mp4", "gif")
+                                       or subs.get("mode") == "track" and kind == "mp4")
+
+
+# ---- subtitles
+
+_TS = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?")
+_TAG = re.compile(r"<[^>]*>")
+
+
+def _ts(text) -> float:
+    m = _TS.search(text)
+    if not m:
+        raise ValueError(text)
+    h, mi, s, ms = m.groups()
+    return int(h or 0) * 3600 + int(mi) * 60 + int(s) + (int((ms or "0").ljust(3, "0")) / 1000)
+
+
+def _clean_text(t) -> str:
+    import html
+    t = html.unescape(_TAG.sub("", t)).replace("​", "")
+    return "\n".join(x.strip() for x in t.splitlines() if x.strip())
+
+
+def parse_srt_vtt(text):
+    """SRT or WebVTT -> [(start, end, text)]. Rolling YouTube auto captions (each line repeated in the next
+    cue) are reduced to the new lines."""
+    cues, prev = [], []
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+    for block in re.split(r"\n\s*\n", text):
+        lines = block.strip("\n").split("\n")
+        idx = next((i for i, x in enumerate(lines) if "-->" in x), None)
+        if idx is None:
+            continue
+        a, b = lines[idx].split("-->", 1)
+        try:
+            s, e = _ts(a), _ts(b.strip().split(" ")[0])
+        except ValueError:
+            continue
+        body = [x for x in _clean_text("\n".join(lines[idx + 1:])).split("\n") if x]
+        new = [x for x in body if x not in prev]
+        prev = body
+        if not new or e <= s:
+            continue
+        cues.append([s, e, "\n".join(new)])
+    return _tidy_cues(cues)
+
+
+def parse_json3(data):
+    import json as _json
+    d = _json.loads(data) if isinstance(data, (str, bytes)) else data
+    cues = []
+    for ev in d.get("events") or []:
+        if ev.get("aAppend") or not ev.get("segs"):
+            continue
+        txt = _clean_text("".join(s.get("utf8", "") for s in ev["segs"]))
+        if not txt:
+            continue
+        s = ev.get("tStartMs", 0) / 1000
+        e = s + (ev.get("dDurationMs") or 2000) / 1000
+        cues.append([s, e, txt])
+    return _tidy_cues(cues)
+
+
+def parse_ass(text):
+    cues, fmt = [], None
+    for line in text.replace("\r", "").splitlines():
+        if line.startswith("Format:") and fmt is None:
+            fmt = [x.strip().lower() for x in line[7:].split(",")]
+        elif line.startswith("Dialogue:"):
+            f = fmt or ["layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"]
+            parts = line[9:].split(",", len(f) - 1)
+            try:
+                s, e = _ts(parts[f.index("start")]), _ts(parts[f.index("end")])
+            except (ValueError, IndexError):
+                continue
+            txt = re.sub(r"\{[^}]*\}", "", parts[-1]).replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
+            txt = _clean_text(txt)
+            if txt and e > s:
+                cues.append([s, e, txt])
+    return _tidy_cues(cues)
+
+
+def parse_subs(data, ext="") -> list:
+    if isinstance(data, bytes):
+        data = data.decode("utf-8-sig", errors="replace")
+    ext = ext.lower().lstrip(".")
+    if ext == "json3" or data.lstrip().startswith("{"):
+        return parse_json3(data)
+    if ext in ("ass", "ssa") or "[Script Info]" in data[:200]:
+        return parse_ass(data)
+    return parse_srt_vtt(data)
+
+
+def _tidy_cues(cues):
+    """Sorted, no overlaps (one line after the other), at least 0.2 s each."""
+    cues = sorted(([float(s), float(e), t] for s, e, t in cues), key=lambda c: c[0])
+    out = []
+    for i, c in enumerate(cues):
+        if i + 1 < len(cues) and cues[i + 1][0] > c[0]:
+            c[1] = min(c[1], cues[i + 1][0])
+        if c[1] - c[0] >= 0.05:
+            out.append((round(c[0], 3), round(c[1], 3), c[2]))
+    return out
+
+
+def cue_at(cues, t):
+    for s, e, txt in cues:
+        if s <= t < e:
+            return txt
+        if s > t:
+            break
+    return ""
+
+
+def _srt_ts(t) -> str:
+    ms = int(round(max(0.0, t) * 1000))
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+
+def write_srt(cues, dst) -> Path:
+    lines = []
+    for i, (s, e, txt) in enumerate(cues, 1):
+        lines += [str(i), f"{_srt_ts(s)} --> {_srt_ts(e)}", txt, ""]
+    Path(dst).write_text("\n".join(lines), encoding="utf-8")
+    return Path(dst)
+
+
+def map_cues(cues, segs):
+    """Cues of the source timeline -> cues of the result. segs: [(start, end, offset_in_result)]."""
+    out = []
+    for s0, e0, off in segs:
+        for s, e, txt in cues:
+            if e <= s0 or s >= e0:
+                continue
+            a, b = max(s, s0) - s0 + off, min(e, e0) - s0 + off
+            if b - a >= 0.05:
+                out.append((a, b, txt))
+    return out
+
+
+def _ass_color(hexcol, alpha=0) -> str:
+    c = str(hexcol or "#ffffff").lstrip("#")
+    c = (c + "ffffff")[:6]
+    return f"&H{alpha:02X}{c[4:6]}{c[2:4]}{c[0:2]}".upper()
+
+
+def sub_layout(w, h, style=None):
+    """Font size, outline and position of the subtitles for a w × h picture (same for preview and export).
+    -> (font px, outline px, anchor x, anchor y) – the anchor is the bottom center of the text."""
+    st = {**SUB_STYLE, **(style or {})}
+    fs = max(8.0, min(w, h) * 0.055 * float(st.get("size") or 100) / 100)
+    pos = st.get("pos")
+    if pos:
+        ax, ay = pos[0] * w, pos[1] * h
+    else:
+        ax, ay = w / 2, h * (1 - (0.17 if h > w * 1.2 else 0.06))
+    return fs, max(1.5, fs * 0.075), ax, ay
+
+
+def write_ass(cues, dst, w, h, style=None) -> Path:
+    """Burned-in subtitles in the chosen font, size, colors and position (default: bottom center, on tall
+    9:16 videos a bit higher so TikTok / Reels / Shorts buttons don't cover them)."""
+    def ts(t):
+        cs = int(round(max(0.0, t) * 100))
+        return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+    st = {**SUB_STYLE, **(style or {})}
+    fs, ol, ax, ay = sub_layout(w, h, st)
+    fs = round(fs)
+    mv = round(h - ay)
+    ml = round(w * 0.07)
+    font = str(st.get("font") or "Arial").replace(",", " ")
+    bold = -1 if st.get("bold") else 0
+    pos = f"{{\\an2\\pos({ax:.0f},{ay:.0f})}}" if st.get("pos") else ""
+    head = ("[Script Info]\nScriptType: v4.00+\nWrapStyle: 0\nScaledBorderAndShadow: yes\n"
+            f"PlayResX: {w}\nPlayResY: {h}\n\n[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+            "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            f"Style: Default,{font},{fs},{_ass_color(st.get('color'))},{_ass_color(st.get('color'))},"
+            f"{_ass_color(st.get('outline'))},{_ass_color(st.get('outline'), 0x64)},{bold},0,0,0,100,100,0,0,1,"
+            f"{ol:.1f},{max(0.0, fs * 0.03):.1f},2,{ml},{ml},{mv},1\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    ev = []
+    for s, e, txt in cues:
+        t = txt.replace("{", "(").replace("}", ")").replace("\n", "\\N")
+        ev.append(f"Dialogue: 0,{ts(s)},{ts(e)},Default,,0,0,0,,{pos}{t}")
+    Path(dst).write_text(head + "\n".join(ev) + "\n", encoding="utf-8")
+    return Path(dst)
+
+
+_ISO2 = {"en": "eng", "de": "ger", "fr": "fre", "es": "spa", "it": "ita", "ja": "jpn", "ko": "kor", "zh": "chi",
+         "pt": "por", "ru": "rus", "nl": "dut", "pl": "pol", "tr": "tur", "ar": "ara", "hi": "hin", "sv": "swe"}
+
+
+def _iso639_2(lang) -> str:
+    code = str(lang or "").split("-")[0].lower()
+    return _ISO2.get(code, code if len(code) == 3 else "und")
+
+
+def _lang_name(code) -> str:
+    names = {"en": "English", "de": "German", "fr": "French", "es": "Spanish", "it": "Italian", "ja": "Japanese",
+             "ko": "Korean", "zh": "Chinese", "pt": "Portuguese", "ru": "Russian", "nl": "Dutch", "pl": "Polish",
+             "tr": "Turkish", "ar": "Arabic", "hi": "Hindi", "sv": "Swedish", "id": "Indonesian", "vi": "Vietnamese"}
+    base = str(code).split("-")[0].lower()
+    return names.get(base, str(code))
+
+
+def list_subs(info) -> list:
+    """Subtitles of a video for the menu: the real ones first, then the automatic ones (original language,
+    English and German translations)."""
+    out = []
+    for key, fmts in (info.get("subtitles") or {}).items():
+        if key == "live_chat" or not fmts:
+            continue
+        name = next((f.get("name") for f in fmts if f.get("name")), "") or _lang_name(key)
+        out.append({"label": name, "kind": "yt", "key": key})
+    auto = info.get("automatic_captions") or {}
+    orig = [k for k in auto if k.endswith("-orig")]
+    lang = info.get("language")
+    seen = set()
+    for key in orig + ([lang] if lang in auto else []):
+        base = key.replace("-orig", "")
+        if base in seen:
+            continue
+        seen.add(base)
+        out.append({"label": f"{_lang_name(base)} (automatic)", "kind": "yt-auto", "key": key})
+    for key in ("en", "de"):
+        if key in auto and key not in seen:
+            seen.add(key)
+            out.append({"label": f"{_lang_name(key)} (automatic, translated)", "kind": "yt-auto", "key": key})
+    return out
+
+
+def sidecar_subs(path) -> list:
+    """Subtitle files next to a video: movie.srt, movie.en.srt, movie.de.vtt …"""
+    p = Path(path)
+    out = []
+    try:
+        for f in sorted(p.parent.iterdir()):
+            if f.suffix.lower() in (".srt", ".vtt", ".ass", ".ssa") and f.name.lower().startswith(p.stem.lower()):
+                out.append({"label": f"{f.name} (file next to the video)", "kind": "file", "key": str(f)})
+    except OSError:
+        pass
+    return out
+
+
+def fetch_subs(url, item, ffmpeg=None) -> list:
+    """Loads one entry of list_subs / local_info['subs'] (or a file) -> cues."""
+    kind, key = item.get("kind"), item.get("key")
+    if kind == "file":
+        p = Path(key)
+        return parse_subs(p.read_bytes(), p.suffix)
+    if kind == "embedded":
+        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(url), "-map", f"0:s:{key}",
+                            "-f", "srt", "-"], capture_output=True, timeout=180, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("Could not read the subtitles: " + r.stderr.decode("utf-8", "replace").strip()[-200:])
+        return parse_srt_vtt(r.stdout.decode("utf-8", "replace"))
+    import tempfile
+    from yt_dlp import YoutubeDL
+    with tempfile.TemporaryDirectory(prefix="ytclip_subs_") as td:
+        opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+                "writesubtitles": kind == "yt", "writeautomaticsub": kind == "yt-auto",
+                "subtitleslangs": [key], "subtitlesformat": "json3/srt/vtt/best",
+                "outtmpl": str(Path(td) / "subs.%(ext)s"), "logger": _Silent(), **YDL_EXTRA}
+        with YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+        files = [f for f in Path(td).iterdir() if f.is_file()]
+        if not files:
+            raise RuntimeError("These subtitles could not be downloaded.")
+        f = files[0]
+        return parse_subs(f.read_bytes(), f.suffix)
+
+
+def save_srts(files, clips, cues, join) -> list:
+    """.srt next to the results (times of the result). files: the media files in clip order."""
+    out = []
+    if not cues or not files:
+        return out
+    groups = [list(range(len(clips)))] if join else [[k] for k in range(len(clips))]
+    for f, g in zip(files, groups):
+        segs, off = [], 0.0
+        for k in g:
+            s, e = clips[k][0], clips[k][1]
+            segs.append((s, e, off))
+            off += e - s
+        mapped = map_cues(cues, segs)
+        if mapped:
+            out.append(write_srt(mapped, Path(f).with_suffix(".srt")))
+    return out
+
+
+# ---- the export with effects
+
+def _clip_names(outdir, name, labels, join, ext, base):
+    if join:
+        return [name or unique_name(outdir, base, ext)]
+    return [unique_name(outdir, clip_file_name(name or base, k, labels[k]), ext) for k in range(len(labels))]
+
+
+def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx, ffmpeg, ffprobe, emit, info=None):
+    """Clips -> pieces in a good intermediate quality -> crop / scale (AI upscale) / volume curve / subtitles
+    in one more encode. join: all clips in one file, else one file per clip."""
+    n = len(clips)
+    ext = _kind_ext(kind, params)
+    base = safe_name((info or {}).get("title") or Path(str(src)).stem or "clip")
+    names = _clip_names(outdir, name, labels, join, ext, base)
+    groups = [list(range(n))] if join else [[k] for k in range(n)]
+    aspect = fx.get("aspect") if kind in ("mp4", "gif") else None
+    boxes = list(fx.get("boxes") or []) + [None] * n
+    subs = fx.get("subs") or {}
+    cues = subs.get("cues") or []
+    mode = subs.get("mode") if cues else None
+    if kind == "mp3":
+        mode = None
+    elif kind == "gif" and mode == "track":
+        mode = "burn"
+    vol = fx.get("vol") or []
+    model = fx.get("model") or {"kind": "std"}
+    steps = n + len(groups)
+    step = [0]
+
+    def sub(label):
+        e = _sub_emit(emit, step[0], steps, label)
+        step[0] += 1
+        return e
+
+    tmp = (Path(outdir) / f".ytclip_fx_{os.getpid()}_{int(time.time() * 1000) % 100000}").resolve()
+    tmp.mkdir(parents=True, exist_ok=True)
+    results = []
+    try:
+        pieces = []
+        for k, (s, e) in enumerate(clips):
+            pieces.append(_piece(kind, src, s, e, tmp, k, local, params, ffmpeg, ffprobe,
+                                 sub(f"Clip {k + 1}/{n}" if n > 1 else "Clip")))
+        for gi, g in enumerate(groups):
+            gemit = sub("Saving" if len(groups) == 1 else f"File {gi + 1}/{len(groups)}")
+            dst = Path(outdir) / (names[gi] + ext)
+            ps = [pieces[k] for k in g]
+            infos = [media_info(p, ffprobe) for p in ps]
+            afx = [vol_filter(vol, clips[k][0]) if kind in ("mp4", "mp3") else "" for k in g]
+            if kind == "mp3":
+                cover = None
+                if params["afmt"] in ("mp3", "m4a"):
+                    try:
+                        at = clips[g[0]][0] + min(1.0, (clips[g[0]][1] - clips[g[0]][0]) / 2)
+                        cover = save_thumbnail(src if not local else str(src), tmp / f"cover{gi}.jpg", ffmpeg=ffmpeg,
+                                               info=info, at=at)
+                    except Exception:  # noqa: BLE001
+                        cover = None
+                results.append(join_audio(ps, dst, afmt=params["afmt"], kbps=params["kbps"], ffmpeg=ffmpeg,
+                                          ffprobe=ffprobe, emit=gemit, title=dst.stem, cover=cover, afx=afx,
+                                          label="Saving"))
+                continue
+            # picture: crop per clip, one output size for the file
+            crops = []
+            for k, inf in zip(g, infos):
+                crops.append(crop_rect(boxes[k], inf["width"], inf["height"], aspect) if aspect else None)
+            cw, ch = (crops[0][0], crops[0][1]) if aspect else (infos[0]["width"], infos[0]["height"])
+            W, H = target_dims(cw, ch, fx.get("up") if kind == "mp4" else None, aspect)
+            if kind == "mp4" and model.get("kind") == "esr" and W > cw * 1.05:
+                for j, (p, cr) in enumerate(zip(ps, crops)):
+                    ps[j] = ai_upscale_video(p, cr, (W, H), model, tmp, f"{gi}_{j}", ffmpeg=ffmpeg,
+                                             ffprobe=ffprobe, emit=gemit)
+                    crops[j] = None
+                infos = [media_info(p, ffprobe) for p in ps]
+            segs, off = [], 0.0
+            for k, inf in zip(g, infos):
+                segs.append((clips[k][0], clips[k][1], off))
+                off += inf["vdur"]
+            mapped = map_cues(cues, segs) if mode else []
+            post_vf, track = "", None
+            if mode == "burn" and mapped:
+                style = subs.get("style") or {}
+                write_ass(mapped, tmp / f"subs{gi}.ass", W, H, style)
+                fdir = tmp / "fonts"
+                n_fonts = collect_fonts(style, fdir)
+                post_vf = f"ass=subs{gi}.ass" + (":fontsdir=fonts" if n_fonts else "")
+            elif mode == "track" and mapped:
+                track = write_srt(mapped, tmp / f"subs{gi}.srt").name
+            if kind == "mp4":
+                codec, profile = params["codec"], params["profile"]
+                enc = check_encoder(params["encoder"], ffmpeg, emit, codec)
+                total = sum(inf["vdur"] for inf in infos)
+                vargs, aargs = encode_args(enc, params["size"], params["target_mb"], total, codec, profile)
+                results.append(join_video(ps, dst, vargs=vargs, aargs=aargs, ffmpeg=ffmpeg, ffprobe=ffprobe,
+                                          emit=gemit, crops=crops, size=(W, H), afx=afx, post_vf=post_vf,
+                                          sub_track=track, sub_lang=subs.get("lang"), cwd=str(tmp),
+                                          label="Saving", infos=infos))
+            else:  # GIF: clean intermediate with crop + subtitles, then the usual palette
+                mid = tmp / f"gif{gi}.mp4"
+                join_video(ps, mid, vargs=["-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-pix_fmt",
+                                           "yuv420p"], aargs=[], ffmpeg=ffmpeg, ffprobe=ffprobe, emit=gemit,
+                           audio=False, crops=crops, size=(W, H), post_vf=post_vf, cwd=str(tmp), infos=infos)
+                dur = media_info(mid, ffprobe)["duration"]
+                results.append(gif_encode(mid, dst, None, None, dur, params["width"], params["fps"], params["colors"],
+                                          ffmpeg, gemit))
+        return results
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------- AI upscaler (Real-ESRGAN)
+
+def upscaler_exe() -> Path | None:
+    for name in ("realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan"):
+        p = UPSCALER_DIR / name
+        if p.is_file() and (UPSCALER_DIR / "models").is_dir():
+            return p
+    return None
+
+
+def install_upscaler(progress=None) -> Path:
+    """Downloads Real-ESRGAN (ncnn / Vulkan – runs on NVIDIA, AMD and Intel graphics, no CUDA needed)."""
+    import hashlib
+    import urllib.request
+    import zipfile
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    zpath = APP_DIR / "upscaler_download.zip"
+    h = hashlib.sha256()
+    req = urllib.request.Request(UPSCALER_URL, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(zpath, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0) or UPSCALER_MB * 1048576
+            done = 0
+            while True:
+                chunk = r.read(1 << 18)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(min(99.0, done / total * 100))
+        if h.hexdigest() != UPSCALER_SHA256:
+            raise RuntimeError("The download is damaged (checksum does not match) – please try again.")
+        tmp = UPSCALER_DIR.with_name("upscaler_new")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        with zipfile.ZipFile(zpath) as z:
+            for m in z.infolist():
+                nm = m.filename.replace("\\", "/")
+                if nm.endswith("/") or ".." in nm:
+                    continue
+                if nm.startswith("models/") or nm.lower().endswith((".exe", ".dll")):
+                    out = tmp / nm
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(m) as src, open(out, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
+        os.replace(tmp, UPSCALER_DIR)
+    finally:
+        zpath.unlink(missing_ok=True)
+    if progress:
+        progress(100.0)
+    exe = upscaler_exe()
+    if not exe:
+        raise RuntimeError("The upscaler could not be installed.")
+    return exe
+
+
+def remove_upscaler() -> None:
+    shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
+
+
+def list_custom_models() -> list:
+    """Own models: [{'name', 'scale'}] (files: CUSTOM_MODELS_DIR/<name>.param + .bin)."""
+    try:
+        items = json.loads((CUSTOM_MODELS_DIR / "models.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [x for x in items if isinstance(x, dict) and (CUSTOM_MODELS_DIR / f"{x.get('name')}.param").is_file()
+            and (CUSTOM_MODELS_DIR / f"{x.get('name')}.bin").is_file()]
+
+
+def import_model(param_path, scale=None) -> dict:
+    """Copies an ncnn model (.param + .bin next to it) into the app. The scale is read from the name
+    (4x-UltraSharp, RealESRGAN_x2plus …) if not given, else 4."""
+    src = Path(param_path)
+    if src.suffix.lower() == ".bin":
+        src = src.with_suffix(".param")
+    binf = src.with_suffix(".bin")
+    if not src.is_file() or not binf.is_file():
+        raise RuntimeError("A model needs two files with the same name: NAME.param and NAME.bin.")
+    head = src.read_text(encoding="utf-8", errors="replace")[:200]
+    if not head.strip().startswith("7767517"):
+        raise RuntimeError("This is not an ncnn model (.param). Real-ESRGAN needs ncnn models, not .pth / .onnx.")
+    name = re.sub(r"[^\w.+-]+", "-", src.stem).strip("-") or "model"
+    if "realesr-animevideov3" in name or name in {m[1] for m in MODELS.values()}:
+        name += "-own"
+    if not scale:
+        m = re.search(r"(?i)(?:^|[^a-z0-9])(?:x([1-8])|([1-8])x)(?=[^a-z0-9]|plus|$)", src.stem)
+        scale = int(m.group(1) or m.group(2)) if m else 4
+    CUSTOM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, CUSTOM_MODELS_DIR / f"{name}.param")
+    shutil.copyfile(binf, CUSTOM_MODELS_DIR / f"{name}.bin")
+    items = [x for x in list_custom_models() if x["name"] != name] + [{"name": name, "scale": int(scale)}]
+    (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
+    return {"name": name, "scale": int(scale)}
+
+
+def remove_model(name) -> None:
+    for ext in (".param", ".bin"):
+        (CUSTOM_MODELS_DIR / f"{name}{ext}").unlink(missing_ok=True)
+    items = [x for x in list_custom_models() if x["name"] != name]
+    if CUSTOM_MODELS_DIR.is_dir():
+        (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
+
+
+def model_spec(label) -> dict:
+    """Menu entry -> {'kind': 'std'} or {'kind': 'esr', 'name', 'scale', 'dir'}."""
+    if label in MODELS:
+        kind, name, scale = MODELS[label]
+        return {"kind": kind, "name": name, "scale": scale, "dir": None, "label": label}
+    for x in list_custom_models():
+        if label == f"Own · {x['name']}":
+            return {"kind": "esr", "name": x["name"], "scale": x["scale"], "dir": str(CUSTOM_MODELS_DIR),
+                    "label": label}
+    return {"kind": "std", "label": label}
+
+
+def _esr_model(model, need):
+    """-> (model name, scale, folder). The anime video model can do 2×/3×/4×, the others their own scale."""
+    if isinstance(model, str):     # old style: "real" / "anime"
+        model = model_spec("AI · anime video" if model == "anime" else "AI · real footage")
+    name = model.get("name") or "realesrgan-x4plus"
+    if name == "realesr-animevideov3":
+        scale = 2 if need <= 2 else 3 if need <= 3 else 4
+    else:
+        scale = int(model.get("scale") or 4)
+    return name, scale, model.get("dir")
+
+
+def _run_esr(src_dir, out_dir, model, scale, on_tick=None, model_dir=None):
+    exe = upscaler_exe()
+    if not exe:
+        raise RuntimeError("The AI upscaler is not installed – Settings → AI upscaler → Install.")
+    cmd = [str(exe), "-i", str(src_dir), "-o", str(out_dir), "-n", model, "-s", str(scale), "-f", "png",
+           "-m", str(model_dir or exe.parent / "models")]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=str(exe.parent),
+                            creationflags=NO_WINDOW)
+    err: list[bytes] = []
+    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
+    reader.start()
+    while proc.poll() is None:
+        if on_tick:
+            on_tick()
+        time.sleep(0.4)
+    reader.join(5)
+    if proc.returncode != 0:
+        lines = [x for x in b"".join(err).decode("utf-8", "replace").splitlines()
+                 if x.strip() and not re.match(r"^\s*\d+(\.\d+)?%\s*$", x)]
+        tail = "\n".join(lines[-4:])
+        hint = (" Your graphics card needs Vulkan support (current NVIDIA / AMD / Intel driver)."
+                if re.search(r"vulkan|gpu|device", tail, re.I) or not tail else "")
+        raise RuntimeError(f"AI upscaling failed.{hint}" + (f"\n{tail}" if tail else ""))
+
+
+def ai_upscale_video(piece, crop, size, model, tmp, tag, *, ffmpeg, ffprobe, emit) -> Path:
+    """One piece -> frames (cropped) -> Real-ESRGAN in batches -> scaled to `size` and encoded again.
+    Batches keep the disk usage small (big PNG frames are deleted as soon as they are encoded)."""
+    inf = media_info(piece, ffprobe)
+    W, H = size
+    cw, ch = (crop[0], crop[1]) if crop else (inf["width"], inf["height"])
+    name, scale, mdir = _esr_model(model, max(W / cw, H / ch))
+    label_ = (model.get("label") if isinstance(model, dict) else "") or name
+    fin = Path(tmp) / f"esr_in_{tag}"
+    fin.mkdir(parents=True, exist_ok=True)
+    emit("status", "Preparing frames for AI upscaling …")
+    emit("progress", None)
+    vf = [f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
+    r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(piece),
+                        *(["-vf", ",".join(vf)] if vf else []), "-fps_mode", "passthrough",
+                        str(fin / "%06d.png")], capture_output=True, creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-400:])
+    frames = sorted(fin.glob("*.png"))
+    total = len(frames)
+    if not total:
+        raise RuntimeError("No frames to upscale.")
+    per = max(1, (cw * scale) * (ch * scale) * 2)     # rough PNG size of one upscaled frame
+    batch = int(min(200, max(8, 1.5e9 // per)))
+    dst = Path(tmp) / f"esr_{tag}.mp4"
+    enc = subprocess.Popen(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", inf["rate"],
+         "-c:v", "png", "-i", "-", "-i", str(piece), "-map", "0:v:0", "-map", "1:a:0?",
+         "-vf", f"scale={W}:{H}:flags=lanczos,setsar=1", "-c:v", "libx264", "-preset", "medium",
+         "-crf", str(PIECE_CRF - 2), "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(dst)],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
+    t0 = time.time()
+    done = 0
+    try:
+        for b0 in range(0, total, batch):
+            bin_ = Path(tmp) / f"esr_b_{tag}"
+            bout = Path(tmp) / f"esr_o_{tag}"
+            for d in (bin_, bout):
+                shutil.rmtree(d, ignore_errors=True)
+                d.mkdir()
+            chunk = frames[b0:b0 + batch]
+            for f in chunk:
+                os.replace(f, bin_ / f.name)
+
+            def tick(b0=b0, bout=bout):
+                k = b0 + len(list(bout.glob("*.png")))
+                el = time.time() - t0
+                eta = el / k * (total - k) if k else 0
+                emit("progress", k / total * 100)
+                emit("status", f"AI upscaling ({label_}) · "
+                               f"frame {k}/{total}" + (f" · {int(eta) // 60}:{int(eta) % 60:02d} left" if k else ""))
+            _run_esr(bin_, bout, name, scale, tick, mdir)
+            for f in chunk:
+                out = bout / f.name
+                if not out.is_file():
+                    raise RuntimeError(f"AI upscaling stopped at frame {done + 1}.")
+                enc.stdin.write(out.read_bytes())
+                out.unlink()
+                done += 1
+            shutil.rmtree(bin_, ignore_errors=True)
+            shutil.rmtree(bout, ignore_errors=True)
+        enc.stdin.close()
+        rc = enc.wait()
+        if rc != 0:
+            raise RuntimeError("FFmpeg error:\n" + enc.stderr.read().decode("utf-8", "replace").strip()[-400:])
+    except BaseException:
+        try:
+            enc.kill()
+        except OSError:
+            pass
+        raise
+    finally:
+        shutil.rmtree(fin, ignore_errors=True)
+    return dst
+
+
+# ----------------------------------------------------------------------------- still frame
+
+def _cookie_header(s) -> str:
+    """yt-dlp's cookie string (name=value; Domain=…; Path=…) -> value of an HTTP Cookie header."""
+    attrs = {"domain", "path", "expires", "version", "max-age", "secure", "httponly", "samesite", "comment"}
+    out = []
+    for part in str(s or "").split(";"):
+        part = part.strip()
+        if "=" in part and part.split("=", 1)[0].strip().lower() not in attrs:
+            out.append(part)
+    return "; ".join(out)
+
+
+def media_url(url, height=None):
+    """Direct address (+ HTTP headers) of the best picture up to `height` – for grabbing single frames."""
+    from yt_dlp import YoutubeDL
+    fmt = f"bv*[height<={height}]/b[height<={height}]/bv*/b" if height else "bv*/b"
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "format": fmt,
+            "logger": _Silent(), **YDL_EXTRA}
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    f = (info.get("requested_formats") or [info])[0]
+    hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
+            if k.lower() not in ("accept-encoding", "range")}
+    ck = _cookie_header(f.get("cookies") or info.get("cookies"))
+    if ck:
+        hdrs["Cookie"] = ck
+    return f["url"], hdrs
+
+
+def _png_size(path):
+    import struct
+    with open(path, "rb") as f:
+        head = f.read(24)
+    return struct.unpack(">II", head[16:24])
+
+
+def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model=None, ffmpeg, ffprobe, emit,
+                 short=None, enlarge=None) -> Path:
+    """The frame shown in the preview at time t, in full quality, as PNG (with crop / size / AI upscaling)."""
+    import tempfile
+    fps = fps if fps and fps > 1 else 30.0
+    frame = int(t * fps + 1e-3)
+    seek = max(0.0, frame / fps - 0.5 / fps)        # first frame at or after this = the frame on screen
+    with tempfile.TemporaryDirectory(prefix="ytclip_still_") as td:
+        raw = Path(td) / "frame.png"
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        if local:
+            inp = str(src)
+        else:
+            emit("status", "Finding the full-quality video …")
+            inp, hdrs = media_url(src, height)
+            if hdrs:
+                cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())]
+        emit("status", "Grabbing the frame …")
+        cmd += ["-ss", f"{seek:.4f}", "-i", inp, "-frames:v", "1", "-update", "1", str(raw)]
+        r = subprocess.run(cmd, capture_output=True, timeout=300, creationflags=NO_WINDOW)
+        if r.returncode != 0 or not raw.is_file():
+            raise RuntimeError("Could not grab the frame:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+        W, H = _png_size(raw)
+        crop = crop_rect(box, W, H, aspect) if aspect else None
+        cw, ch = (crop[0], crop[1]) if crop else (W, H)
+        if up is None and short:
+            up = ("short", short)
+        if model is None and enlarge in ("real", "anime"):
+            model = model_spec("AI · anime video" if enlarge == "anime" else "AI · real footage")
+        model = model or {"kind": "std"}
+        ow, oh = target_dims(cw, ch, up, aspect)
+        img = raw
+        if crop:
+            img = Path(td) / "crop.png"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-vf",
+                            f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}", str(img)],
+                           check=True, capture_output=True, creationflags=NO_WINDOW)
+        if model.get("kind") == "esr" and ow > cw * 1.05:
+            emit("status", "AI upscaling the frame …")
+            emit("progress", None)
+            din, dout = Path(td) / "esr_in", Path(td) / "esr_out"
+            din.mkdir()
+            dout.mkdir()
+            shutil.copy(img, din / "f.png")
+            name, scale, mdir = _esr_model(model, max(ow / cw, oh / ch))
+            _run_esr(din, dout, name, scale, model_dir=mdir)
+            img = dout / "f.png"
+            if not img.is_file():
+                raise RuntimeError("AI upscaling produced no image.")
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(img)]
+        if _png_size(img) != (ow, oh):
+            cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
+        r = subprocess.run(cmd + [str(dst)], capture_output=True, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+    return Path(dst)
+
+
+# ----------------------------------------------------------------------------- history of links
+
+def history_load() -> list:
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        return [x for x in data if isinstance(x, dict) and x.get("url")]
+    except (OSError, ValueError):
+        return []
+
+
+def _history_save(items) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items[:HISTORY_MAX], indent=1, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, HISTORY_FILE)
+    except OSError:
+        pass
+
+
+def history_thumb_path(url) -> Path:
+    import hashlib
+    return HISTORY_DIR / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
+
+
+def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
+    items = [x for x in history_load() if x.get("url") != url]
+    entry = {"url": url, "title": info.get("title") or url, "channel": info.get("channel") or "",
+             "duration": info.get("duration"), "added": time.time(),
+             "site": {"Youtube": "YouTube", "YoutubeTab": "YouTube"}.get(info.get("site") or "", info.get("site") or "")}
+    if thumb_jpg:
+        try:
+            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            p = history_thumb_path(url)
+            p.write_bytes(thumb_jpg)
+            entry["thumb"] = p.name
+        except OSError:
+            pass
+    items.insert(0, entry)
+    for old in items[HISTORY_MAX:]:
+        if old.get("thumb"):
+            (HISTORY_DIR / old["thumb"]).unlink(missing_ok=True)
+    _history_save(items)
+
+
+def history_remove(url) -> None:
+    items = history_load()
+    for x in items:
+        if x.get("url") == url and x.get("thumb"):
+            (HISTORY_DIR / x["thumb"]).unlink(missing_ok=True)
+    _history_save([x for x in items if x.get("url") != url])
+
+
+def history_clear() -> None:
+    shutil.rmtree(HISTORY_DIR, ignore_errors=True)
+    HISTORY_FILE.unlink(missing_ok=True)
+
+
+def login_hint(msg) -> str:
+    """Extra hint when a site wants a login (Instagram, age-restricted or members-only videos)."""
+    if re.search(r"log ?in|sign in|cookies|rate.?limit|private|members|age", msg or "", re.I) and not YDL_EXTRA:
+        return ("\nTip: this needs a login. Sign in to the site in your browser and turn on "
+                "Settings → Browser login.")
+    return ""
+
+
+# ----------------------------------------------------------------------------- fonts for burned-in subtitles
+
+def system_font_files(family) -> list:
+    """Font files of an installed font family (Windows registry: for all users and per user)."""
+    if not WIN or not family:
+        return []
+    import winreg
+    out, fam = [], family.lower()
+    windir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            key = winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+        except OSError:
+            continue
+        with key:
+            i = 0
+            while True:
+                try:
+                    name, val, _t = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                i += 1
+                n = name.lower()
+                if n == fam or n.startswith(fam + " ") or n.startswith(fam + " (") or n.startswith(fam + " & "):
+                    f = Path(val) if os.path.isabs(val) else windir / val
+                    if f.is_file():
+                        out.append(f)
+    return out
+
+
+def collect_fonts(style, dst_dir) -> int:
+    """Copies the subtitle font (own file, or the installed family) next to the .ass so libass finds it."""
+    files = []
+    ff = (style or {}).get("font_file")
+    if ff and Path(ff).is_file():
+        files.append(Path(ff))
+    files += system_font_files((style or {}).get("font"))
+    if not files:
+        return 0
+    Path(dst_dir).mkdir(parents=True, exist_ok=True)
+    for f in files[:12]:
+        try:
+            shutil.copyfile(f, Path(dst_dir) / f.name)
+        except OSError:
+            pass
+    return len(files)
+
+
+def install_font(path) -> Path:
+    """Keeps a copy of a font file in the app folder (loaded again at every start)."""
+    src = Path(path)
+    FONTS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = FONTS_DIR / src.name
+    if src.resolve() != dst.resolve():
+        shutil.copyfile(src, dst)
+    return dst
+
+
+# ----------------------------------------------------------------------------- app update from GitHub
+
+def _ver(v) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "0"))[:4])
+
+
+def check_app_update(timeout=15.0) -> dict:
+    """version.json of the repo -> {'version', 'newer': bool, 'notes', …}"""
+    data = fetch_bytes(UPDATE_BASE + f"version.json?t={int(time.time())}", timeout=timeout)
+    info = json.loads(data.decode("utf-8-sig"))
+    info["newer"] = _ver(info.get("version")) > _ver(APP_VERSION)
+    return info
+
+
+def install_app_update(info, script, emit) -> Path:
+    """Downloads the new app file, checks it (checksum + Python syntax), installs new packages if needed,
+    keeps the old one as .bak and puts the new one in place. The app restarts afterwards."""
+    import hashlib
+    script = Path(script)
+    name = info.get("file") or "tfrog_ytclip.pyw"
+    if "/" in name or "\\" in name:
+        raise RuntimeError("Invalid update file name.")
+    emit("status", f"Downloading version {info.get('version')} …")
+    data = fetch_bytes(UPDATE_BASE + f"{name}?t={int(time.time())}", timeout=60)
+    if info.get("sha256") and hashlib.sha256(data).hexdigest() != info["sha256"]:
+        raise RuntimeError("The download doesn't match the checksum – try again in a few minutes.")
+    compile(data.decode("utf-8"), name, "exec")         # never install a broken file
+    extra = {}
+    for f in info.get("extra") or []:
+        if isinstance(f, str) and "/" not in f and "\\" not in f and f != name:
+            try:
+                extra[f] = fetch_bytes(UPDATE_BASE + f, timeout=60)
+            except Exception:  # noqa: BLE001 - optional files (icon …)
+                pass
+    pip = [x for x in info.get("pip") or [] if isinstance(x, str) and re.match(r"^[\w.\[\],<>=!-]+$", x)]
+    if pip:
+        emit("status", "Installing new packages …")
+        py = Path(sys.executable)
+        if py.name.lower() == "pythonw.exe" and py.with_name("python.exe").exists():
+            py = py.with_name("python.exe")
+        r = subprocess.run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", *pip],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("Installing packages failed:\n" + (r.stderr or r.stdout).strip()[-500:])
+    if script.exists():
+        shutil.copyfile(script, script.with_name(script.name + ".bak"))
+    tmp = script.with_name(script.name + ".new")
+    tmp.write_bytes(data)
+    os.replace(tmp, script)
+    for f, b in extra.items():
+        try:
+            (script.parent / f).write_bytes(b)
+        except OSError:
+            pass
+    return script
+
+# ----------------------------------------------------------------------------- GUI (PySide6)
+
+from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
+from PySide6.QtCore import Qt, Signal  # noqa: E402
+
+try:   # video player (PySide6-Addons); the app works without it
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+    PLAYER_OK = True
+except Exception:  # noqa: BLE001
+    PLAYER_OK = False
+
+AA = QtGui.QPainter.RenderHint.Antialiasing
+SMOOTH = QtGui.QPainter.RenderHint.SmoothPixmapTransform
+
+
+def _rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _lum(h):
+    def f(c):
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = _rgb(h)
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+
+def _mix(a, b, t):
+    return "#%02x%02x%02x" % tuple(int(round(x + (y - x) * t)) for x, y in zip(_rgb(a), _rgb(b)))
+
+
+def theme_colors(theme: str, accent: str) -> dict:
+    c = dict(THEMES.get(theme, THEMES[DEFAULT_THEME]))
+    c["accent"] = accent
+    c["on_accent"] = "#0b0b0c" if _lum(accent) > 0.35 else "#ffffff"
+    c["accent_hover"] = _mix(accent, "#ffffff" if c["dark"] else "#000000", 0.15)
+    c["accent_soft"] = _mix(c["panel"], accent, 0.14)
+    c["warn"], c["err"] = WARN_COLOR, ERR_COLOR
+    return c
+
+
+def _arrow_svg(color: str) -> str:
+    d = APP_DIR / "ui"
+    p = d / f"arrow_{color.lstrip('#')}.svg"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6">'
+                         f'<path d="M1 1l4 4 4-4" fill="none" stroke="{color}" stroke-width="1.6" '
+                         'stroke-linecap="round" stroke-linejoin="round"/></svg>', encoding="utf-8")
+    except OSError:
+        pass
+    return str(p).replace("\\", "/")
+
+
+def _check_svg(color: str) -> str:
+    d = APP_DIR / "ui"
+    p = d / f"check_{color.lstrip('#')}.svg"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">'
+                         f'<path d="M2.5 6.2l2.4 2.4 4.6-5" fill="none" stroke="{color}" stroke-width="1.8" '
+                         'stroke-linecap="round" stroke-linejoin="round"/></svg>', encoding="utf-8")
+    except OSError:
+        pass
+    return str(p).replace("\\", "/")
+
+
+def build_qss(c: dict) -> str:
+    arrow = _arrow_svg(c["muted"])
+    check = _check_svg(c["on_accent"])
+    mono = "Consolas, 'Cascadia Mono', 'JetBrains Mono', monospace"
+    return f"""
+QWidget {{ color: {c['text']}; font-size: 13px; }}
+QMainWindow, QDialog, QWidget#root {{ background: {c['bg']}; }}
+QToolTip {{ background: {c['panel2']}; color: {c['text']}; border: 1px solid {c['border']}; padding: 5px 8px; }}
+QFrame#card {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 16px; }}
+QLabel {{ background: transparent; }}
+QLabel#h1 {{ font-size: 24px; font-weight: 700; }}
+QLabel#sub {{ color: {c['muted']}; }}
+QLabel#section {{ color: {c['muted']}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
+QLabel#muted, QLabel#field {{ color: {c['muted']}; }}
+QLabel#hint {{ color: {c['muted']}; font-size: 12px; }}
+QLabel#hint[state="warn"] {{ color: {c['warn']}; }}
+QLabel#hint[state="error"] {{ color: {c['err']}; }}
+QLabel#vtitle {{ font-size: 15px; font-weight: 600; }}
+QLabel#status {{ color: {c['muted']}; font-size: 12px; }}
+QLabel#status[state="ok"] {{ color: {c['accent']}; }}
+QLabel#status[state="error"] {{ color: {c['err']}; }}
+QLabel#ext {{ color: {c['muted']}; font-family: {mono}; }}
+QLabel#len {{ color: {c['accent']}; font-family: {mono}; font-size: 12px; }}
+QLabel#brand {{ color: {c['border_hi']}; font-size: 10px; font-weight: 700; letter-spacing: 2px; }}
+QLineEdit {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 10px; padding: 8px 11px;
+    selection-background-color: {c['accent']}; selection-color: {c['on_accent']}; }}
+QLineEdit:hover {{ border-color: {c['border_hi']}; }}
+QLineEdit:focus {{ border-color: {c['accent']}; }}
+QLineEdit:disabled {{ color: {c['muted']}; }}
+QLineEdit#url {{ font-size: 14px; padding: 11px 13px; }}
+QLineEdit#time {{ font-family: {mono}; }}
+QLineEdit[state="error"] {{ border-color: {c['err']}; }}
+QComboBox {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 10px; padding: 7px 11px; }}
+QComboBox:hover {{ border-color: {c['border_hi']}; }}
+QComboBox:focus, QComboBox:on {{ border-color: {c['accent']}; }}
+QComboBox:disabled {{ color: {c['muted']}; }}
+QComboBox::drop-down {{ border: none; width: 26px; }}
+QComboBox::down-arrow {{ image: url("{arrow}"); width: 10px; height: 6px; }}
+QComboBox QAbstractItemView {{ background: {c['panel2']}; border: 1px solid {c['border']}; padding: 4px;
+    outline: none; selection-background-color: {c['accent']}; selection-color: {c['on_accent']}; }}
+QPushButton {{ background: {c['panel2']}; border: 1px solid {c['border']}; border-radius: 10px; padding: 8px 14px; }}
+QPushButton:hover {{ border-color: {c['accent']}; }}
+QPushButton:pressed {{ background: {c['border']}; }}
+QPushButton:disabled {{ color: {c['muted']}; border-color: {c['border']}; }}
+QPushButton#primary {{ background: {c['accent']}; color: {c['on_accent']}; border: none; border-radius: 12px;
+    padding: 14px; font-size: 15px; font-weight: 700; }}
+QPushButton#primary:hover {{ background: {c['accent_hover']}; }}
+QPushButton#primary:disabled {{ background: {c['panel2']}; color: {c['muted']}; }}
+QPushButton#ghost {{ background: transparent; border: none; color: {c['muted']}; padding: 6px 8px; }}
+QPushButton#ghost:hover {{ color: {c['text']}; }}
+QPushButton#ghost:disabled {{ color: {c['border_hi']}; }}
+QPushButton#ghost[state="ok"] {{ color: {c['accent']}; font-weight: 700; }}
+QPushButton#chip {{ background: {c['panel2']}; border: 1px solid {c['border']}; border-radius: 12px;
+    padding: 4px 12px; font-size: 12px; min-height: 16px; }}
+QPushButton#chip:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
+QPushButton#chip:disabled {{ color: {c['muted']}; }}
+QFrame#segmented {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 12px; }}
+QFrame#segInd {{ background: {c['accent']}; border: none; border-radius: 9px; }}
+QPushButton#segBtn {{ background: transparent; border: none; color: {c['muted']}; padding: 9px 10px; font-weight: 600; }}
+QPushButton#segBtn:checked {{ color: {c['on_accent']}; }}
+QPushButton#segBtn:hover:!checked {{ color: {c['text']}; }}
+QProgressBar {{ background: {c['panel2']}; border: none; border-radius: 3px; min-height: 6px; max-height: 6px; }}
+QProgressBar::chunk {{ background: {c['accent']}; border-radius: 3px; }}
+QPlainTextEdit {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 12px; color: {c['muted']};
+    font-family: {mono}; font-size: 11px; padding: 6px; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 4px 2px; }}
+QScrollBar::handle:vertical {{ background: {c['border_hi']}; border-radius: 3px; min-height: 30px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QCheckBox {{ spacing: 9px; }}
+QCheckBox:disabled {{ color: {c['muted']}; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 1px solid {c['border_hi']};
+    background: {c['field']}; }}
+QCheckBox::indicator:hover {{ border-color: {c['accent']}; }}
+QCheckBox::indicator:checked {{ background: {c['accent']}; border-color: {c['accent']}; image: url("{check}"); }}
+QSlider::groove:horizontal {{ height: 4px; background: {c['panel2']}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {c['accent']}; border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {c['text']}; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; }}
+QSlider::handle:horizontal:hover {{ background: {c['accent']}; }}
+QPushButton#transport {{ padding: 0; min-width: 34px; max-width: 34px; min-height: 30px; max-height: 30px;
+    border-radius: 9px; font-size: 13px; }}
+QLabel#ptime {{ color: {c['muted']}; font-family: {mono}; font-size: 12px; }}
+QListWidget#clips {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 12px; outline: none;
+    padding: 3px; }}
+QListWidget#clips::item {{ border-radius: 8px; margin: 1px 0; }}
+QListWidget#clips::item:selected {{ background: {c['accent_soft']}; }}
+QListWidget#clips::item:hover:!selected {{ background: {c['panel2']}; }}
+QWidget#cliprow {{ background: transparent; }}
+QLabel#clipno {{ color: {c['accent']}; font-weight: 700; font-family: {mono}; }}
+QLabel#cliptime {{ font-family: {mono}; font-size: 12px; }}
+QPushButton#mini {{ background: transparent; border: none; color: {c['muted']}; padding: 2px 5px; font-size: 13px;
+    min-width: 20px; }}
+QPushButton#mini:hover {{ color: {c['accent']}; }}
+QPushButton#mini:disabled {{ color: {c['border']}; }}
+QPushButton#swatch {{ border-radius: 16px; min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px;
+    padding: 0; border: 3px solid {c['bg']}; }}
+QPushButton#swatch:checked {{ border: 3px solid {c['text']}; }}
+QPushButton#swatch:hover {{ border: 3px solid {c['border_hi']}; }}
+QPushButton#swatch:checked:hover {{ border: 3px solid {c['text']}; }}
+QPushButton#tab {{ background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+    color: {c['muted']}; padding: 6px 2px 7px 2px; margin-right: 14px; font-weight: 600; }}
+QPushButton#tab:hover {{ color: {c['text']}; }}
+QPushButton#tab:checked {{ color: {c['text']}; border-bottom: 2px solid {c['accent']}; }}
+QPushButton#tab:disabled {{ color: {c['border_hi']}; }}
+QFrame#tabline {{ background: {c['border']}; border: none; min-height: 1px; max-height: 1px; }}
+QTableWidget#lines {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 12px;
+    gridline-color: {c['border']}; outline: none; selection-background-color: {c['accent_soft']};
+    selection-color: {c['text']}; }}
+QHeaderView::section {{ background: {c['panel2']}; color: {c['muted']}; border: none;
+    border-bottom: 1px solid {c['border']}; padding: 6px 8px; font-weight: 600; }}
+QTableCornerButton::section {{ background: {c['panel2']}; border: none; }}
+QTableWidget#lines QLineEdit {{ padding: 1px 6px; border-radius: 5px; }}
+QPushButton#colorbtn {{ min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px; padding: 0;
+    border-radius: 8px; border: 2px solid {c['border_hi']}; }}
+QListWidget#history, QListWidget#lines {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 12px;
+    outline: none; padding: 4px; }}
+QListWidget#history::item, QListWidget#lines::item {{ border-radius: 8px; padding: 4px; }}
+QListWidget#history::item:selected, QListWidget#lines::item:selected {{ background: {c['accent_soft']}; color: {c['text']}; }}
+QListWidget#history::item:hover:!selected, QListWidget#lines::item:hover:!selected {{ background: {c['panel2']}; }}
+"""
+
+
+def set_dark_titlebar(widget, dark: bool) -> None:
+    if not WIN:
+        return
+    try:
+        import ctypes
+        hwnd = int(widget.winId())
+        val = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (Win11 / older Win10)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                break
+    except Exception:
+        pass
+
+
+def repolish(w) -> None:
+    w.style().unpolish(w)
+    w.style().polish(w)
+
+
+def set_state(w, state: str) -> None:
+    if w.property("state") != state:
+        w.setProperty("state", state)
+        repolish(w)
+
+
+# ---- custom widgets ----------------------------------------------------------------
+
+def _esc(t: str) -> str:
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def tip_html(title: str, text: str = "") -> str:
+    """Rich-text tooltip (rich text wraps nicely instead of one endless line)."""
+    if not text:
+        return f"<div>{_esc(title)}</div>"
+    return f"<b>{_esc(title)}</b><br>{_esc(text)}"
+
+
+def tip(w, title: str, text: str = ""):
+    w.setToolTip(tip_html(title, text))
+    return w
+
+
+class TipFilter(QtCore.QObject):
+    """App-wide switch for the hover help (Settings)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.enabled = True
+
+    def eventFilter(self, obj, ev):
+        return ev.type() == QtCore.QEvent.Type.ToolTip and not self.enabled
+
+
+class Spinner(QtWidgets.QWidget):
+    def __init__(self, parent=None, size=26):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+        self.color = QtGui.QColor(DEFAULT_ACCENT)
+        self._angle = 0
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def start(self):
+        self._timer.start()
+        self.show()
+        self.raise_()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 7) % 360
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        pen = QtGui.QPen(self.color, 2.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        r = QtCore.QRectF(self.rect()).adjusted(3, 3, -3, -3)
+        p.drawArc(r, -self._angle * 16, 270 * 16)
+
+
+class Segmented(QtWidgets.QFrame):
+    """Segmented control with a sliding highlight."""
+    changed = Signal(str)
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self.setObjectName("segmented")
+        self._ind = QtWidgets.QFrame(self)
+        self._ind.setObjectName("segInd")
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        self._btns = {}
+        for key, label in items:
+            b = QtWidgets.QPushButton(label)
+            b.setObjectName("segBtn")
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, k=key: self.set_value(k, animate=True, emit=True))
+            lay.addWidget(b, 1)
+            self._btns[key] = b
+        self._ind.lower()
+        self._value = items[0][0]
+        self._btns[self._value].setChecked(True)
+        self._anim = QtCore.QPropertyAnimation(self._ind, b"geometry", self)
+        self._anim.setDuration(240)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+
+    def value(self):
+        return self._value
+
+    def set_tips(self, tips: dict):
+        for k, (title, text) in tips.items():
+            if k in self._btns:
+                tip(self._btns[k], title, text)
+
+    def set_value(self, key, animate=False, emit=False):
+        if key not in self._btns:
+            return
+        changed = key != self._value
+        self._value = key
+        for k, b in self._btns.items():
+            b.setChecked(k == key)
+        self._place(animate)
+        if emit and changed:
+            self.changed.emit(key)
+
+    def _place(self, animate):
+        target = self._btns[self._value].geometry()
+        if not target.isValid():
+            return
+        if animate and self.isVisible():
+            self._anim.stop()
+            self._anim.setStartValue(self._ind.geometry())
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self._ind.setGeometry(target)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        QtCore.QTimer.singleShot(0, lambda: self._place(False))
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QtCore.QTimer.singleShot(0, lambda: self._place(False))
+
+
+class RangeSlider(QtWidgets.QWidget):
+    """Timeline with two handles (start/end of the clip), the player position and the other clips."""
+    changed = Signal(float, float)
+    dragged = Signal(str, float)   # handle ('lo' / 'hi' / 'mid') and its time -> the player shows that frame
+
+    M = 12  # horizontal margin
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(46)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._max, self._lo, self._hi = 1.0, 0.0, 1.0
+        self._drag = None
+        self._hover = None
+        self._grab = 0.0
+        self._play = None
+        self._others = []
+        self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
+
+    def set_colors(self, c):
+        self.c = c
+        self.update()
+
+    def set_playhead(self, t):
+        self._play = t
+        self.update()
+
+    def set_others(self, segs):
+        """Other clips (multi-clip mode): [(start, end, label)]"""
+        self._others = list(segs)
+        self.update()
+
+    def set_duration(self, d):
+        self._max = max(float(d), 0.1)
+        self._lo, self._hi = 0.0, self._max
+        self.update()
+
+    def duration(self):
+        return self._max
+
+    def set_range(self, lo, hi):
+        lo = min(max(0.0, lo), self._max)
+        hi = min(max(lo + 0.1, hi), self._max)
+        self._lo, self._hi = lo, hi
+        self.update()
+
+    def values(self):
+        return self._lo, self._hi
+
+    def _x(self, v):
+        return self.M + (self.width() - 2 * self.M) * v / self._max
+
+    def _v(self, x):
+        v = (x - self.M) / max(1, self.width() - 2 * self.M) * self._max
+        return round(min(max(0.0, v), self._max), 1)
+
+    def _hit(self, x):
+        dl, dh = abs(x - self._x(self._lo)), abs(x - self._x(self._hi))
+        if min(dl, dh) <= 12:
+            return "lo" if dl < dh or (dl == dh and x < self._x(self._lo)) else "hi"
+        if self._x(self._lo) < x < self._x(self._hi):
+            return "mid"
+        return "lo" if dl < dh else "hi"
+
+    def mousePressEvent(self, e):
+        x = e.position().x()
+        self._drag = self._hit(x)
+        self._grab = self._v(x) - self._lo
+        self.mouseMoveEvent(e)
+
+    def mouseMoveEvent(self, e):
+        x = e.position().x()
+        if self._drag is None:
+            h = self._hit(x)
+            h = h if h != "mid" else None
+            if h != self._hover:
+                self._hover = h
+                self.update()
+            return
+        v = self._v(x)
+        if self._drag == "lo":
+            self._lo = min(v, self._hi - 0.1)
+        elif self._drag == "hi":
+            self._hi = max(v, self._lo + 0.1)
+        else:
+            span = self._hi - self._lo
+            lo = min(max(0.0, round(v - self._grab, 1)), self._max - span)
+            self._lo, self._hi = lo, lo + span
+        self.update()
+        self.changed.emit(self._lo, self._hi)
+        self.dragged.emit(self._drag, self._hi if self._drag == "hi" else self._lo)
+
+    def mouseReleaseEvent(self, _e):
+        self._drag = None
+
+    def leaveEvent(self, _e):
+        self._hover = None
+        self.update()
+
+    def paintEvent(self, _e):
+        c = self.c
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        y = 16
+        track = QtCore.QRectF(self.M, y - 3, self.width() - 2 * self.M, 6)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor(c["panel2"]))
+        p.drawRoundedRect(track, 3, 3)
+        if self._others:
+            f0 = self.font()
+            f0.setPointSizeF(max(7.0, f0.pointSizeF() - 2))
+            f0.setBold(True)
+            p.setFont(f0)
+            for lo, hi, lab in self._others:
+                a, b = self._x(lo), self._x(hi)
+                col = QtGui.QColor(c["accent"])
+                col.setAlpha(80)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(col)
+                p.drawRoundedRect(QtCore.QRectF(a, y - 7, max(3.0, b - a), 14), 4, 4)
+                if b - a > 14:
+                    p.setPen(QtGui.QColor(c["text"]))
+                    p.drawText(QtCore.QRectF(a, y - 7, b - a, 14), Qt.AlignmentFlag.AlignCenter, str(lab))
+            p.setPen(Qt.PenStyle.NoPen)
+        x1, x2 = self._x(self._lo), self._x(self._hi)
+        p.setBrush(QtGui.QColor(c["accent"]))
+        p.drawRoundedRect(QtCore.QRectF(x1, y - 3, max(2.0, x2 - x1), 6), 3, 3)
+        for name, x in (("lo", x1), ("hi", x2)):
+            r = 9 if (self._hover == name or self._drag == name) else 7.5
+            p.setBrush(QtGui.QColor(c["text"] if c["dark"] else "#ffffff"))
+            p.setPen(QtGui.QPen(QtGui.QColor(c["accent"]), 2.5))
+            p.drawEllipse(QtCore.QPointF(x, y), r, r)
+        f = self.font()
+        f.setPointSizeF(max(7.5, f.pointSizeF() - 1.5))
+        p.setFont(f)
+        p.setPen(QtGui.QColor(c["muted"]))
+        fm = QtGui.QFontMetrics(f)
+        t1, t2 = fmt_ts(self._lo), fmt_ts(self._hi)
+        w1, w2 = fm.horizontalAdvance(t1), fm.horizontalAdvance(t2)
+        lx = min(max(0, x1 - w1 / 2), self.width() - w1)
+        rx = min(max(0, x2 - w2 / 2), self.width() - w2)
+        if rx < lx + w1 + 6:  # labels would overlap -> push apart
+            rx = min(self.width() - w2, lx + w1 + 6)
+            lx = min(lx, rx - w1 - 6)
+        p.drawText(QtCore.QPointF(lx, y + 24), t1)
+        p.drawText(QtCore.QPointF(rx, y + 24), t2)
+        if self._play is not None:
+            xp = self._x(min(max(0.0, self._play), self._max))
+            p.setPen(QtGui.QPen(QtGui.QColor(c["text"]), 2))
+            p.drawLine(QtCore.QPointF(xp, y - 11), QtCore.QPointF(xp, y + 11))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(c["text"]))
+            p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(xp - 4, y - 14), QtCore.QPointF(xp + 4, y - 14),
+                                           QtCore.QPointF(xp, y - 9)]))
+
+
+class Thumb(QtWidgets.QWidget):
+    """16:9 preview with rounded corners, fade-in, a duration badge and an overlay
+    (e.g. 'Load video preview' / download progress). Clickable."""
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        sp = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+        self.setMinimumSize(320, 180)
+        self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
+        self._pix = None
+        self._text = "Paste a YouTube link to see a preview"
+        self._badge = ""
+        self._overlay = ""
+        self._ov_frac = None
+        self._alpha = 1.0
+        self._fade = QtCore.QVariantAnimation(self)
+        self._fade.setDuration(350)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+        self._fade.valueChanged.connect(self._on_fade)
+        self.spinner = Spinner(self, 34)
+
+    def set_colors(self, c):
+        self.c = c
+        self.spinner.color = QtGui.QColor(c["accent"])
+        self.update()
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return int(w * 9 / 16)
+
+    def sizeHint(self):
+        return QtCore.QSize(520, 292)
+
+    def set_overlay(self, text="", frac=None):
+        self._overlay, self._ov_frac = text, frac
+        self.setCursor(Qt.CursorShape.PointingHandCursor if text.startswith("▶") else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+    def set_text(self, text):
+        self._pix, self._text, self._badge = None, text, ""
+        self.spinner.stop()
+        self.update()
+
+    def set_loading(self):
+        self._pix, self._text, self._badge = None, "", ""
+        self.spinner.start()
+        self.update()
+
+    def set_image(self, data, badge=""):
+        self.spinner.stop()
+        self._badge = badge
+        pix = None
+        if data:
+            img = QtGui.QImage()
+            if img.loadFromData(data):
+                pix = QtGui.QPixmap.fromImage(img)
+        self._pix = pix
+        self._text = "" if pix else "No preview image"
+        self._alpha = 0.0
+        self._fade.start()
+        self.update()
+
+    def _on_fade(self, v):
+        self._alpha = float(v)
+        self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.spinner.move((self.width() - self.spinner.width()) // 2, (self.height() - self.spinner.height()) // 2)
+
+    def paintEvent(self, _e):
+        c = self.c
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        p.setRenderHint(SMOOTH)
+        r = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(r, 14, 14)
+        p.fillPath(path, QtGui.QColor(c["field"]))
+        if self._pix is not None and not self._pix.isNull():
+            p.save()
+            p.setClipPath(path)
+            p.setOpacity(self._alpha)
+            pw, ph = self._pix.width(), self._pix.height()
+            s = max(r.width() / pw, r.height() / ph)
+            w, h = pw * s, ph * s
+            p.drawPixmap(QtCore.QRectF(r.center().x() - w / 2, r.center().y() - h / 2, w, h), self._pix,
+                         QtCore.QRectF(0, 0, pw, ph))
+            p.restore()
+            if self._badge:
+                f = self.font()
+                f.setBold(True)
+                p.setFont(f)
+                fm = QtGui.QFontMetrics(f)
+                bw, bh = fm.horizontalAdvance(self._badge) + 14, fm.height() + 6
+                br = QtCore.QRectF(r.right() - bw - 10, r.bottom() - bh - 10, bw, bh)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QtGui.QColor(0, 0, 0, 170))
+                p.drawRoundedRect(br, 6, 6)
+                p.setPen(QtGui.QColor("#ffffff"))
+                p.drawText(br, Qt.AlignmentFlag.AlignCenter, self._badge)
+        elif self._text:
+            p.setPen(QtGui.QColor(c["muted"]))
+            p.drawText(r.adjusted(20, 0, -20, 0), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self._text)
+        if self._overlay:
+            f = self.font()
+            if f.pointSizeF() > 0:
+                f.setPointSizeF(f.pointSizeF() + 0.5)
+            f.setBold(True)
+            p.setFont(f)
+            fm = QtGui.QFontMetrics(f)
+            bw, bh = fm.horizontalAdvance(self._overlay) + 34, fm.height() + (22 if self._ov_frac is not None else 16)
+            br = QtCore.QRectF(r.center().x() - bw / 2, r.center().y() - bh / 2, bw, bh)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(0, 0, 0, 175))
+            p.drawRoundedRect(br, bh / 2 if self._ov_frac is None else 12, bh / 2 if self._ov_frac is None else 12)
+            p.setPen(QtGui.QColor("#ffffff"))
+            tr = QtCore.QRectF(br.left(), br.top() + (2 if self._ov_frac is None else 4), br.width(), fm.height() + 12)
+            p.drawText(tr if self._ov_frac is not None else br, Qt.AlignmentFlag.AlignCenter, self._overlay)
+            if self._ov_frac is not None:
+                bar = QtCore.QRectF(br.left() + 17, br.bottom() - 10, br.width() - 34, 3)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QtGui.QColor(255, 255, 255, 60))
+                p.drawRoundedRect(bar, 1.5, 1.5)
+                p.setBrush(QtGui.QColor(c["accent"]))
+                p.drawRoundedRect(QtCore.QRectF(bar.left(), bar.top(), bar.width() * max(0.0, min(1.0, self._ov_frac)),
+                                                3), 1.5, 1.5)
+        p.setPen(QtGui.QPen(QtGui.QColor(c["border"]), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+
+class VideoCanvas(QtWidgets.QWidget):
+    """Shows the frames of the player (from a QVideoSink) and draws on top: the crop box (drag to move,
+    corners to resize, the format stays) and the current subtitle line."""
+    boxChanged = Signal(object)    # (x, y, w, h) as fractions of the frame
+    subMoved = Signal(object)      # (x, y) bottom center of the subtitles as fractions of the picture, or None
+
+    H = 12  # corner grab size
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
+        self.img = None
+        self.aspect = None
+        self.box = None
+        self.sub_text = ""
+        self.sub_style = dict(SUB_STYLE)
+        self.ghost = False
+        self._sub_rect = None
+        self._sub_grab = None
+        self._drag = None
+        self._grab = None
+        self.sink = None
+        if PLAYER_OK:
+            try:
+                self.sink = QVideoSink(self)
+                self.sink.videoFrameChanged.connect(self._on_frame)
+            except Exception:  # noqa: BLE001
+                self.sink = None
+
+    def set_colors(self, c):
+        self.c = c
+        self.update()
+
+    def _on_frame(self, frame):
+        try:
+            img = frame.toImage()
+        except Exception:  # noqa: BLE001
+            return
+        if img is not None and not img.isNull():
+            self.img = img
+            if self.aspect and self.box is None:
+                self.reset_box()
+            self.update()
+
+    def clear(self):
+        self.img = None
+        self.update()
+
+    def frame_size(self):
+        return (self.img.width(), self.img.height()) if self.img is not None else None
+
+    # crop box
+    def set_aspect(self, aspect, box=None):
+        self.aspect = aspect
+        self.box = box
+        if aspect and box is None:
+            self.reset_box(emit=False)
+        self.update()
+
+    def set_box(self, box):
+        self.box = box
+        if self.aspect and box is None:
+            self.reset_box(emit=False)
+        self.update()
+
+    def reset_box(self, emit=True):
+        fs = self.frame_size()
+        if not self.aspect or not fs:
+            return
+        self.box = center_box(self.aspect, *fs)
+        self.update()
+        if emit:
+            self.boxChanged.emit(self.box)
+
+    def set_sub(self, text):
+        if text != self.sub_text:
+            self.sub_text = text
+            self.update()
+
+    def set_sub_style(self, style):
+        self.sub_style = dict(style)
+        self.update()
+
+    def set_ghost(self, on):
+        if on != self.ghost:
+            self.ghost = on
+            self.update()
+
+    def _sub_area(self):
+        b = self._box_rect()
+        return b if b is not None else self._frame_rect()
+
+    def _frame_rect(self):
+        r = QtCore.QRectF(self.rect())
+        if self.img is None:
+            return r
+        iw, ih = self.img.width(), self.img.height()
+        s = min(r.width() / iw, r.height() / ih)
+        w, h = iw * s, ih * s
+        return QtCore.QRectF(r.center().x() - w / 2, r.center().y() - h / 2, w, h)
+
+    def _box_rect(self):
+        if not self.aspect or self.box is None or self.img is None:
+            return None
+        f = self._frame_rect()
+        x, y, w, h = self.box
+        return QtCore.QRectF(f.left() + x * f.width(), f.top() + y * f.height(), w * f.width(), h * f.height())
+
+    def _hit(self, pos):
+        b = self._box_rect()
+        if b is None:
+            return None
+        for name, pt in (("tl", b.topLeft()), ("tr", b.topRight()), ("bl", b.bottomLeft()), ("br", b.bottomRight())):
+            if abs(pos.x() - pt.x()) <= self.H and abs(pos.y() - pt.y()) <= self.H:
+                return name
+        return "move" if b.contains(pos) else "outside"
+
+    def mousePressEvent(self, e):
+        pos = e.position()
+        if e.button() == Qt.MouseButton.LeftButton and self._sub_rect is not None \
+                and self._sub_rect.adjusted(-6, -6, 6, 6).contains(pos) and self.img is not None:
+            a = self._sub_area()
+            _fs, _ol, ax, ay = sub_layout(a.width(), a.height(), self.sub_style)
+            self._sub_grab = (pos, QtCore.QPointF(a.left() + ax, a.top() + ay))
+            self._drag = "sub"
+            return
+        if e.button() != Qt.MouseButton.LeftButton or self._box_rect() is None:
+            return super().mousePressEvent(e)
+        hit = self._hit(pos)
+        b = self._box_rect()
+        if hit == "outside":   # jump: center the box on the click
+            f = self._frame_rect()
+            nb = QtCore.QRectF(b)
+            nb.moveCenter(pos)
+            self._apply_rect(nb, f)
+            hit, b = "move", self._box_rect()
+        self._drag = hit
+        self._grab = (pos, QtCore.QRectF(b))
+
+    def mouseDoubleClickEvent(self, e):
+        if self._sub_rect is not None and self._sub_rect.adjusted(-6, -6, 6, 6).contains(e.position()):
+            self.sub_style["pos"] = None          # back to the default place
+            self.update()
+            self.subMoved.emit(None)
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def mouseMoveEvent(self, e):
+        pos = e.position()
+        if self._drag == "sub":
+            p0, anchor = self._sub_grab
+            a = self._sub_area()
+            nx = (anchor.x() + pos.x() - p0.x() - a.left()) / max(1.0, a.width())
+            ny = (anchor.y() + pos.y() - p0.y() - a.top()) / max(1.0, a.height())
+            nx, ny = min(max(nx, 0.03), 0.97), min(max(ny, 0.05), 0.99)
+            if abs(nx - 0.5) < 0.02:
+                nx = 0.5                     # snaps to the middle
+            self.sub_style["pos"] = (round(nx, 4), round(ny, 4))
+            self.update()
+            self.subMoved.emit(self.sub_style["pos"])
+            return
+        if self._drag is None:
+            if self._sub_rect is not None and self._sub_rect.adjusted(-6, -6, 6, 6).contains(pos):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                return
+            hit = self._hit(pos)
+            cur = {"tl": Qt.CursorShape.SizeFDiagCursor, "br": Qt.CursorShape.SizeFDiagCursor,
+                   "tr": Qt.CursorShape.SizeBDiagCursor, "bl": Qt.CursorShape.SizeBDiagCursor,
+                   "move": Qt.CursorShape.SizeAllCursor, "outside": Qt.CursorShape.PointingHandCursor}.get(hit)
+            self.setCursor(cur or Qt.CursorShape.ArrowCursor)
+            return
+        f = self._frame_rect()
+        p0, b0 = self._grab
+        if self._drag == "move":
+            nb = b0.translated(pos - p0)
+        else:
+            aw, ah = self.aspect
+            anchor = {"tl": b0.bottomRight(), "tr": b0.bottomLeft(), "bl": b0.topRight(), "br": b0.topLeft()}[self._drag]
+            dx, dy = abs(pos.x() - anchor.x()), abs(pos.y() - anchor.y())
+            w = max(dx, dy * aw / ah)
+            w = max(w, min(f.width(), f.height()) * 0.08)
+            sx = -1 if self._drag in ("tl", "bl") else 1
+            sy = -1 if self._drag in ("tl", "tr") else 1
+            # keep it inside the frame
+            maxw = (anchor.x() - f.left()) if sx < 0 else (f.right() - anchor.x())
+            maxh = (anchor.y() - f.top()) if sy < 0 else (f.bottom() - anchor.y())
+            w = min(w, maxw, maxh * aw / ah)
+            h = w * ah / aw
+            nb = QtCore.QRectF(anchor.x() if sx > 0 else anchor.x() - w, anchor.y() if sy > 0 else anchor.y() - h, w, h)
+        self._apply_rect(nb, f)
+
+    def _apply_rect(self, nb, f):
+        nb = QtCore.QRectF(nb)
+        if nb.width() > f.width():
+            nb.setWidth(f.width())
+        if nb.height() > f.height():
+            nb.setHeight(f.height())
+        nb.moveLeft(min(max(nb.left(), f.left()), f.right() - nb.width()))
+        nb.moveTop(min(max(nb.top(), f.top()), f.bottom() - nb.height()))
+        self.box = ((nb.left() - f.left()) / f.width(), (nb.top() - f.top()) / f.height(),
+                    nb.width() / f.width(), nb.height() / f.height())
+        self.update()
+        self.boxChanged.emit(self.box)
+
+    def mouseReleaseEvent(self, e):
+        was = self._drag
+        self._drag = None
+        if was == "sub":
+            self.update()
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, _e):
+        c = self.c
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        p.setRenderHint(SMOOTH)
+        r = QtCore.QRectF(self.rect())
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+        p.setClipPath(path)
+        p.fillRect(r, QtGui.QColor("#000"))
+        if self.img is None:
+            return
+        f = self._frame_rect()
+        p.drawImage(f, self.img)
+        b = self._box_rect()
+        area = b if b is not None else f
+        if b is not None:
+            shade = QtGui.QPainterPath()
+            shade.addRect(f)
+            inner = QtGui.QPainterPath()
+            inner.addRect(b)
+            p.fillPath(shade.subtracted(inner), QtGui.QColor(0, 0, 0, 150))
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 55), 1))
+            for k in (1, 2):
+                p.drawLine(QtCore.QPointF(b.left() + b.width() * k / 3, b.top()),
+                           QtCore.QPointF(b.left() + b.width() * k / 3, b.bottom()))
+                p.drawLine(QtCore.QPointF(b.left(), b.top() + b.height() * k / 3),
+                           QtCore.QPointF(b.right(), b.top() + b.height() * k / 3))
+            p.setPen(QtGui.QPen(QtGui.QColor(c["accent"]), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(b)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(c["accent"]))
+            for pt in (b.topLeft(), b.topRight(), b.bottomLeft(), b.bottomRight()):
+                p.drawRoundedRect(QtCore.QRectF(pt.x() - 5, pt.y() - 5, 10, 10), 2.5, 2.5)
+            lab = f"{self.aspect[0]}:{self.aspect[1]}"
+            fn = self.font()
+            fn.setBold(True)
+            fn.setPointSizeF(max(7.5, fn.pointSizeF() - 1))
+            p.setFont(fn)
+            fm = QtGui.QFontMetrics(fn)
+            tr = QtCore.QRectF(b.left() + 6, b.top() + 6, fm.horizontalAdvance(lab) + 12, fm.height() + 4)
+            p.setBrush(QtGui.QColor(0, 0, 0, 160))
+            p.drawRoundedRect(tr, 5, 5)
+            p.setPen(QtGui.QColor("#fff"))
+            p.drawText(tr, Qt.AlignmentFlag.AlignCenter, lab)
+        self._sub_rect = None
+        text = self.sub_text or ("Subtitle text – drag me" if self.ghost else "")
+        if text:
+            st = self.sub_style
+            fs, ol, ax, ay = sub_layout(area.width(), area.height(), st)
+            fn = QtGui.QFont(st.get("font") or "Arial")
+            fn.setBold(bool(st.get("bold")))
+            fn.setPixelSize(max(6, int(round(fs))))
+            fm = QtGui.QFontMetricsF(fn)
+            lines = []
+            for para in text.split("\n"):
+                cur = ""
+                for w in para.split(" "):
+                    t = (cur + " " + w).strip()
+                    if cur and fm.horizontalAdvance(t) > area.width() * 0.86:
+                        lines.append(cur)
+                        cur = w
+                    else:
+                        cur = t
+                lines.append(cur)
+            cx, bottom = area.left() + ax, area.top() + ay
+            tp = QtGui.QPainterPath()
+            y = bottom - fm.descent() - (len(lines) - 1) * fm.lineSpacing()
+            for ln in lines:
+                tp.addText(QtCore.QPointF(cx - fm.horizontalAdvance(ln) / 2, y), fn, ln)
+                y += fm.lineSpacing()
+            p.save()
+            if not self.sub_text:
+                p.setOpacity(0.55)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QtGui.QPen(QtGui.QColor(st.get("outline") or "#000"), ol * 2, Qt.PenStyle.SolidLine,
+                                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawPath(tp)
+            p.fillPath(tp, QtGui.QColor(st.get("color") or "#fff"))
+            p.restore()
+            self._sub_rect = tp.boundingRect()
+            if self._drag == "sub" or not self.sub_text:
+                p.setPen(QtGui.QPen(QtGui.QColor(c["accent"]), 1, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(self._sub_rect.adjusted(-6, -4, 6, 4))
+
+
+class VideoView(QtWidgets.QWidget):
+    """16:9 area: the thumbnail, or the video of the built-in player (with crop box / subtitles on top)."""
+
+    def __init__(self, thumb, parent=None):
+        super().__init__(parent)
+        sp = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+        self.setMinimumSize(320, 180)
+        self.thumb = thumb
+        self.stack = QtWidgets.QStackedLayout(self)
+        self.stack.setContentsMargins(0, 0, 0, 0)
+        self.stack.addWidget(thumb)
+        self.video = None
+        if PLAYER_OK:
+            cv = VideoCanvas()
+            if cv.sink is not None:
+                self.video = cv
+                self.stack.addWidget(cv)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return int(w * 9 / 16)
+
+    def sizeHint(self):
+        return QtCore.QSize(560, 315)
+
+    def show_video(self, on):
+        self.stack.setCurrentWidget(self.video if (on and self.video is not None) else self.thumb)
+
+    def showing_video(self):
+        return self.video is not None and self.stack.currentWidget() is self.video
+
+
+class TabBar(QtWidgets.QWidget):
+    """Flat tabs with an underline; a dot after the name shows that something is switched on there."""
+    changed = Signal(str)
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        self.btns, self.names, self._val = {}, {}, items[0][0]
+        group = QtWidgets.QButtonGroup(self)
+        for key, text in items:
+            b = QtWidgets.QPushButton(text)
+            b.setObjectName("tab")
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, k=key: self.set_value(k, emit=True))
+            group.addButton(b)
+            row.addWidget(b)
+            self.btns[key], self.names[key] = b, text
+        row.addStretch(1)
+        lay.addLayout(row)
+        line = QtWidgets.QFrame()
+        line.setObjectName("tabline")
+        lay.addWidget(line)
+        self.btns[self._val].setChecked(True)
+
+    def value(self):
+        return self._val
+
+    def set_value(self, key, emit=False):
+        if key not in self.btns:
+            return
+        self._val = key
+        self.btns[key].setChecked(True)
+        if emit:
+            self.changed.emit(key)
+
+    def set_badge(self, key, on):
+        self.btns[key].setText(self.names[key] + ("  •" if on else ""))
+
+    def set_tips(self, tips):
+        for k, (t, x) in tips.items():
+            tip(self.btns[k], t, x)
+
+
+class VolumeLane(QtWidgets.QWidget):
+    """Volume curve over the clip: click to add a point, drag to move, right-click / double-click to delete.
+    100 % = unchanged, up to 200 %."""
+    changed = Signal()
+    seek = Signal(float)
+
+    M = 14
+    TOP, BOT = 10, 24
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(118)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
+        self.pts: list[list[float]] = []
+        self.lo, self.hi = 0.0, 10.0
+        self.play = None
+        self._drag = None
+        self._hover = None
+        self._mouse = None
+
+    def set_colors(self, c):
+        self.c = c
+        self.update()
+
+    def set_points(self, pts):
+        self.pts = pts      # shared list (absolute times)
+        self.update()
+
+    def set_range(self, lo, hi):
+        self.lo, self.hi = float(lo), max(float(lo) + 0.05, float(hi))
+        self.update()
+
+    def set_playhead(self, t):
+        self.play = t
+        self.update()
+
+    def _x(self, t):
+        return self.M + (self.width() - 2 * self.M) * (t - self.lo) / (self.hi - self.lo)
+
+    def _t(self, x):
+        t = self.lo + (x - self.M) / max(1, self.width() - 2 * self.M) * (self.hi - self.lo)
+        return min(max(self.lo, t), self.hi)
+
+    def _y(self, g):
+        return self.TOP + (self.height() - self.TOP - self.BOT) * (1 - g / 2.0)
+
+    def _g(self, y):
+        g = (1 - (y - self.TOP) / max(1, self.height() - self.TOP - self.BOT)) * 2.0
+        g = min(max(0.0, g), 2.0)
+        return 1.0 if abs(g - 1.0) < 0.05 else round(g, 3)
+
+    def _near(self, pos):
+        for i, (t, g) in enumerate(self.pts):
+            if self.lo - 0.001 <= t <= self.hi + 0.001 and abs(self._x(t) - pos.x()) <= 8 and abs(self._y(g) - pos.y()) <= 8:
+                return i
+        return None
+
+    def mousePressEvent(self, e):
+        pos = e.position()
+        i = self._near(pos)
+        if e.button() == Qt.MouseButton.RightButton:
+            if i is not None:
+                self.pts.pop(i)
+                self.changed.emit()
+                self.update()
+            return
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        if i is None:
+            self.pts.append([round(self._t(pos.x()), 3), self._g(pos.y())])
+            self.pts.sort()
+            i = self._near(pos)
+            self.changed.emit()
+        self._drag = self.pts[i] if i is not None else None
+        self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        i = self._near(e.position())
+        if i is not None:
+            self.pts.pop(i)
+            self._drag = None
+            self.changed.emit()
+            self.update()
+
+    def mouseMoveEvent(self, e):
+        pos = e.position()
+        self._mouse = pos
+        if self._drag is not None:
+            self._drag[0] = round(self._t(pos.x()), 3)
+            self._drag[1] = self._g(pos.y())
+            self.pts.sort()
+            self.changed.emit()
+        else:
+            self._hover = self._near(pos)
+            self.setCursor(Qt.CursorShape.SizeAllCursor if self._hover is not None else Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def mouseReleaseEvent(self, _e):
+        if self._drag is not None:
+            self.seek.emit(self._drag[0])
+        self._drag = None
+
+    def leaveEvent(self, _e):
+        self._mouse = None
+        self._hover = None
+        self.update()
+
+    def paintEvent(self, _e):
+        c = self.c
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        r = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setPen(QtGui.QPen(QtGui.QColor(c["border"]), 1))
+        p.setBrush(QtGui.QColor(c["field"]))
+        p.drawRoundedRect(r, 12, 12)
+        x0, x1 = self._x(self.lo), self._x(self.hi)
+        fn = self.font()
+        fn.setPointSizeF(max(7.0, fn.pointSizeF() - 2))
+        p.setFont(fn)
+        for g, lab in ((2.0, "200 %"), (1.0, "100 %"), (0.0, "0")):
+            y = self._y(g)
+            pen = QtGui.QPen(QtGui.QColor(c["border_hi"] if g == 1.0 else c["border"]), 1,
+                             Qt.PenStyle.DashLine if g == 1.0 else Qt.PenStyle.SolidLine)
+            p.setPen(pen)
+            p.drawLine(QtCore.QPointF(x0, y), QtCore.QPointF(x1, y))
+            p.setPen(QtGui.QColor(c["muted"]))
+            p.drawText(QtCore.QPointF(x1 - QtGui.QFontMetrics(fn).horizontalAdvance(lab), y - 3), lab)
+        # curve over the visible range
+        poly = QtGui.QPolygonF()
+        n = 120
+        for k in range(n + 1):
+            t = self.lo + (self.hi - self.lo) * k / n
+            poly.append(QtCore.QPointF(self._x(t), self._y(min(2.0, vol_at(self.pts, t)))))
+        fill = QtGui.QPolygonF(poly)
+        fill.append(QtCore.QPointF(x1, self._y(0)))
+        fill.append(QtCore.QPointF(x0, self._y(0)))
+        col = QtGui.QColor(c["accent"])
+        col.setAlpha(40)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawPolygon(fill)
+        p.setPen(QtGui.QPen(QtGui.QColor(c["accent"]), 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPolyline(poly)
+        for i, (t, g) in enumerate(self.pts):
+            if not (self.lo - 0.001 <= t <= self.hi + 0.001):
+                continue
+            big = i == self._hover or self.pts[i] is self._drag
+            p.setPen(QtGui.QPen(QtGui.QColor(c["accent"]), 2))
+            p.setBrush(QtGui.QColor(c["text"] if c["dark"] else "#fff"))
+            p.drawEllipse(QtCore.QPointF(self._x(t), self._y(min(2.0, g))), 6 if big else 4.5, 6 if big else 4.5)
+        if self.play is not None and self.lo <= self.play <= self.hi:
+            xp = self._x(self.play)
+            p.setPen(QtGui.QPen(QtGui.QColor(c["text"]), 1.5))
+            p.drawLine(QtCore.QPointF(xp, self.TOP - 4), QtCore.QPointF(xp, self._y(0) + 2))
+        p.setPen(QtGui.QColor(c["muted"]))
+        p.drawText(QtCore.QPointF(x0, self.height() - 7), fmt_tf(self.lo))
+        t2 = fmt_tf(self.hi)
+        p.drawText(QtCore.QPointF(x1 - QtGui.QFontMetrics(fn).horizontalAdvance(t2), self.height() - 7), t2)
+        if self._mouse is not None and (self._drag is not None or self._hover is not None or True):
+            if self._drag is not None:
+                t, g = self._drag
+            elif self._hover is not None:
+                t, g = self.pts[self._hover]
+            else:
+                t, g = self._t(self._mouse.x()), self._g(self._mouse.y())
+            lab = f"{fmt_tf(t)} · {g * 100:.0f} %"
+            fm = QtGui.QFontMetrics(fn)
+            w = fm.horizontalAdvance(lab)
+            p.setPen(QtGui.QColor(c["text"]))
+            p.drawText(QtCore.QPointF((self.width() - w) / 2, self.height() - 7), lab)
+
+
+class Clip(list):
+    """[start, end] of a clip + its name (e.g. a chapter title) and its crop box."""
+
+    def __init__(self, s, e, label="", box=None):
+        super().__init__([float(s), float(e)])
+        self.label = label
+        self.box = box
+
+
+class HistoryDialog(QtWidgets.QDialog):
+    """All links you pasted, newest first, with a small picture. Double-click opens one."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("History")
+        self.resize(660, 620)
+        self.chosen = None
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(12)
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(label("History", "h1"))
+        head.addStretch(1)
+        self.count = label("", "muted")
+        head.addWidget(self.count, 0, Qt.AlignmentFlag.AlignBottom)
+        lay.addLayout(head)
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Search title, channel or link …")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        lay.addWidget(self.search)
+        self.list = QtWidgets.QListWidget()
+        self.list.setObjectName("history")
+        self.list.setIconSize(QtCore.QSize(128, 72))
+        self.list.setUniformItemSizes(True)
+        self.list.itemDoubleClicked.connect(lambda _it: self._open())
+        lay.addWidget(self.list, 1)
+        bot = QtWidgets.QHBoxLayout()
+        for txt, fn, title, text in (("Copy link", self._copy, "Copy link", "Copies the link of the selected entry."),
+                                     ("Remove", self._remove, "Remove", "Removes the selected entry from the history."),
+                                     ("Clear all", self._clear, "Clear all", "Empties the whole history.")):
+            b = tip(QtWidgets.QPushButton(txt), title, text)
+            b.setObjectName("ghost")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(fn)
+            bot.addWidget(b)
+        bot.addStretch(1)
+        ok = QtWidgets.QPushButton("Open")
+        ok.setObjectName("primary")
+        ok.setMinimumWidth(120)
+        ok.clicked.connect(self._open)
+        bot.addWidget(ok)
+        lay.addLayout(bot)
+        self._fill()
+
+    def _fill(self):
+        self.list.clear()
+        items = history_load()
+        blank = QtGui.QPixmap(128, 72)
+        blank.fill(QtGui.QColor(0, 0, 0, 0))
+        for x in items:
+            when = time.strftime("%d.%m.%Y %H:%M", time.localtime(x.get("added") or 0))
+            meta = "  ·  ".join(v for v in (x.get("channel"), fmt_ts(x["duration"]) if x.get("duration") else "",
+                                            x.get("site"), when) if v)
+            it = QtWidgets.QListWidgetItem(f"{x.get('title') or x['url']}\n{meta}")
+            it.setData(Qt.ItemDataRole.UserRole, x["url"])
+            it.setToolTip(x["url"])
+            pix = None
+            if x.get("thumb"):
+                pm = QtGui.QPixmap(str(HISTORY_DIR / x["thumb"]))
+                if not pm.isNull():
+                    pix = QtGui.QPixmap(128, 72)
+                    pix.fill(QtGui.QColor(0, 0, 0, 0))
+                    pp = QtGui.QPainter(pix)
+                    pp.setRenderHint(SMOOTH)
+                    sc = pm.scaled(128, 72, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    pp.drawPixmap((128 - sc.width()) // 2, (72 - sc.height()) // 2, sc)
+                    pp.end()
+            it.setIcon(QtGui.QIcon(pix or blank))
+            it.setSizeHint(QtCore.QSize(0, 82))
+            self.list.addItem(it)
+        self.count.setText(f"{len(items)} links")
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        self._filter(self.search.text())
+
+    def _filter(self, text):
+        t = text.strip().lower()
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            it.setHidden(bool(t) and t not in it.text().lower() and t not in str(it.data(Qt.ItemDataRole.UserRole)).lower())
+
+    def _sel(self):
+        it = self.list.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it is not None and not it.isHidden() else None
+
+    def _open(self):
+        url = self._sel()
+        if url:
+            self.chosen = url
+            self.accept()
+
+    def _copy(self):
+        url = self._sel()
+        if url:
+            QtWidgets.QApplication.clipboard().setText(url)
+
+    def _remove(self):
+        url = self._sel()
+        if url:
+            row = self.list.currentRow()
+            history_remove(url)
+            self._fill()
+            self.list.setCurrentRow(min(row, self.list.count() - 1))
+
+    def _clear(self):
+        if QtWidgets.QMessageBox.question(self, "Clear history", "Remove all links from the history?") \
+                == QtWidgets.QMessageBox.StandardButton.Yes:
+            history_clear()
+            self._fill()
+
+
+class SubsEditor(QtWidgets.QDialog):
+    """Read and edit the subtitles: change text and times, add / delete lines, shift everything, copy, save.
+    Click a line to jump there in the preview. Changes are used right away (preview + export)."""
+    changed = Signal(object)    # list of (start, end, text)
+    jump = Signal(float)
+
+    COLS = ("Start", "End", "Text")
+
+    def __init__(self, parent, cues, title, playhead):
+        super().__init__(parent)
+        self.setWindowTitle(f"Subtitles – {title}")
+        self.resize(760, 680)
+        self.cues = [list(c) for c in cues]
+        self._title = title
+        self._playhead = playhead
+        self._busy = False
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(10)
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(label("Subtitles", "h1"))
+        head.addStretch(1)
+        self.count = label("", "muted")
+        head.addWidget(self.count, 0, Qt.AlignmentFlag.AlignBottom)
+        lay.addLayout(head)
+        lay.addWidget(label("Double-click a cell to edit it. “ / ” in the text = new line. Click a line to jump there.",
+                            "hint"))
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Search the text …")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        lay.addWidget(self.search)
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setObjectName("lines")
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+                                   | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.table.itemChanged.connect(self._edited)
+        self.table.currentCellChanged.connect(lambda r, _c, _r2, _c2: self._jump(r))
+        lay.addWidget(self.table, 1)
+        r1 = QtWidgets.QHBoxLayout()
+        r1.setSpacing(6)
+        for txt, fn, title, text in (
+                ("+ Line here", self._add, "New line", "Adds a 2-second line at the preview position."),
+                ("Delete", self._delete, "Delete", "Removes the selected lines."),
+                ("Start = playhead", lambda: self._set_time(0), "Start = playhead",
+                 "The selected line starts at the current preview position."),
+                ("End = playhead", lambda: self._set_time(1), "End = playhead",
+                 "The selected line ends at the current preview position.")):
+            b = tip(QtWidgets.QPushButton(txt), title, text)
+            b.setObjectName("chip")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(fn)
+            r1.addWidget(b)
+        r1.addStretch(1)
+        r1.addWidget(label("Shift all", "field"))
+        self.shift = QtWidgets.QLineEdit()
+        self.shift.setObjectName("time")
+        self.shift.setFixedWidth(84)
+        self.shift.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.shift.setPlaceholderText("± s")
+        self.shift.returnPressed.connect(lambda: self._shift())
+        tip(self.shift, "Shift all", "Moves every line earlier (−) or later (+) – for subtitles that are out of sync.")
+        b = QtWidgets.QPushButton("Apply")
+        b.setObjectName("chip")
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.clicked.connect(self._shift)
+        r1.addWidget(self.shift)
+        r1.addWidget(b)
+        lay.addLayout(r1)
+        bot = QtWidgets.QHBoxLayout()
+        b1 = tip(QtWidgets.QPushButton("Copy text"), "Copy text", "Copies all lines (without times).")
+        b1.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(
+            "\n".join(t.replace("\n", " ") for _s, _e, t in self.cues)))
+        b2 = tip(QtWidgets.QPushButton("Save .srt …"), "Save .srt", "Saves all subtitles (with your changes).")
+        b2.clicked.connect(self._save)
+        close = QtWidgets.QPushButton("Close")
+        close.setObjectName("primary")
+        close.setMinimumWidth(110)
+        close.clicked.connect(self.accept)
+        bot.addWidget(b1)
+        bot.addWidget(b2)
+        bot.addStretch(1)
+        bot.addWidget(close)
+        lay.addLayout(bot)
+        self._fill()
+
+    def _fill(self, select=None):
+        self._busy = True
+        self.table.setRowCount(len(self.cues))
+        for r, (s0, e0, txt) in enumerate(self.cues):
+            for col, val in enumerate((fmt_tc(s0), fmt_tc(e0), txt.replace("\n", " / "))):
+                it = QtWidgets.QTableWidgetItem(val)
+                if col < 2:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r, col, it)
+        self._busy = False
+        self.count.setText(f"{len(self.cues)} lines")
+        self._filter(self.search.text())
+        if select is not None and 0 <= select < len(self.cues):
+            self.table.selectRow(select)
+
+    def _filter(self, text):
+        t = text.strip().lower()
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 2)
+            self.table.setRowHidden(r, bool(t) and (it is None or t not in it.text().lower()))
+
+    def _emit(self, select=None):
+        self.cues.sort(key=lambda c: c[0])
+        self._fill(select)
+        self.changed.emit([(round(a, 3), round(b, 3), t) for a, b, t in self.cues if b > a and t.strip()])
+
+    def _edited(self, it):
+        if self._busy:
+            return
+        r, col = it.row(), it.column()
+        if r >= len(self.cues):
+            return
+        c = self.cues[r]
+        if col < 2:
+            try:
+                v = parse_time(it.text())
+                if v is None:
+                    raise ValueError
+            except ValueError:
+                QtWidgets.QApplication.beep()
+                self._fill(r)
+                return
+            c[col] = v
+            if c[1] <= c[0]:
+                c[1] = c[0] + 0.5 if col == 0 else c[1]
+                c[0] = min(c[0], c[1] - 0.1)
+        else:
+            c[2] = "\n".join(x.strip() for x in it.text().split(" / ")).strip()
+        self._emit(self.cues.index(c))
+
+    def _rows(self):
+        return sorted({i.row() for i in self.table.selectedIndexes()})
+
+    def _jump(self, r):
+        if 0 <= r < len(self.cues) and not self._busy:
+            self.jump.emit(float(self.cues[r][0]))
+
+    def _add(self):
+        t = self._playhead() or 0.0
+        c = [round(t, 3), round(t + 2.0, 3), "…"]
+        nxt = [x[0] for x in self.cues if x[0] > t]
+        if nxt:
+            c[1] = max(c[0] + 0.3, min(c[1], min(nxt)))
+        self.cues.append(c)
+        self._emit(self.cues.index(c))
+        r = self.cues.index(c)
+        self.table.editItem(self.table.item(r, 2))
+
+    def _delete(self):
+        rows = self._rows()
+        if not rows:
+            return
+        self.cues = [c for i, c in enumerate(self.cues) if i not in rows]
+        self._emit(min(rows[0], len(self.cues) - 1))
+
+    def _set_time(self, col):
+        rows = self._rows()
+        t = self._playhead()
+        if not rows or t is None:
+            return
+        c = self.cues[rows[0]]
+        c[col] = round(t, 3)
+        if c[1] <= c[0]:
+            if col == 0:
+                c[1] = c[0] + 1.0
+            else:
+                c[0] = max(0.0, c[1] - 1.0)
+        self._emit(self.cues.index(c))
+
+    def _shift(self):
+        try:
+            d = float(self.shift.text().replace(",", ".").replace("s", "").strip() or 0)
+        except ValueError:
+            set_state(self.shift, "error")
+            return
+        set_state(self.shift, "")
+        if not d:
+            return
+        self.cues = [[max(0.0, a + d), max(0.05, b + d), t] for a, b, t in self.cues]
+        self.shift.clear()
+        self._emit()
+
+    def _save(self):
+        out = self.parent().outdir.text().strip() or str(Path.home() / "Downloads")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save subtitles",
+                                                        str(Path(out) / (safe_name(self._title) + ".srt")),
+                                                        "Subtitles (*.srt)")
+        if path:
+            write_srt([tuple(c) for c in self.cues], path)
+
+
+class ChaptersDialog(QtWidgets.QDialog):
+    """Pick chapters -> they become clips."""
+
+    def __init__(self, parent, chapters):
+        super().__init__(parent)
+        self.setWindowTitle("Chapters")
+        self.resize(520, 520)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(12)
+        lay.addWidget(label("Chapters → clips", "h1"))
+        lay.addWidget(label("Ticked chapters become clips (with the chapter name). You can still change every "
+                            "clip afterwards.", "hint"))
+        self.list = QtWidgets.QListWidget()
+        self.list.setObjectName("lines")
+        for i, (s, e, title) in enumerate(chapters):
+            it = QtWidgets.QListWidgetItem(f"{i + 1:>2}   {title or 'Chapter ' + str(i + 1)}     {fmt_tf(s)} – {fmt_tf(e)}")
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked)
+            self.list.addItem(it)
+        lay.addWidget(self.list, 1)
+        row = QtWidgets.QHBoxLayout()
+        for txt, st in (("All", Qt.CheckState.Checked), ("None", Qt.CheckState.Unchecked)):
+            b = QtWidgets.QPushButton(txt)
+            b.setObjectName("ghost")
+            b.clicked.connect(lambda _=False, st=st: [self.list.item(i).setCheckState(st) for i in range(self.list.count())])
+            row.addWidget(b)
+        row.addStretch(1)
+        self.seg_join = Segmented([("separate", "One file each"), ("join", "Join")])
+        self.seg_join.setFixedWidth(230)
+        self.seg_join.set_tips({"separate": ("One file each", "Every chapter becomes its own file, named after the "
+                                                              "chapter."),
+                                "join": ("Join", "The ticked chapters one after another in one file.")})
+        row.addWidget(self.seg_join)
+        lay.addLayout(row)
+        bot = QtWidgets.QHBoxLayout()
+        bot.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QtWidgets.QPushButton("Use as clips")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self.accept)
+        bot.addWidget(cancel)
+        bot.addWidget(ok)
+        lay.addLayout(bot)
+        self.chapters = chapters
+
+    def picked(self):
+        return [self.chapters[i] for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+
+class ClipRow(QtWidgets.QWidget):
+    """One row of the clip list: number, times, length, play / up / down / delete."""
+    action = Signal(str, int)   # 'play' | 'up' | 'down' | 'del', row
+
+    def __init__(self, idx, s, e, n, parent=None, name=""):
+        super().__init__(parent)
+        self.setObjectName("cliprow")
+        self.name = name
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(8, 2, 4, 2)
+        lay.setSpacing(8)
+        self.no = label(f"{idx + 1}", "clipno")
+        self.no.setFixedWidth(18)
+        self.times = label("", "cliptime")
+        self.length = label("", "muted")
+        lay.addWidget(self.no)
+        lay.addWidget(self.times)
+        lay.addWidget(self.length)
+        lay.addStretch(1)
+        for key, txt, title, text in (("play", "▶", "Play this clip", "Plays it in the preview."),
+                                      ("up", "↑", "Move up", "Clips are joined in this order."),
+                                      ("down", "↓", "Move down", "Clips are joined in this order."),
+                                      ("del", "✕", "Remove clip", "")):
+            b = tip(QtWidgets.QPushButton(txt), title, text)
+            b.setObjectName("mini")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, k=key: self.action.emit(k, self.idx))
+            lay.addWidget(b)
+            setattr(self, f"btn_{key}", b)
+        self.set_clip(idx, s, e, n)
+
+    def set_clip(self, idx, s, e, n):
+        self.idx = idx
+        self.no.setText(f"{idx + 1}")
+        self.times.setText(f"{fmt_tf(s)} – {fmt_tf(e)}")
+        ln = f"{e - s:.2f} s".replace(".00 s", " s") if e - s < 60 else fmt_tf(e - s)
+        nm = self.name if len(self.name) <= 22 else self.name[:21] + "…"
+        self.length.setText(ln + (f"  ·  {nm}" if nm else ""))
+        self.length.setToolTip(tip_html(self.name) if self.name else "")
+        self.btn_up.setEnabled(idx > 0)
+        self.btn_down.setEnabled(idx < n - 1)
+
+
+def card():
+    f = QtWidgets.QFrame()
+    f.setObjectName("card")
+    lay = QtWidgets.QVBoxLayout(f)
+    lay.setContentsMargins(20, 18, 20, 20)
+    lay.setSpacing(12)
+    return f, lay
+
+
+def label(text, name=None):
+    lbl = QtWidgets.QLabel(text)
+    if name:
+        lbl.setObjectName(name)
+    return lbl
+
+
+def section(text):
+    return label(text.upper(), "section")
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent, theme, accent, tips_on, apply, apply_tips, auto_pv=True, apply_pv=None,
+                 pv_mode="stream", apply_mode=None):
+        super().__init__(parent)
+        self.main = parent
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setMinimumWidth(840)
+        self._apply, self._apply_tips = apply, apply_tips
+        self.theme, self.accent = theme, accent
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(24, 22, 24, 20)
+        outer.setSpacing(14)
+        outer.addWidget(label("Settings", "h1"))
+        cols = QtWidgets.QHBoxLayout()
+        cols.setSpacing(36)
+        outer.addLayout(cols, 1)
+        lay = QtWidgets.QVBoxLayout()
+        lay.setSpacing(12)
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(12)
+        cols.addLayout(lay, 1)
+        cols.addLayout(right, 1)
+
+        lay.addWidget(section("Theme"))
+        self.seg = Segmented([(k, k) for k in THEMES])
+        self.seg.set_tips({k: (k, ITEM_HELP.get(k, "")) for k in THEMES})
+        self.seg.set_value(theme)
+        self.seg.changed.connect(self._theme)
+        lay.addWidget(self.seg)
+        lay.addSpacing(4)
+        lay.addWidget(section("Accent color"))
+        grid = QtWidgets.QHBoxLayout()
+        grid.setSpacing(8)
+        self.group = QtWidgets.QButtonGroup(self)
+        self.swatches = {}
+        for name, col in ACCENTS:
+            b = QtWidgets.QPushButton()
+            b.setObjectName("swatch")
+            b.setCheckable(True)
+            tip(b, name)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"background: {col};")
+            b.clicked.connect(lambda _=False, c=col: self._accent(c))
+            self.group.addButton(b)
+            grid.addWidget(b)
+            self.swatches[col.lower()] = b
+        grid.addStretch(1)
+        lay.addLayout(grid)
+        row = QtWidgets.QHBoxLayout()
+        self.btn_custom = tip(QtWidgets.QPushButton("Custom color …"), "Custom color",
+                              "Pick any color for buttons, highlights and the progress bar.")
+        self.btn_custom.clicked.connect(self._custom)
+        self.lbl_hex = label("", "muted")
+        row.addWidget(self.btn_custom)
+        row.addWidget(self.lbl_hex)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addSpacing(4)
+        lay.addWidget(section("Help"))
+        self.cb_tips = QtWidgets.QCheckBox("Show help when hovering over buttons and options")
+        self.cb_tips.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_tips, "Hover help", "Short explanations like this one. Turn off once you know the app.")
+        self.cb_tips.setChecked(tips_on)
+        self.cb_tips.toggled.connect(self._apply_tips)
+        lay.addWidget(self.cb_tips)
+        lay.addSpacing(4)
+        lay.addWidget(section("History"))
+        self.cb_hist = QtWidgets.QCheckBox("Remember the links I paste (with a small picture)")
+        self.cb_hist.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_hist, "History", "Saved only on this PC. Open it with the History button next to the link field.")
+        self.cb_hist.setChecked(bool(parent.cfg.get("history", True)))
+        self.cb_hist.toggled.connect(self._hist_toggled)
+        lay.addWidget(self.cb_hist)
+        hr = QtWidgets.QHBoxLayout()
+        self.btn_hist_clear = tip(QtWidgets.QPushButton("Clear history"), "Clear history", "Removes all saved links.")
+        self.btn_hist_clear.clicked.connect(self._hist_clear)
+        hr.addWidget(self.btn_hist_clear)
+        hr.addStretch(1)
+        lay.addLayout(hr)
+        lay.addStretch(1)
+
+        right.addWidget(section("Video preview"))
+        self.seg_pv = Segmented([("stream", "Stream from YouTube"), ("download", "Download small copy")])
+        self.seg_pv.set_tips({
+            "stream": ("Stream from YouTube", "Plays the video straight from YouTube in the app's player – starts at "
+                                              "once, nothing is saved, no ads (no Premium needed). Needs internet while "
+                                              "you work. If streaming doesn't work, a small copy is downloaded instead."),
+            "download": ("Download small copy", "Downloads a 360p copy first. Jumping and frame steps are a bit "
+                                                "snappier and it works offline once loaded.")})
+        self.seg_pv.set_value(pv_mode if pv_mode in ("stream", "download") else "stream")
+        if apply_mode:
+            self.seg_pv.changed.connect(apply_mode)
+        right.addWidget(self.seg_pv)
+        self.cb_pv = QtWidgets.QCheckBox(f"Load the preview by itself (downloads: videos up to "
+                                         f"{PREVIEW_AUTO_MAX // 60} min)")
+        self.cb_pv.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_pv, "Automatic preview", "Starts the preview as soon as you paste a link. Off: click the "
+                                             "picture to start it.")
+        self.cb_pv.setChecked(auto_pv)
+        if apply_pv:
+            self.cb_pv.toggled.connect(apply_pv)
+        right.addWidget(self.cb_pv)
+        if not PLAYER_OK:
+            self.seg_pv.setEnabled(False)
+            self.cb_pv.setEnabled(False)
+            self.cb_pv.setText("Video preview not available (run the setup again)")
+        right.addSpacing(4)
+        right.addWidget(section("Browser login"))
+        br = QtWidgets.QHBoxLayout()
+        self.cb_browser = QtWidgets.QComboBox()
+        self.cb_browser.addItems(BROWSERS)
+        self.cb_browser.setCurrentText(parent.cfg.get("browser", "Off"))
+        self.cb_browser.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_browser, "Browser login",
+            "Uses your YouTube login from this browser – needed for age-restricted or members-only videos. Sign in to "
+            "YouTube in that browser first. Firefox works best; Chrome / Edge sometimes refuse while they are open.")
+        self.cb_browser.currentTextChanged.connect(lambda t: parent._set_browser(t))
+        br.addWidget(label("Use the login from", "field"))
+        br.addWidget(self.cb_browser, 1)
+        right.addLayout(br)
+        right.addWidget(label("Only needed for age-restricted or members-only videos.", "hint"))
+        right.addSpacing(4)
+        right.addWidget(section("AI upscaler"))
+        self.lbl_esr = label("", "muted")
+        self.lbl_esr.setWordWrap(True)
+        right.addWidget(self.lbl_esr)
+        er = QtWidgets.QHBoxLayout()
+        self.btn_esr = QtWidgets.QPushButton()
+        self.btn_esr.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_esr.clicked.connect(self._esr_clicked)
+        er.addWidget(self.btn_esr)
+        er.addStretch(1)
+        right.addLayout(er)
+        mr = QtWidgets.QHBoxLayout()
+        mr.setSpacing(6)
+        mr.addWidget(label("Own models", "field"))
+        self.cb_own = QtWidgets.QComboBox()
+        tip(self.cb_own, "Own models", "Models you added under Output → Upscale → Model → Load own model.")
+        mr.addWidget(self.cb_own, 1)
+        self.btn_own_add = QtWidgets.QPushButton("Add …")
+        self.btn_own_del = QtWidgets.QPushButton("Remove")
+        for b in (self.btn_own_add, self.btn_own_del):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            mr.addWidget(b)
+        self.btn_own_add.clicked.connect(self._own_add)
+        self.btn_own_del.clicked.connect(self._own_del)
+        right.addLayout(mr)
+        right.addStretch(1)
+        self.refresh_esr()
+        self._fill_own()
+
+        bot = QtWidgets.QHBoxLayout()
+        reset = tip(QtWidgets.QPushButton("Reset to default"), "Reset to default",
+                    "Dark theme, lime accent and hover help on.")
+        reset.setObjectName("ghost")
+        reset.clicked.connect(self._reset)
+        done = QtWidgets.QPushButton("Done")
+        done.setObjectName("primary")
+        done.setMinimumWidth(110)
+        done.clicked.connect(self.accept)
+        bot.addWidget(reset)
+        bot.addStretch(1)
+        bot.addWidget(done)
+        outer.addLayout(bot)
+        self._sync()
+
+    def refresh_esr(self):
+        busy = self.main._esr_job is not None
+        exe = upscaler_exe()
+        if busy:
+            self.lbl_esr.setText("Downloading …")
+            self.btn_esr.setText("Installing …")
+            self.btn_esr.setEnabled(False)
+        elif exe:
+            self.lbl_esr.setText("✓ Real-ESRGAN is installed (photo + anime models). Pick “AI” under Frame → Enlarge.")
+            self.btn_esr.setText("Remove")
+            self.btn_esr.setEnabled(True)
+        else:
+            self.lbl_esr.setText(f"Real-ESRGAN enlarges pictures with AI on your graphics card (NVIDIA, AMD, Intel). "
+                                 f"One download of ≈ {UPSCALER_MB} MB.")
+            self.btn_esr.setText("Install")
+            self.btn_esr.setEnabled(True)
+        tip(self.btn_esr, "AI upscaler", "Downloaded from the official Real-ESRGAN page on GitHub.")
+
+    def _fill_own(self):
+        self.cb_own.clear()
+        own = list_custom_models()
+        for x in own:
+            self.cb_own.addItem(f"{x['name']}  ({x['scale']}×)", x["name"])
+        if not own:
+            self.cb_own.addItem("none yet")
+        self.cb_own.setEnabled(bool(own))
+        self.btn_own_del.setEnabled(bool(own))
+
+    def _own_add(self):
+        m = self.main
+        idx = m.cb_model.findText(MODEL_LOAD)
+        m.cb_model.setCurrentIndex(idx)
+        m._model_picked(idx)
+        self._fill_own()
+
+    def _own_del(self):
+        name = self.cb_own.currentData()
+        if name and QtWidgets.QMessageBox.question(self, "Remove model", f"Remove the model “{name}”?") \
+                == QtWidgets.QMessageBox.StandardButton.Yes:
+            remove_model(name)
+            self.main._fill_models()
+            self.main._frame_info()
+            self._fill_own()
+
+    def _esr_clicked(self):
+        if upscaler_exe():
+            remove_upscaler()
+        else:
+            self.main._install_upscaler()
+        self.refresh_esr()
+
+    def _hist_toggled(self, on):
+        self.main.cfg["history"] = bool(on)
+        save_cfg(self.main.cfg)
+
+    def _hist_clear(self):
+        if QtWidgets.QMessageBox.question(self, "Clear history", "Remove all links from the history?") \
+                == QtWidgets.QMessageBox.StandardButton.Yes:
+            history_clear()
+
+    def _reset(self):
+        self.seg.set_value(DEFAULT_THEME, animate=True)
+        self._theme(DEFAULT_THEME)
+        self._accent(DEFAULT_ACCENT)
+        self.cb_tips.setChecked(True)
+
+    def _sync(self):
+        b = self.swatches.get(self.accent.lower())
+        self.group.setExclusive(False)
+        for s in self.swatches.values():
+            s.setChecked(False)
+        self.group.setExclusive(True)
+        if b:
+            b.setChecked(True)
+        self.lbl_hex.setText(self.accent.upper())
+
+    def _theme(self, t):
+        self.theme = t
+        self._apply(self.theme, self.accent)
+        set_dark_titlebar(self, THEMES[t]["dark"])
+
+    def _accent(self, col):
+        self.accent = col
+        self._sync()
+        self._apply(self.theme, self.accent)
+
+    def _custom(self):
+        col = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.accent), self, "Accent color")
+        if col.isValid():
+            self._accent(col.name())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        set_dark_titlebar(self, THEMES.get(self.theme, THEMES[DEFAULT_THEME])["dark"])
+
+
+class Bridge(QtCore.QObject):
+    sig = Signal(str, object)
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_cfg()
+        self.busy = False
+        self.update_done = threading.Event()
+        self.last_clip = ""
+        self.last_files: list[str] = []
+        self.info: dict = {}
+        self.info_url = ""
+        self._req = 0
+        self.bridge = Bridge()
+        self.bridge.sig.connect(self._dispatch)
+        self.player = None
+        self.audio_out = None
+        self._pv_state = ""            # "", "offer", "loading", "error", "ready"
+        self._pv_cache: dict[str, str] = {}
+        self._pv_dir = APP_DIR / "preview"
+        shutil.rmtree(self._pv_dir, ignore_errors=True)
+        self._clip_stop = None
+        self._seek_target = None
+        self._pos_hint = (None, 0.0)     # last position we jumped to + when (for fast frame steps)
+        self.aplayer = None              # sound of a streamed preview, when picture and sound are separate files
+        self.a_out2 = None
+        self._proxy = None
+        self._pv_kind = ""               # "stream", "copy" or "file"
+        self._stream_failed: set[str] = set()
+        self.clips: list[Clip] = []
+        self.cur = 0
+        self._loading_clip = False
+        self.box = None                  # crop box (fractions of the frame) of the clip being edited
+        self.vol_pts: list[list[float]] = []   # volume curve [time, gain] on the source timeline
+        self.sub_cues: list = []
+        self.sub_items: list = []
+        self._sub_req = 0
+        self.lines_dlg = None
+        self._esr_job = None
+        self._set_browser(self.cfg.get("browser", "Off"), save=False)
+        st = self.cfg.get("sub_style") if isinstance(self.cfg.get("sub_style"), dict) else {}
+        self.sub_style = {**SUB_STYLE, **{k: v for k, v in st.items() if k in SUB_STYLE}}
+        if self.sub_style.get("pos"):
+            self.sub_style["pos"] = tuple(self.sub_style["pos"])
+        self._font_files: dict[str, str] = {}
+        self._load_app_fonts()
+        self._app_update = None
+
+        refresh_path()
+        self.ffmpeg = find_tool("ffmpeg")
+        self.ffprobe = find_tool("ffprobe")
+        self.deno = find_tool("deno")
+
+        self.setWindowTitle(APP)
+        icon = Path(__file__).with_name("icon.ico")
+        if icon.exists():
+            self.setWindowIcon(QtGui.QIcon(str(icon)))
+        self.setAcceptDrops(True)
+        self.tip_filter = TipFilter(self)
+        self.tip_filter.enabled = bool(self.cfg.get("tooltips", True))
+        QtWidgets.QApplication.instance().installEventFilter(self.tip_filter)
+        self._build()
+        self._apply_sub_style_ui()
+        self.theme = self.cfg.get("theme") if self.cfg.get("theme") in THEMES else DEFAULT_THEME
+        self.accent = self.cfg.get("accent") or DEFAULT_ACCENT
+        self.apply_theme(self.theme, self.accent, save=False)
+        self._load_settings()
+
+        self._fetch_timer = QtCore.QTimer(self)
+        self._fetch_timer.setSingleShot(True)
+        self._fetch_timer.setInterval(600)
+        self._fetch_timer.timeout.connect(self._start_fetch)
+        self._seek_timer = QtCore.QTimer(self)
+        self._seek_timer.setSingleShot(True)
+        self._seek_timer.setInterval(35)
+        self._seek_timer.timeout.connect(self._do_seek)
+
+        QtWidgets.QApplication.instance().applicationStateChanged.connect(
+            lambda st: self._grab_clipboard() if st == Qt.ApplicationState.ApplicationActive else None)
+        QtCore.QTimer.singleShot(400, self._grab_clipboard)
+        self._check_tools()
+        self._maybe_update()
+        if time.time() - float(self.cfg.get("last_app_check", 0)) > UPDATE_INTERVAL:
+            QtCore.QTimer.singleShot(3000, lambda: self._check_app_update(manual=False))
+
+    # ------------------------------------------------------------------ layout
+    def _build(self):
+        root = QtWidgets.QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        v = QtWidgets.QVBoxLayout(root)
+        v.setContentsMargins(26, 22, 26, 14)
+        v.setSpacing(16)
+
+        head = QtWidgets.QHBoxLayout()
+        tl = QtWidgets.QVBoxLayout()
+        tl.setSpacing(2)
+        tl.addWidget(label(APP, "h1"))
+        tl.addWidget(label("Paste a link or open your own video  ·  video, audio or GIF", "sub"))
+        head.addLayout(tl)
+        head.addStretch(1)
+        self.btn_settings = tip(QtWidgets.QPushButton("⚙  Settings"), "Settings",
+                                "Theme, accent color and this hover help (can be turned off there).")
+        self.btn_settings.setObjectName("ghost")
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_settings.clicked.connect(self._settings)
+        head.addWidget(self.btn_settings, 0, Qt.AlignmentFlag.AlignTop)
+        v.addLayout(head)
+
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(16)
+        v.addLayout(body, 1)
+
+        # ---- left: source + clip
+        left, L = card()
+        L.addWidget(section("Source"))
+        row = QtWidgets.QHBoxLayout()
+        self.url = QtWidgets.QLineEdit()
+        self.url.setObjectName("url")
+        self.url.setPlaceholderText("Paste a YouTube link … or drop a video file here")
+        self.url.setClearButtonEnabled(True)
+        self.url.textChanged.connect(self._url_changed)
+        self.url.returnPressed.connect(self.start)
+        tip(self.url, "Source", "A YouTube link (videos, Shorts, music) or the path of a file on your PC. "
+                                "You can also drop a file or link onto the window.")
+        self.btn_paste = tip(QtWidgets.QPushButton("Paste"), "Paste",
+                             "Insert the link from the clipboard. YouTube links you copy are picked up automatically.")
+        self.btn_paste.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_paste.clicked.connect(self._paste)
+        self.btn_file = QtWidgets.QPushButton("Open file …")
+        self.btn_file.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.btn_file, "Open file", "Use a video or audio file from your computer – cut it, "
+                                        "convert it, extract the audio or make a GIF.")
+        self.btn_file.clicked.connect(self._open_file)
+        self.btn_hist = tip(QtWidgets.QPushButton("History"), "History",
+                            "All links you pasted before, with a small picture. Double-click one to open it again.")
+        self.btn_hist.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_hist.clicked.connect(self._show_history)
+        row.addWidget(self.url, 1)
+        row.addWidget(self.btn_paste)
+        row.addWidget(self.btn_file)
+        row.addWidget(self.btn_hist)
+        L.addLayout(row)
+        self.thumb = Thumb()
+        self.thumb.clicked.connect(self._thumb_clicked)
+        self.vview = VideoView(self.thumb)
+        self.canvas = self.vview.video
+        if self.canvas is not None:
+            self.canvas.boxChanged.connect(self._box_changed)
+            self.canvas.subMoved.connect(self._sub_moved)
+        L.addWidget(self.vview)
+        self.transport = QtWidgets.QWidget()
+        tv = QtWidgets.QVBoxLayout(self.transport)
+        tv.setContentsMargins(0, 0, 0, 0)
+        tv.setSpacing(6)
+        trl = QtWidgets.QHBoxLayout()
+        trl.setSpacing(6)
+        self.btn_prev_f = tip(QtWidgets.QPushButton("◀|"), "Previous frame", "← or ,   (Shift + ← = 1 second back)")
+        self.btn_play = tip(QtWidgets.QPushButton("▶"), "Play / pause", "Space")
+        self.btn_next_f = tip(QtWidgets.QPushButton("|▶"), "Next frame", "→ or .   (Shift + → = 1 second ahead)")
+        for b_, fn in ((self.btn_prev_f, lambda: self._step(-1)), (self.btn_play, self._toggle_play),
+                       (self.btn_next_f, lambda: self._step(1))):
+            b_.setObjectName("transport")
+            b_.setCursor(Qt.CursorShape.PointingHandCursor)
+            b_.setAutoRepeat(b_ is not self.btn_play)
+            b_.setAutoRepeatDelay(350)
+            b_.setAutoRepeatInterval(60)
+            b_.clicked.connect(fn)
+        self.ed_tc = tip(QtWidgets.QLineEdit("0:00.00"), "Timecode",
+                         "Position of the preview. Type a time and press Enter to jump there: 1:31.24 · 1:02:03 · "
+                         "90s (a plain number like 10 means minute 10).")
+        self.ed_tc.setObjectName("time")
+        self.ed_tc.setFixedWidth(92)
+        self.ed_tc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ed_tc.returnPressed.connect(self._tc_entered)
+        self.ed_tc.textEdited.connect(lambda _t: set_state(self.ed_tc, ""))
+        self.lbl_ptime = label("/ 0:00", "ptime")
+        self.seek = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Position", "Drag to move through the video.")
+        self.seek.setRange(0, 0)
+        self.seek.sliderMoved.connect(lambda v: self._seek_to(v / 1000))
+        self.vol = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Volume", "")
+        self.vol.setRange(0, 100)
+        self.vol.setFixedWidth(64)
+        self.vol.valueChanged.connect(self._on_volume)
+        trl.addWidget(self.btn_prev_f)
+        trl.addWidget(self.btn_play)
+        trl.addWidget(self.btn_next_f)
+        trl.addSpacing(4)
+        trl.addWidget(self.ed_tc)
+        trl.addWidget(self.lbl_ptime)
+        trl.addSpacing(4)
+        trl.addWidget(self.seek, 1)
+        trl.addSpacing(4)
+        trl.addWidget(self.vol)
+        tv.addLayout(trl)
+        tr2 = QtWidgets.QHBoxLayout()
+        tr2.setSpacing(6)
+        self.btn_play_clip = tip(QtWidgets.QPushButton("▷ Play clip"), "Play the clip",
+                                 "Plays from the clip start to the clip end.")
+        self.btn_set_in = tip(QtWidgets.QPushButton("⇤ Start here"), "Start here",
+                              "Sets the clip start to the current position (key I).")
+        self.btn_set_out = tip(QtWidgets.QPushButton("End here ⇥"), "End here",
+                               "Sets the clip end to the current position (key O).")
+        for b_, fn in ((self.btn_play_clip, self._play_clip), (self.btn_set_in, self._set_in),
+                       (self.btn_set_out, self._set_out)):
+            b_.setObjectName("chip")
+            b_.setCursor(Qt.CursorShape.PointingHandCursor)
+            b_.clicked.connect(fn)
+            tr2.addWidget(b_)
+        self.btn_still = tip(QtWidgets.QPushButton("↓ Save frame"), "Save frame",
+                             "Saves the frame you see as a PNG in full quality (not the preview quality) – with the "
+                             "crop, size and AI upscaling from the Frame tab.")
+        self.btn_still.setObjectName("chip")
+        self.btn_still.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_still.clicked.connect(self._save_still)
+        tr2.addSpacing(6)
+        tr2.addWidget(self.btn_still)
+        tr2.addStretch(1)
+        self.lbl_pv_src = label("", "ptime")
+        tr2.addWidget(self.lbl_pv_src)
+        tv.addLayout(tr2)
+        self.transport.hide()
+        L.addWidget(self.transport)
+        self.vtitle = label("", "vtitle")
+        self.vtitle.setWordWrap(True)
+        self.vmeta = label("", "muted")
+        self.vmeta.setWordWrap(True)
+        L.addWidget(self.vtitle)
+        mr = QtWidgets.QHBoxLayout()
+        mr.addWidget(self.vmeta, 1)
+        self.btn_thumb = QtWidgets.QPushButton("↓  Save thumbnail")
+        self.btn_thumb.setObjectName("chip")
+        self.btn_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.btn_thumb, "Save thumbnail", "Saves the video thumbnail as a JPG in the output folder. "
+                                              "For your own files: the frame at the clip start.")
+        self.btn_thumb.clicked.connect(self._save_thumb_now)
+        self.btn_thumb.hide()
+        mr.addWidget(self.btn_thumb, 0, Qt.AlignmentFlag.AlignTop)
+        L.addLayout(mr)
+        L.addSpacing(4)
+
+        ch = QtWidgets.QHBoxLayout()
+        ch.addWidget(section("Clip"))
+        ch.addSpacing(8)
+        self.lbl_len = label("", "len")
+        ch.addWidget(self.lbl_len)
+        ch.addStretch(1)
+        self.btn_chapters = tip(QtWidgets.QPushButton("Chapters"), "Chapters",
+                                "The video has chapters – pick some and they become clips (one file per chapter, "
+                                "named after it, or joined).")
+        self.btn_chapters.setObjectName("chip")
+        self.btn_chapters.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_chapters.clicked.connect(self._chapters)
+        self.btn_chapters.hide()
+        ch.addWidget(self.btn_chapters)
+        ch.addSpacing(6)
+        self.seg_clips = Segmented([("one", "One clip"), ("multi", "Several clips")])
+        self.seg_clips.set_tips({"one": ("One clip", "Cut one part of the video (or take all of it)."),
+                                 "multi": ("Several clips", "Pick as many parts as you like – save them as one "
+                                                            "file (one after another) or each as its own file. "
+                                                            "Works for video, audio and GIF.")})
+        self.seg_clips.setFixedWidth(236)
+        self.seg_clips.changed.connect(self._clip_mode_changed)
+        ch.addWidget(self.seg_clips)
+        L.addLayout(ch)
+        self.slider = RangeSlider()
+        self.slider.changed.connect(self._slider_changed)
+        self.slider.dragged.connect(self._on_handle_dragged)
+        tip(self.slider, "Clip range", "Drag the handles to set start and end, or drag the middle to move the "
+                                       "whole range.")
+        self.slider.hide()
+        L.addWidget(self.slider)
+        tr = QtWidgets.QHBoxLayout()
+        tr.setSpacing(8)
+        self.t_from = QtWidgets.QLineEdit()
+        self.t_to = QtWidgets.QLineEdit()
+        tip(self.t_from, "From", "Start time. 10 = minute 10, 1:30, 1:02:30 or 90s. Empty = from the beginning.")
+        tip(self.t_to, "To", "End time, same formats. Empty = to the end.")
+        for w, ph in ((self.t_from, "start"), (self.t_to, "end")):
+            w.setObjectName("time")
+            w.setPlaceholderText(ph)
+            w.setFixedWidth(96)
+            w.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            w.textEdited.connect(self._times_edited)
+            w.editingFinished.connect(self._times_committed)
+            w.returnPressed.connect(self.start)
+        tr.addWidget(label("from", "field"))
+        tr.addWidget(self.t_from)
+        tr.addWidget(label("to", "field"))
+        tr.addWidget(self.t_to)
+        tr.addSpacing(6)
+        self.chips = []
+        for txt, secs in (("5 s", 5), ("10 s", 10), ("30 s", 30), ("Whole", None)):
+            b = QtWidgets.QPushButton(txt)
+            b.setObjectName("chip")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            tip(b, txt, f"Makes the clip {secs} seconds long, starting at 'from'." if secs
+                else "Clears the times and uses the whole video.")
+            b.clicked.connect(lambda _=False, s=secs: self._chip(s))
+            tr.addWidget(b)
+            self.chips.append(b)
+        tr.addStretch(1)
+        L.addLayout(tr)
+        self.clip_hint = label("", "hint")
+        self.clip_hint.setWordWrap(True)
+        L.addWidget(self.clip_hint)
+        L.addStretch(1)
+        body.addWidget(left, 11)
+
+        # ---- right: output
+        right, R = card()
+        self.multi_box = QtWidgets.QWidget()
+        mb = QtWidgets.QVBoxLayout(self.multi_box)
+        mb.setContentsMargins(0, 0, 0, 0)
+        mb.setSpacing(8)
+        mh = QtWidgets.QHBoxLayout()
+        mh.addWidget(section("Clips"))
+        mh.addSpacing(6)
+        self.lbl_clips = label("", "muted")
+        mh.addWidget(self.lbl_clips)
+        mh.addStretch(1)
+        self.seg_join = Segmented([("join", "Join"), ("separate", "One file each")])
+        self.seg_join.setFixedWidth(220)
+        mh.addWidget(self.seg_join)
+        mh.addSpacing(6)
+        self.btn_add_clip = tip(QtWidgets.QPushButton("+ Add clip"), "Add clip",
+                                "Adds a new clip at the player position (or after the last clip). "
+                                "Then drag the handles or type the times.")
+        self.btn_add_clip.setObjectName("chip")
+        self.btn_add_clip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_add_clip.clicked.connect(self._add_clip)
+        mh.addWidget(self.btn_add_clip)
+        mb.addLayout(mh)
+        self.clip_list = tip(QtWidgets.QListWidget(), "Clips", "Click a clip to edit it with the timeline on the "
+                                                               "left. Joined clips play in this order.")
+        self.clip_list.setObjectName("clips")
+        self.clip_list.setFixedHeight(118)
+        self.clip_list.currentRowChanged.connect(self._select_clip)
+        mb.addWidget(self.clip_list)
+        self.seg_join.set_tips({"join": ("Join", "All clips one after another in a single file – frame-accurate, "
+                                                 "with tiny fades at the cuts so the sound doesn't click."),
+                                "separate": ("One file per clip", "Every clip becomes its own file "
+                                                                  "(name_01, name_02 … if you give a name).")})
+        self.seg_join.changed.connect(lambda _k: (self._update_clip_info(), self._set_button_text()))
+        mb.addSpacing(4)
+        self.multi_box.hide()
+        R.addWidget(self.multi_box)
+        R.addWidget(section("Format"))
+        self.seg = Segmented([("mp4", "Video"), ("mp3", "Audio"), ("gif", "GIF")])
+        self.seg.set_tips({"mp4": ("Video", "MP4 (H.264 / H.265) or ProRes MOV for editing."),
+                           "mp3": ("Audio", "Only the sound: MP3, WAV or M4A."),
+                           "gif": ("GIF", f"Short looping animation without sound – up to {GIF_MAX} s.")})
+        self.seg.changed.connect(self._mode_changed)
+        R.addWidget(self.seg)
+        R.addSpacing(2)
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self._page_mp4())
+        self.stack.addWidget(self._page_audio())
+        self.stack.addWidget(self._page_gif())
+        self.tabs = TabBar([("out", "Output"), ("frame", "Frame"), ("volume", "Volume"), ("subs", "Subtitles")])
+        self.tabs.set_tips({
+            "out": ("Output", "Codec, quality and size of the file."),
+            "frame": ("Frame", "Crop to 9:16, 1:1 … (for TikTok, Reels, Shorts), output size and AI upscaling."),
+            "volume": ("Volume", "Make parts of the clip quieter or louder – fades, ducking, muting."),
+            "subs": ("Subtitles", "Load the video's subtitles (or your own file), read them, burn them into the "
+                                  "picture or save them as .srt.")})
+        self.tabs.changed.connect(self._tab_changed)
+        R.addWidget(self.tabs)
+        self.tabstack = QtWidgets.QStackedWidget()
+        self.tabstack.addWidget(self.stack)
+        self.tabstack.addWidget(self._page_frame())
+        self.tabstack.addWidget(self._page_volume())
+        self.tabstack.addWidget(self._page_subs())
+        R.addWidget(self.tabstack)
+        R.addSpacing(2)
+        R.addWidget(section("Save as"))
+        nr = QtWidgets.QHBoxLayout()
+        self.name = QtWidgets.QLineEdit()
+        self.name.setClearButtonEnabled(True)
+        tip(self.name, "File name", "Leave empty to use the video title. An existing file is never "
+                                    "overwritten – a number is added instead.")
+        self.name.returnPressed.connect(self.start)
+        self.lbl_ext = tip(label(".mp4", "ext"), "File type", "Set by the format you picked.")
+        nr.addWidget(self.name, 1)
+        nr.addWidget(self.lbl_ext)
+        R.addLayout(nr)
+        fr = QtWidgets.QHBoxLayout()
+        self.outdir = QtWidgets.QLineEdit()
+        tip(self.outdir, "Output folder", "Where the files are saved.")
+        self.btn_browse = tip(QtWidgets.QPushButton("Browse …"), "Browse", "Choose the output folder.")
+        self.btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_browse.clicked.connect(self._pick_dir)
+        fr.addWidget(self.outdir, 1)
+        fr.addWidget(self.btn_browse)
+        R.addLayout(fr)
+        self.cb_thumb = QtWidgets.QCheckBox("Also save the thumbnail as JPG")
+        self.cb_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_thumb, "Thumbnail as JPG", "Saved next to the file with the same name. "
+                                               "For your own videos: the frame at the clip start.")
+        R.addWidget(self.cb_thumb)
+        R.addStretch(1)
+        self.btn = QtWidgets.QPushButton("Download MP4")
+        self.btn.setObjectName("primary")
+        self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn.clicked.connect(self.start)
+        R.addWidget(self.btn)
+        self.pb = QtWidgets.QProgressBar()
+        self.pb.setTextVisible(False)
+        self.pb.setRange(0, 1000)
+        self.pb.setValue(0)
+        self._pb_anim = QtCore.QPropertyAnimation(self.pb, b"value", self)
+        self._pb_anim.setDuration(260)
+        self._pb_anim.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+        R.addWidget(self.pb)
+        self.status = label("Ready.", "status")
+        self.status.setWordWrap(True)
+        self.status.setMinimumHeight(34)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        R.addWidget(self.status)
+        body.addWidget(right, 9)
+
+        # ---- details + footer
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(2000)
+        self.log.setFixedHeight(130)
+        self.log.hide()
+        v.addWidget(self.log)
+        foot = QtWidgets.QHBoxLayout()
+        foot.setSpacing(4)
+        self.btn_details = QtWidgets.QPushButton("▸  Details")
+        self.btn_open = QtWidgets.QPushButton("Open folder")
+        self.btn_show = QtWidgets.QPushButton("Show file")
+        self.btn_upd = QtWidgets.QPushButton("Update yt-dlp")
+        self.btn_app_upd = QtWidgets.QPushButton("Update app")
+        for b in (self.btn_details, self.btn_open, self.btn_show, self.btn_upd, self.btn_app_upd):
+            b.setObjectName("ghost")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_details.clicked.connect(self._toggle_log)
+        self.btn_open.clicked.connect(self._open_dir)
+        self.btn_show.clicked.connect(self._reveal)
+        self.btn_show.setEnabled(False)
+        self.btn_upd.clicked.connect(lambda: self._run_update(manual=True))
+        self.btn_app_upd.clicked.connect(self._app_update_clicked)
+        tip(self.btn_app_upd, "Update app", f"Loads the newest version of this app from github.com/{UPDATE_REPO} "
+                                            "and restarts it. Your settings stay.")
+        tip(self.btn_details, "Details", "Shows the full log – useful if something goes wrong.")
+        tip(self.btn_open, "Open folder", "Opens the output folder in Explorer.")
+        tip(self.btn_show, "Show file", "Shows the last saved file in Explorer.")
+        tip(self.btn_upd, "Update yt-dlp", "yt-dlp does the YouTube part. If downloads suddenly fail, "
+                                           "an update usually fixes it (also runs automatically once a day).")
+        foot.addWidget(self.btn_details)
+        foot.addWidget(self.btn_open)
+        foot.addWidget(self.btn_show)
+        foot.addStretch(1)
+        foot.addWidget(self.btn_app_upd)
+        foot.addWidget(self.btn_upd)
+        foot.addSpacing(10)
+        self.lbl_ver = tip(label(f"v{APP_VERSION}", "brand"), f"Version {APP_VERSION}")
+        foot.addWidget(self.lbl_ver, 0, Qt.AlignmentFlag.AlignBottom)
+        foot.addSpacing(6)
+        brand = label("TFROG", "brand")
+        tip(brand, "made by tfrog")
+        foot.addWidget(brand, 0, Qt.AlignmentFlag.AlignBottom)
+        v.addLayout(foot)
+        for key, fn in (("Space", self._toggle_play), ("I", self._set_in), ("O", self._set_out),
+                        (",", lambda: self._step(-1)), (".", lambda: self._step(1))):
+            sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            sc.activated.connect(fn)
+
+    def _grid(self):
+        w = QtWidgets.QWidget()
+        g = QtWidgets.QGridLayout(w)
+        g.setContentsMargins(0, 4, 0, 0)
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(10)
+        g.setColumnStretch(1, 1)
+        return w, g
+
+    def _combo(self, items, title=None, text=""):
+        c = QtWidgets.QComboBox()
+        c.addItems(list(items))
+        c.setCursor(Qt.CursorShape.PointingHandCursor)
+        for i, it in enumerate(items):
+            if it in ITEM_HELP:
+                c.setItemData(i, tip_html(it, ITEM_HELP[it]), Qt.ItemDataRole.ToolTipRole)
+        if title:
+            def upd(cur, c=c):
+                h = ITEM_HELP.get(cur)
+                c.setToolTip(tip_html(title, text) + (f"<br><br><b>{_esc(cur)}</b> – {_esc(h)}" if h else ""))
+            c.currentTextChanged.connect(upd)
+            upd(c.currentText())
+        return c
+
+    @staticmethod
+    def _field(text, title, help_):
+        return tip(label(text, "field"), title, help_)
+
+    def _page_mp4(self):
+        w, g = self._grid()
+        h_codec = "How the video is compressed. Hover over the entries in the list for details."
+        h_quality = "Maximum resolution. If the video doesn't have it, the next best is used."
+        h_size = "How strongly the video is compressed – smaller files, a bit less detail."
+        h_enc = "What does the encoding work. NVIDIA is much faster if you have such a graphics card."
+        self.cb_codec = self._combo(CODECS, "Codec", h_codec)
+        self.cb_codec.currentTextChanged.connect(self._codec_changed)
+        self.cb_quality = self._combo(QUALITIES, "Quality", h_quality)
+        self.cb_size = self._combo(SIZES, "Size", h_size)
+        self.cb_size.currentTextChanged.connect(self._size_changed)
+        self.target_mb = QtWidgets.QLineEdit()
+        self.target_mb.setObjectName("time")
+        self.target_mb.setFixedWidth(70)
+        self.target_mb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tip(self.target_mb, "Target size", "File size in MB, e.g. 25 for Discord or 50. Audio is included.")
+        self.lbl_mb = label("MB", "field")
+        self.cb_encoder = self._combo(ENCODERS, "Encoder", h_enc)
+        self.lbl_size = self._field("Size", "Size", h_size)
+        self.lbl_encoder = self._field("Encoder", "Encoder", h_enc)
+        g.addWidget(self._field("Codec", "Codec", h_codec), 0, 0)
+        g.addWidget(self.cb_codec, 0, 1, 1, 3)
+        g.addWidget(self._field("Quality", "Quality", h_quality), 1, 0)
+        g.addWidget(self.cb_quality, 1, 1, 1, 3)
+        g.addWidget(self.lbl_size, 2, 0)
+        self._mp4_grid = g
+        g.addWidget(self.cb_size, 2, 1, 1, 3)
+        g.addWidget(self.target_mb, 2, 2)
+        g.addWidget(self.lbl_mb, 2, 3)
+        g.addWidget(self.lbl_encoder, 3, 0)
+        g.addWidget(self.cb_encoder, 3, 1, 1, 3)
+        self.size_hint = label("", "hint")
+        self.size_hint.setWordWrap(True)
+        g.addWidget(self.size_hint, 4, 1, 1, 3)
+        h_up = ("Makes the picture bigger (or sets the size of a 9:16 / 1:1 crop). 'To 1080p' = short side 1080 px, "
+                "e.g. 1080 × 1920 for Reels / Shorts.")
+        h_model = ("How it is enlarged: normal scaling, or AI (Real-ESRGAN on the graphics card). You can also load "
+                   "your own ncnn models.")
+        self.cb_up = self._combo(UPSCALES, "Upscale", h_up)
+        self.cb_up.currentTextChanged.connect(lambda _t: self._frame_info())
+        self.cb_model = self._combo(list(MODELS), "Model", h_model)
+        self.cb_model.activated.connect(self._model_picked)
+        self.cb_model.currentTextChanged.connect(lambda _t: self._frame_info())
+        self._fill_models()
+        g.addWidget(self._field("Upscale", "Upscale", h_up), 5, 0)
+        ur = QtWidgets.QHBoxLayout()
+        ur.setSpacing(8)
+        ur.addWidget(self.cb_up, 2)
+        ur.addWidget(self.cb_model, 3)
+        g.addLayout(ur, 5, 1, 1, 3)
+        self.up_hint = label("", "hint")
+        self.up_hint.setWordWrap(True)
+        g.addWidget(self.up_hint, 6, 1, 1, 3)
+        er = QtWidgets.QHBoxLayout()
+        self.btn_esr = tip(QtWidgets.QPushButton(f"Install AI upscaler (≈ {UPSCALER_MB} MB)"), "AI upscaler",
+                           "Real-ESRGAN – runs on the graphics card (NVIDIA, AMD or Intel, no extra setup). "
+                           "Downloaded once from its official GitHub page.")
+        self.btn_esr.setObjectName("chip")
+        self.btn_esr.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_esr.clicked.connect(lambda: self._install_upscaler())
+        er.addWidget(self.btn_esr)
+        er.addStretch(1)
+        g.addLayout(er, 7, 1, 1, 3)
+        return w
+
+    def _page_audio(self):
+        w, g = self._grid()
+        h_fmt = "The audio file type. Hover over the entries in the list for details."
+        h_rate = "Higher = better sound and bigger file."
+        self.cb_afmt = self._combo(AUDIO_FORMATS, "Format", h_fmt)
+        self.cb_afmt.currentTextChanged.connect(self._afmt_changed)
+        self.cb_mp3 = self._combo(MP3_QUALITIES, "Bitrate", h_rate)
+        self.lbl_bitrate = self._field("Bitrate", "Bitrate", h_rate)
+        g.addWidget(self._field("Format", "Format", h_fmt), 0, 0)
+        g.addWidget(self.cb_afmt, 0, 1)
+        g.addWidget(self.lbl_bitrate, 1, 0)
+        g.addWidget(self.cb_mp3, 1, 1)
+        self.audio_hint = label("", "hint")
+        self.audio_hint.setWordWrap(True)
+        g.addWidget(self.audio_hint, 2, 1)
+        g.setRowStretch(3, 1)
+        return w
+
+    def _page_gif(self):
+        w, g = self._grid()
+        h_w = "Width of the GIF – height follows the video. Bigger = much larger file."
+        h_fps = "Frames per second. More = smoother motion and a bigger file."
+        h_col = "GIFs can show at most 256 colors. Fewer colors = smaller file, more banding."
+        self.cb_gif_w = self._combo(GIF_WIDTHS, "Width", h_w)
+        self.cb_gif_fps = self._combo(GIF_FPS, "Frame rate", h_fps)
+        self.cb_gif_col = self._combo(GIF_COLORS, "Colors", h_col)
+        g.addWidget(self._field("Width", "Width", h_w), 0, 0)
+        g.addWidget(self.cb_gif_w, 0, 1)
+        g.addWidget(self._field("Frame rate", "Frame rate", h_fps), 1, 0)
+        g.addWidget(self.cb_gif_fps, 1, 1)
+        g.addWidget(self._field("Colors", "Colors", h_col), 2, 0)
+        g.addWidget(self.cb_gif_col, 2, 1)
+        g.addWidget(label(f"Best for short clips – {GIF_RECOMMENDED} s or less (max {GIF_MAX} s).", "hint"), 3, 1)
+        return w
+
+    def _page_frame(self):
+        w, g = self._grid()
+        h_fmt = ("Crops the picture to this format. A box appears in the preview: drag it to move, drag a corner to "
+                 "resize. With several clips every clip keeps its own box. The size of the result is set under "
+                 "Output → Upscale.")
+        self.seg_aspect = Segmented([(k, k) for k in ASPECTS])
+        self.seg_aspect.set_tips({"Off": ("Off", "Keep the whole picture."),
+                                  "16:9": ("16:9", "Landscape – YouTube, TV."),
+                                  "9:16": ("9:16", "Vertical – Shorts, Reels, TikTok."),
+                                  "1:1": ("1:1", "Square."),
+                                  "3:4": ("3:4", "Portrait.")})
+        self.seg_aspect.changed.connect(self._aspect_changed)
+        g.addWidget(self._field("Format", "Format", h_fmt), 0, 0)
+        g.addWidget(self.seg_aspect, 0, 1, 1, 2)
+        self.frame_hint = label("", "hint")
+        self.frame_hint.setWordWrap(True)
+        g.addWidget(self.frame_hint, 1, 1, 1, 2)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        self.btn_center = tip(QtWidgets.QPushButton("Center box"), "Center box",
+                              "Puts the box in the middle again, as big as possible.")
+        self.btn_center.setObjectName("chip")
+        self.btn_center.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_center.clicked.connect(lambda: self.canvas.reset_box() if self.canvas is not None else None)
+        row.addWidget(self.btn_center)
+        row.addStretch(1)
+        g.addLayout(row, 2, 1, 1, 2)
+        g.setRowStretch(3, 1)
+        return w
+
+    def _page_volume(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(10)
+        self.lane = VolumeLane()
+        self.lane.set_points(self.vol_pts)
+        self.lane.changed.connect(self._vol_changed)
+        self.lane.seek.connect(lambda t: self._seek_to(t) if self._has_media() else None)
+        tip(self.lane, "Volume curve", "Shows the clip you are editing. Click to add a point, drag it, right-click "
+                                       "or double-click to remove it. The middle line is 100 % (unchanged).")
+        v.addWidget(self.lane)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        for txt, fn, title, text in (
+                ("+ Point here", self._vol_point, "Point at the playhead", "Adds a point at the current preview "
+                                                                           "position (with the current volume)."),
+                ("Fade in", lambda: self._vol_fade(True), "Fade in", "Sound comes up over the first second of the clip."),
+                ("Fade out", lambda: self._vol_fade(False), "Fade out", "Sound goes down over the last second."),
+                ("Reset", self._vol_reset, "Reset", "Removes the whole curve (100 % everywhere).")):
+            b = tip(QtWidgets.QPushButton(txt), title, text)
+            b.setObjectName("chip")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        v.addLayout(row)
+        self.vol_hint = label("", "hint")
+        self.vol_hint.setWordWrap(True)
+        v.addWidget(self.vol_hint)
+        v.addStretch(1)
+        return w
+
+    def _page_subs(self):
+        w, g = self._grid()
+        h_src = ("Subtitles of the video (real ones and YouTube's automatic ones), subtitles inside your file, or "
+                 "your own .srt / .vtt / .ass file.")
+        h_mode = "Burned in: always visible, works everywhere. As track: can be switched on and off in the player."
+        h_font = "Any installed font – or load a .ttf / .otf file. Used in the preview and when burning in."
+        h_look = "Size, text color, outline color and bold."
+        self.cb_subs = QtWidgets.QComboBox()
+        self.cb_subs.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_subs, "Subtitles", h_src)
+        self.cb_subs.activated.connect(self._sub_picked)
+        self.seg_submode = Segmented([("none", "Not in the video"), ("burn", "Burned in"), ("track", "As track")])
+        self.seg_submode.set_tips({"none": ("Not in the video", "The subtitles are only shown here (and saved as "
+                                                                ".srt if ticked)."),
+                                   "burn": ("Burned in", "Part of the picture – in your font, size, colors and "
+                                                         "position."),
+                                   "track": ("As track", "A subtitle track in the MP4 / MOV that players can switch "
+                                                         "on and off (the player decides how it looks).")})
+        self.seg_submode.changed.connect(lambda _k: self._subs_ui())
+        self.cb_font = QtWidgets.QFontComboBox()
+        self.cb_font.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cb_font.setEditable(False)
+        tip(self.cb_font, "Font", h_font)
+        self.cb_font.currentFontChanged.connect(lambda f: self._sub_style_set(font=f.family()))
+        self.btn_font = tip(QtWidgets.QPushButton("Load font …"), "Load font", "Use a .ttf / .otf file. It is kept "
+                                                                              "in the app and stays in this list.")
+        self.btn_font.setObjectName("chip")
+        self.btn_font.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_font.clicked.connect(self._load_font)
+        self.sp_size = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.sp_size.setRange(40, 300)
+        self.sp_size.setSingleStep(5)
+        self.sp_size.setPageStep(10)
+        self.sp_size.setFixedWidth(96)
+        self.sp_size.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.sp_size, "Size", "100 % = about 5.5 % of the picture height (of the short side).")
+        self.lbl_size_pct = label("100 %", "ptime")
+        self.lbl_size_pct.setFixedWidth(42)
+        self.sp_size.valueChanged.connect(lambda v: (self.lbl_size_pct.setText(f"{v} %"), self._sub_style_set(size=v)))
+        self.btn_col = tip(QtWidgets.QPushButton(), "Text color")
+        self.btn_ol = tip(QtWidgets.QPushButton(), "Outline color")
+        for b, key in ((self.btn_col, "color"), (self.btn_ol, "outline")):
+            b.setObjectName("colorbtn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, k=key: self._pick_sub_color(k))
+        self.cb_bold = QtWidgets.QCheckBox("Bold")
+        self.cb_bold.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cb_bold.toggled.connect(lambda v: self._sub_style_set(bold=v))
+        self.cb_srt = QtWidgets.QCheckBox("Also save as .srt next to the file")
+        self.cb_srt.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_srt, "Save .srt", "With the times of your clip (or of the joined clips) – and your changes.")
+        self.cb_srt.toggled.connect(lambda _v: self._subs_ui())
+        self.btn_lines = tip(QtWidgets.QPushButton("Edit lines …"), "Edit lines",
+                             "All lines with their times: change text and times, add or delete lines, shift "
+                             "everything, search, copy or save.")
+        self.btn_pos = tip(QtWidgets.QPushButton("Reset position"), "Reset position",
+                           "Back to the bottom center (double-click the text in the preview does the same).")
+        for b in (self.btn_lines, self.btn_pos):
+            b.setObjectName("chip")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_lines.clicked.connect(self._show_lines)
+        self.btn_pos.clicked.connect(lambda: self._sub_style_set(pos=None))
+        g.addWidget(self._field("Subtitles", "Subtitles", h_src), 0, 0)
+        g.addWidget(self.cb_subs, 0, 1)
+        self.sub_status = label("", "hint")
+        g.addWidget(self.sub_status, 1, 1)
+        g.addWidget(self._field("In the video", "In the video", h_mode), 2, 0)
+        g.addWidget(self.seg_submode, 2, 1)
+        g.addWidget(self._field("Font", "Font", h_font), 3, 0)
+        fr = QtWidgets.QHBoxLayout()
+        fr.setSpacing(6)
+        fr.addWidget(self.cb_font, 1)
+        fr.addWidget(self.btn_font)
+        g.addLayout(fr, 3, 1)
+        g.addWidget(self._field("Look", "Look", h_look), 4, 0)
+        lr = QtWidgets.QHBoxLayout()
+        lr.setSpacing(8)
+        lr.addWidget(self.sp_size)
+        lr.addWidget(self.lbl_size_pct)
+        lr.addWidget(self.btn_col)
+        lr.addWidget(label("text", "field"))
+        lr.addWidget(self.btn_ol)
+        lr.addWidget(label("outline", "field"))
+        lr.addSpacing(6)
+        lr.addWidget(self.cb_bold)
+        lr.addStretch(1)
+        g.addLayout(lr, 4, 1)
+        g.addWidget(self.cb_srt, 5, 1)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(self.btn_lines)
+        row.addWidget(self.btn_pos)
+        row.addStretch(1)
+        g.addLayout(row, 6, 1)
+        self.sub_hint = label("Drag the text in the preview to place it anywhere in the picture.", "hint")
+        self.sub_hint.setWordWrap(True)
+        g.addWidget(self.sub_hint, 7, 1)
+        g.setRowStretch(8, 1)
+        self._fill_subs([])
+        return w
+
+    # ------------------------------------------------------------------ subtitle look
+    def _load_app_fonts(self):
+        self._font_files = {}
+        for f in sorted(FONTS_DIR.glob("*")) if FONTS_DIR.is_dir() else []:
+            if f.suffix.lower() in (".ttf", ".otf", ".ttc"):
+                fid = QtGui.QFontDatabase.addApplicationFont(str(f))
+                for fam in QtGui.QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []:
+                    self._font_files[fam] = str(f)
+
+    def _apply_sub_style_ui(self):
+        st = self.sub_style
+        for w_ in (self.cb_font, self.sp_size, self.cb_bold):
+            w_.blockSignals(True)
+        self.cb_font.setCurrentFont(QtGui.QFont(st.get("font") or "Arial"))
+        self.sp_size.setValue(int(st.get("size") or 100))
+        self.lbl_size_pct.setText(f"{int(st.get('size') or 100)} %")
+        self.cb_bold.setChecked(bool(st.get("bold")))
+        for w_ in (self.cb_font, self.sp_size, self.cb_bold):
+            w_.blockSignals(False)
+        self.btn_col.setStyleSheet(f"background: {st.get('color')};")
+        self.btn_ol.setStyleSheet(f"background: {st.get('outline')};")
+        self.btn_pos.setEnabled(bool(st.get("pos")))
+        if self.canvas is not None:
+            self.canvas.set_sub_style(st)
+
+    def _sub_style_set(self, **kw):
+        if "font" in kw:
+            kw["font_file"] = self._font_files.get(kw["font"], "")
+        self.sub_style.update(kw)
+        self.cfg["sub_style"] = {k: v for k, v in self.sub_style.items()}
+        self._apply_sub_style_ui()
+
+    def _sub_moved(self, pos):
+        self.sub_style["pos"] = pos
+        self.cfg["sub_style"] = dict(self.sub_style)
+        self.btn_pos.setEnabled(bool(pos))
+
+    def _pick_sub_color(self, key):
+        col = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.sub_style.get(key) or "#ffffff"), self,
+                                              "Text color" if key == "color" else "Outline color")
+        if col.isValid():
+            self._sub_style_set(**{key: col.name()})
+
+    def _load_font(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load a font", self.cfg.get("last_font_dir") or
+                                                        str(Path.home()), "Fonts (*.ttf *.otf *.ttc)")
+        if not path:
+            return
+        self.cfg["last_font_dir"] = str(Path(path).parent)
+        try:
+            f = install_font(path)
+        except OSError as ex:
+            return self._on_error(f"Font not loaded: {ex}")
+        fid = QtGui.QFontDatabase.addApplicationFont(str(f))
+        fams = QtGui.QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
+        if not fams:
+            return self._on_error("This font file can't be read.")
+        for fam in fams:
+            self._font_files[fam] = str(f)
+        self._sub_style_set(font=fams[0])
+        self._on_status(f"Font “{fams[0]}” loaded.")
+
+    # ------------------------------------------------------------------ frame tab
+    def _tab_changed(self, key):
+        self.tabstack.setCurrentIndex(["out", "frame", "volume", "subs"].index(key))
+        self._fit_stack(self.tabstack)
+        if self.canvas is not None:
+            self.canvas.set_ghost(key == "subs" and bool(self.sub_cues) and self.seg.value() != "mp3")
+        if key == "volume":
+            self._lane_range()
+        if key == "frame":
+            self._frame_info()
+
+    def _aspect(self):
+        return ASPECTS.get(self.seg_aspect.value()) if self.seg.value() in ("mp4", "gif") else None
+
+    def _aspect_changed(self, _key=None):
+        aspect = ASPECTS.get(self.seg_aspect.value())
+        for c in self.clips:
+            c.box = None
+        self.box = None
+        if self.canvas is not None:
+            self.canvas.set_aspect(self._aspect())
+            self.box = self.canvas.box
+            if self._multi() and self.clips:
+                self.clips[self.cur].box = self.box
+            if aspect and self._pv_state == "offer" and self._is_info_current():
+                self._thumb_clicked()          # the box needs the picture
+        self._frame_info()
+
+    def _box_changed(self, box):
+        self.box = box
+        if self._multi() and self.clips and self.cur < len(self.clips):
+            self.clips[self.cur].box = box
+        self._frame_info()
+
+    def _src_dims(self):
+        """Width × height of the picture that will be downloaded (or of the file)."""
+        if not self._is_info_current():
+            return None
+        w, h = self.info.get("width"), self.info.get("height")
+        if not w or not h:
+            fs = self.canvas.frame_size() if self.canvas is not None else None
+            if not fs:
+                return None
+            w, h = fs
+            if not self.info.get("local"):
+                h0 = 1080
+                w, h = round(w * h0 / h), h0
+        q = QUALITIES.get(self.cb_quality.currentText()) if self.seg.value() == "mp4" else None
+        if q and not self.info.get("local") and h > q and w >= h:
+            w, h = round(w * q / h), q
+        elif q and not self.info.get("local") and w < h and w > q:   # vertical video: the short side is limited
+            w, h = q, round(h * q / w)
+        return int(w), int(h)
+
+    def _frame_dims(self):
+        """-> (crop w, crop h, result w, result h) or None."""
+        d = self._src_dims()
+        if not d:
+            return None
+        W, H = d
+        aspect = self._aspect()
+        cw, ch = (crop_rect(self.box, W, H, aspect)[:2]) if aspect else (W, H)
+        up = UPSCALES.get(self.cb_up.currentText()) if self.seg.value() == "mp4" else None
+        ow, oh = target_dims(cw, ch, up, aspect)
+        return cw, ch, ow, oh
+
+    def _model(self):
+        return model_spec(self.cb_model.currentText())
+
+    def _ai_wanted(self):
+        return self._model().get("kind") == "esr"
+
+    def _fill_models(self, select=None):
+        cur = select or self.cb_model.currentText()
+        self.cb_model.blockSignals(True)
+        self.cb_model.clear()
+        labels = list(MODELS) + [f"Own · {x['name']}" for x in list_custom_models()]
+        for lab in labels:
+            self.cb_model.addItem(lab)
+        self.cb_model.addItem(MODEL_LOAD)
+        for i in range(self.cb_model.count()):
+            t = self.cb_model.itemText(i)
+            h = ITEM_HELP.get(t) or ("Your own model (ncnn). Remove it in Settings → AI upscaler."
+                                     if t.startswith("Own · ") else "")
+            if h:
+                self.cb_model.setItemData(i, tip_html(t, h), Qt.ItemDataRole.ToolTipRole)
+        self.cb_model.setCurrentText(cur if cur in labels else labels[0])
+        self.cb_model.blockSignals(False)
+        self._last_model = self.cb_model.currentText()
+
+    def _model_picked(self, idx):
+        if self.cb_model.itemText(idx) != MODEL_LOAD:
+            self._last_model = self.cb_model.currentText()
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load a model (.param – the .bin with the same name must be next to it)",
+            self.cfg.get("last_model_dir") or str(Path.home()), "ncnn models (*.param *.bin);;All files (*.*)")
+        if not path:
+            self.cb_model.setCurrentText(getattr(self, "_last_model", list(MODELS)[0]))
+            return
+        self.cfg["last_model_dir"] = str(Path(path).parent)
+        try:
+            m = import_model(path)
+        except Exception as ex:  # noqa: BLE001
+            self.cb_model.setCurrentText(getattr(self, "_last_model", list(MODELS)[0]))
+            return self._on_error(clean_error(ex))
+        self._fill_models(select=f"Own · {m['name']}")
+        self._on_log(f"✓ Model added: {m['name']} ({m['scale']}×)")
+        self._on_status(f"Model “{m['name']}” added ({m['scale']}×).")
+        self._frame_info()
+
+    def _frame_info(self):
+        mode = self.seg.value()
+        is_mp4 = mode == "mp4"
+        self.seg_aspect.setEnabled(mode in ("mp4", "gif"))
+        self.btn_center.setVisible(bool(self._aspect()) and self.canvas is not None)
+        aspect = self._aspect()
+        dims = self._frame_dims() if mode != "mp3" else None
+        ai = self._ai_wanted() and is_mp4 and UPSCALES.get(self.cb_up.currentText()) is not None
+        need_ai = False
+        if mode == "mp3":
+            ftxt = "Audio has no picture – switch to Video or GIF to crop."
+            utxt = ""
+        elif dims:
+            cw, ch, ow, oh = dims
+            ftxt = f"Crop {cw} × {ch}" if aspect else f"Picture {cw} × {ch}"
+            utxt = ""
+            if is_mp4 and (ow, oh) != (cw, ch):
+                f = ow / cw
+                need_ai = ai and f > 1.02
+                utxt = f"{cw} × {ch}  →  {ow} × {oh}" + (
+                    f"  ·  {f:.1f}× " + ("with AI" if need_ai else "(standard)") if f > 1.02 else "  ·  scaled down")
+                ftxt += f"  →  result {ow} × {oh} (Output → Upscale)"
+            elif not is_mp4:
+                ftxt += "  ·  the GIF width is set in Output"
+            if aspect and self.canvas is not None:
+                ftxt += ".  Drag the box in the preview."
+        else:
+            ftxt = "Paste a link or open a file – the sizes appear here." if aspect else ""
+            utxt = ""
+            need_ai = ai
+        installed = upscaler_exe() is not None
+        busy = self._esr_job is not None
+        self.btn_esr.setVisible(is_mp4 and self._ai_wanted() and (not installed or busy))
+        self.btn_esr.setEnabled(not busy)
+        if is_mp4 and self._ai_wanted() and not installed and not busy:
+            utxt = (utxt + "  ·  " if utxt else "") + "the AI upscaler is not installed yet"
+        self.cb_model.setEnabled(UPSCALES.get(self.cb_up.currentText()) is not None)
+        self.frame_hint.setText(ftxt)
+        self.up_hint.setText(utxt)
+        self.up_hint.setVisible(bool(utxt))
+        set_state(self.up_hint, "warn" if (need_ai and not installed) else "")
+        self._badges()
+
+    def _badges(self):
+        mode = self.seg.value()
+        self.tabs.set_badge("frame", bool(self._aspect()))
+        self.tabs.set_badge("volume", mode in ("mp4", "mp3") and any(abs(g - 1) > 1e-4 for _t, g in self.vol_pts))
+        self.tabs.set_badge("subs", bool(self.sub_cues) and (self.seg_submode.value() != "none" or self.cb_srt.isChecked()))
+
+    # ------------------------------------------------------------------ volume tab
+    def _lane_range(self):
+        rng = self._cur_range()
+        dur = self._duration()
+        if rng:
+            self.lane.set_range(*rng)
+        elif dur:
+            self.lane.set_range(0, dur)
+        mode = self.seg.value()
+        self.lane.setEnabled(mode != "gif")
+        self.vol_hint.setText("GIFs have no sound." if mode == "gif" else
+                              "Click the line to add points, drag them up or down. In the preview you hear the "
+                              "curve up to 100 %.")
+
+    def _vol_changed(self):
+        self._badges()
+        self._apply_gain()
+
+    def _vol_point(self):
+        t = self._player_pos()
+        rng = self._cur_range()
+        if t is None:
+            t = rng[0] if rng else 0.0
+        if rng:
+            t = min(max(t, rng[0]), rng[1])
+        g = vol_at(self.vol_pts, t)
+        self.vol_pts[:] = [q for q in self.vol_pts if abs(q[0] - t) > 0.01] + [[round(t, 3), round(g, 3)]]
+        self.vol_pts.sort()
+        self.lane.update()
+        self._vol_changed()
+
+    def _vol_fade(self, fade_in):
+        rng = self._cur_range()
+        if not rng:
+            return
+        s, e = rng
+        d = min(1.0, (e - s) / 3)
+        a, b = (s, s + d) if fade_in else (e - d, e)
+        ga, gb = (0.0, vol_at(self.vol_pts, b) or 1.0) if fade_in else (vol_at(self.vol_pts, a) or 1.0, 0.0)
+        self.vol_pts[:] = [q for q in self.vol_pts if not (a - 0.001 <= q[0] <= b + 0.001)] + [[a, ga], [b, gb]]
+        self.vol_pts.sort()
+        self.lane.update()
+        self._vol_changed()
+
+    def _vol_reset(self):
+        self.vol_pts.clear()
+        self.lane.update()
+        self._vol_changed()
+
+    def _apply_gain(self, t=None):
+        if t is None:
+            t = self._player_pos()
+        gain = vol_at(self.vol_pts, t) if (t is not None and self.seg.value() != "gif") else 1.0
+        for out in (self.audio_out, self.a_out2):
+            if out is not None:
+                out.setVolume(min(1.0, self.vol.value() / 100 * gain))
+
+    # ------------------------------------------------------------------ subtitles tab
+    def _fill_subs(self, items):
+        self.sub_items = list(items)
+        self.cb_subs.blockSignals(True)
+        self.cb_subs.clear()
+        self.cb_subs.addItem("Off")
+        for it in self.sub_items:
+            self.cb_subs.addItem(it["label"])
+        self.cb_subs.addItem("Load a file …")
+        self.cb_subs.blockSignals(False)
+        self.sub_status.setText("" if items else ("No subtitles found in this video – you can load a file."
+                                                  if self._is_info_current() else ""))
+        self._set_cues([], None)
+
+    def _sub_picked(self, idx):
+        n = len(self.sub_items)
+        if idx <= 0:
+            return self._set_cues([], None)
+        if idx == n + 1:
+            start = self.cfg.get("last_subs") or (str(Path(self.info["local"]).parent) if self.info.get("local")
+                                                  else str(Path.home()))
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open subtitles", start,
+                                                            "Subtitles (*.srt *.vtt *.ass *.ssa);;All files (*.*)")
+            if not path:
+                self.cb_subs.setCurrentIndex(0)
+                return self._set_cues([], None)
+            self.cfg["last_subs"] = str(Path(path).parent)
+            item = {"label": Path(path).name, "kind": "file", "key": path}
+            self.sub_items.append(item)
+            self.cb_subs.blockSignals(True)
+            self.cb_subs.insertItem(n + 1, item["label"])
+            self.cb_subs.setCurrentIndex(n + 1)
+            self.cb_subs.blockSignals(False)
+        else:
+            item = self.sub_items[idx - 1]
+        self._sub_req += 1
+        req, url = self._sub_req, self.info.get("local") or self.url.text().strip()
+        self.sub_status.setText("Loading subtitles …")
+        set_state(self.sub_status, "")
+        ffmpeg = self.ffmpeg
+
+        def work():
+            try:
+                cues = fetch_subs(url, item, ffmpeg)
+                self.emit("subs", (req, cues, item, ""))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("subs", (req, [], item, clean_error(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_subs(self, val):
+        req, cues, item, err = val
+        if req != self._sub_req:
+            return
+        if err or not cues:
+            self.sub_status.setText(("✕ " + err.splitlines()[0][:120]) if err else "These subtitles are empty.")
+            set_state(self.sub_status, "error")
+            self._set_cues([], None)
+            return
+        self._set_cues(cues, item)
+
+    def _set_cues(self, cues, item):
+        self.sub_cues = cues
+        self.sub_lang = (item or {}).get("key") if (item or {}).get("kind", "").startswith("yt") else None
+        if cues:
+            last = cues[-1][1]
+            self.sub_status.setText(f"{len(cues)} lines · up to {fmt_ts(last)}")
+            set_state(self.sub_status, "")
+        if self.lines_dlg is not None:
+            self.lines_dlg.close()
+            self.lines_dlg = None
+        self._subs_ui()
+        self._update_sub_overlay()
+
+    def _cues_edited(self, cues):
+        self.sub_cues = list(cues)
+        self.sub_status.setText(f"{len(cues)} lines · edited")
+        set_state(self.sub_status, "")
+        self._update_sub_overlay()
+        self._badges()
+
+    def _subs_ui(self):
+        mode = self.seg.value()
+        has = bool(self.sub_cues)
+        self.seg_submode.setEnabled(has and mode != "mp3")
+        self.cb_srt.setEnabled(has)
+        self.btn_lines.setEnabled(has)
+        look = has and mode != "mp3"
+        for w_ in (self.cb_font, self.btn_font, self.sp_size, self.btn_col, self.btn_ol, self.cb_bold):
+            w_.setEnabled(look)
+        self.btn_pos.setEnabled(look and bool(self.sub_style.get("pos")))
+        self.sub_hint.setVisible(look)
+        if mode == "gif" and self.seg_submode.value() == "track":
+            self.seg_submode.set_value("burn")
+        if self.canvas is not None:
+            self.canvas.set_ghost(look and self.tabs.value() == "subs")
+        self._badges()
+
+    def _update_sub_overlay(self, t=None):
+        if self.canvas is None:
+            return
+        if t is None:
+            t = self._player_pos()
+        self.canvas.set_sub(cue_at(self.sub_cues, t) if (self.sub_cues and t is not None) else "")
+
+    def _show_lines(self):
+        if not self.sub_cues:
+            return
+        if self.lines_dlg is None:
+            self.lines_dlg = SubsEditor(self, self.sub_cues, self.info.get("title") or "subtitles", self._player_pos)
+            self.lines_dlg.jump.connect(lambda t: (self._stop_playback(), self._seek_to(t)) if self._has_media() else None)
+            self.lines_dlg.changed.connect(self._cues_edited)
+            self.lines_dlg.finished.connect(lambda _r: setattr(self, "lines_dlg", None))
+        self.lines_dlg.show()
+        self.lines_dlg.raise_()
+
+    # ------------------------------------------------------------------ chapters / history / still / upscaler
+    def _chapters(self):
+        ch = self.info.get("chapters") if self._is_info_current() else None
+        if not ch or self.busy:
+            return
+        dlg = ChaptersDialog(self, ch)
+        dlg.seg_join.set_value("join" if self.seg_join.value() == "join" and self._multi() else "separate")
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        picked = dlg.picked()
+        if not picked:
+            return
+        self.clips = [Clip(s, e, title, self.box) for s, e, title in picked]
+        self.cur = 0
+        self.seg_join.set_value(dlg.seg_join.value())
+        if not self._multi():
+            self.seg_clips.set_value("multi", animate=True)
+            self.multi_box.setVisible(True)
+        self._refresh_clip_list()
+        self._select_clip(0)
+        self._update_clip_info()
+        self._set_button_text()
+
+    def _show_history(self):
+        dlg = HistoryDialog(self)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and dlg.chosen:
+            self.url.setText(dlg.chosen)
+            self.name.clear()
+
+    def _history_add(self, url, info, data):
+        if not self.cfg.get("history", True) or info.get("local"):
+            return
+        jpg = None
+        if data:
+            img = QtGui.QImage()
+            if img.loadFromData(data):
+                img = img.scaled(256, 144, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                buf = QtCore.QBuffer()
+                buf.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+                img.save(buf, "JPG", 82)
+                jpg = bytes(buf.data())
+        try:
+            history_add(url, info, jpg)
+        except Exception as ex:  # noqa: BLE001
+            self._on_log(f"History: {ex}")
+
+    def _save_still(self):
+        if not self._has_media() or self.busy or not self._is_info_current():
+            return
+        if self.info.get("local") and not self.info.get("has_video", True):
+            return
+        model = self._model() if self.seg.value() == "mp4" else {"kind": "std"}
+        dims = self._frame_dims()
+        if model.get("kind") == "esr" and dims and dims[2] > dims[0] * 1.05 and upscaler_exe() is None:
+            if not self._ask_install():
+                return
+            return self._install_upscaler(then=self._save_still)
+        t = self._player_pos() or 0.0
+        self._stop_playback()
+        outdir = Path(self.outdir.text().strip() or Path.home() / "Downloads")
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            return self._on_error(f"Invalid folder: {ex}")
+        base = self.name.text().strip() or safe_name(self.info.get("title") or "frame")
+        tc = fmt_tc(t).replace(":", "-").replace(".", "_")
+        dst = outdir / (unique_name(outdir, f"{base}_{tc}", ".png") + ".png")
+        local = bool(self.info.get("local"))
+        src = self.info["local"] if local else self.url.text().strip()
+        fps = float(self.info.get("fps") or 0) or self._fps()
+        aspect = self._aspect() if self.seg.value() != "mp3" else None
+        up = UPSCALES.get(self.cb_up.currentText()) if self.seg.value() == "mp4" else None
+        height = QUALITIES.get(self.cb_quality.currentText())
+        self._on_log(f"\n— Frame at {fmt_tc(t)} → {dst.name}")
+        self._set_busy(True)
+        self._on_status("Saving frame …")
+        self._on_progress(None)
+        box = self.box
+
+        def work():
+            try:
+                if not local:
+                    self.update_done.wait()
+                f = export_still(src, t, fps, dst, local=local, height=height, aspect=aspect, box=box, up=up,
+                                 model=model, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, emit=self.emit)
+                self.emit("done", [str(f)])
+            except Exception as ex:  # noqa: BLE001
+                self.emit("error", clean_error(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ask_install(self):
+        return QtWidgets.QMessageBox.question(
+            self, "AI upscaler",
+            f"The AI upscaler (Real-ESRGAN, ≈ {UPSCALER_MB} MB) isn't installed yet.\n\nDownload and install it now? "
+            "It runs on your graphics card.") == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _install_upscaler(self, then=None):
+        if self._esr_job is not None:
+            return
+        self._esr_job = then or (lambda: None)
+        self._frame_info()
+        self._on_status("Downloading the AI upscaler …")
+        self._on_progress(0)
+
+        def work():
+            try:
+                install_upscaler(lambda pct: self.emit("esr", ("progress", pct)))
+                self.emit("esr", ("done", None))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("esr", ("error", clean_error(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_esr(self, val):
+        kind, v = val
+        if kind == "progress":
+            if not self.busy:
+                self._on_progress(v)
+                self._on_status(f"Downloading the AI upscaler … {v:.0f} %")
+            self.btn_esr.setText(f"Downloading … {v:.0f} %")
+            return
+        job, self._esr_job = self._esr_job, None
+        self.btn_esr.setEnabled(True)
+        self.btn_esr.setText(f"Install AI upscaler (≈ {UPSCALER_MB} MB)")
+        self._frame_info()
+        dlg = getattr(self, "settings_dlg", None)
+        if dlg is not None:
+            dlg.refresh_esr()
+        if kind == "error":
+            self._on_error("AI upscaler: " + v)
+            return
+        self._on_log("✓ AI upscaler installed.")
+        if not self.busy:
+            self._on_progress(100)
+            self._on_status("✓  AI upscaler installed.")
+            set_state(self.status, "ok")
+        if job:
+            job()
+
+    def _set_browser(self, name, save=True):
+        name = name if name in BROWSERS else "Off"
+        YDL_EXTRA.clear()
+        if name != "Off":
+            YDL_EXTRA["cookiesfrombrowser"] = (name.lower(),)
+        self.cfg["browser"] = name
+        if save:
+            save_cfg(self.cfg)
+
+    def _fx(self, mode):
+        """Crop / size / volume / subtitles for export_multi (None if nothing is switched on)."""
+        aspect = self._aspect()
+        boxes = [c.box for c in self.clips] if self._multi() else [self.box]
+        sub_mode = self.seg_submode.value()
+        fx = {
+            "aspect": aspect, "boxes": boxes,
+            "up": UPSCALES.get(self.cb_up.currentText()) if mode == "mp4" else None,
+            "model": self._model(),
+            "vol": [tuple(q) for q in self.vol_pts] if mode in ("mp4", "mp3") else [],
+            "subs": {"cues": self.sub_cues, "mode": None if sub_mode == "none" else sub_mode,
+                     "lang": self.sub_lang, "style": dict(self.sub_style)} if self.sub_cues else None,
+        }
+        return fx
+
+    def _srt_job(self):
+        return self.sub_cues if (self.sub_cues and self.cb_srt.isChecked()) else None
+
+    # ------------------------------------------------------------------ settings / theme
+    def _load_settings(self):
+        c = self.cfg
+
+        def pick(combo, key, options, default):
+            val = c.get(key)
+            combo.setCurrentText(val if val in options else default)
+
+        if str(c.get("encoder", "")).startswith("NVIDIA"):  # labels of older versions
+            c["encoder"] = ENCODERS[1]
+        pick(self.cb_codec, "codec", CODECS, DEFAULT_CODEC)
+        pick(self.cb_quality, "quality", QUALITIES, DEFAULT_QUALITY)
+        pick(self.cb_size, "size", SIZES, DEFAULT_SIZE)
+        pick(self.cb_encoder, "encoder", ENCODERS, DEFAULT_ENCODER)
+        pick(self.cb_afmt, "audio_format", AUDIO_FORMATS, DEFAULT_AUDIO)
+        pick(self.cb_mp3, "mp3_quality", MP3_QUALITIES, DEFAULT_MP3)
+        pick(self.cb_gif_w, "gif_width", GIF_WIDTHS, "480 px")
+        pick(self.cb_gif_fps, "gif_fps", GIF_FPS, "15 fps")
+        pick(self.cb_gif_col, "gif_colors", GIF_COLORS, "Best (256 colors)")
+        self.target_mb.setText(f"{c.get('target_mb', 50):g}")
+        self.cb_thumb.setChecked(bool(c.get("save_thumb", False)))
+        self.outdir.setText(c.get("outdir") or str(Path.home() / "Downloads"))
+        self.vol.setValue(int(c.get("volume", 80)))
+        self.seg_join.set_value("separate" if c.get("join") == "separate" else "join")
+        pick(self.cb_up, "upscale", UPSCALES, "Off")
+        if c.get("model"):
+            self._fill_models(select=c.get("model"))
+        self.seg_aspect.set_value(c.get("aspect") if c.get("aspect") in ASPECTS else "Off")
+        self.seg_submode.set_value(c.get("sub_mode") if c.get("sub_mode") in ("none", "burn", "track") else "none")
+        self.cb_srt.setChecked(bool(c.get("save_srt", False)))
+        mode = c.get("mode") if c.get("mode") in EXT else "mp4"
+        self.seg.set_value(mode)
+        self._codec_changed(self.cb_codec.currentText())
+        self._afmt_changed(self.cb_afmt.currentText())
+        self._mode_changed(mode)
+        geo = c.get("geometry")
+        if geo:
+            try:
+                self.restoreGeometry(QtCore.QByteArray.fromBase64(geo.encode()))
+            except Exception:
+                pass
+        if c.get("layout_v") != 4 and not self.isMaximized():   # 2.5: tabs + player need a bit more room
+            scr = self.screen().availableGeometry() if self.screen() else None
+            w, h = max(self.width(), 1240), max(self.height(), 940)
+            if scr is not None:
+                w, h = min(w, scr.width() - 40), min(h, scr.height() - 40)
+            self.resize(w, h)
+            c["layout_v"] = 4
+        self._aspect_changed()
+
+    def _save_settings(self):
+        self.cfg.update(
+            quality=self.cb_quality.currentText(), size=self.cb_size.currentText(),
+            encoder=self.cb_encoder.currentText(), mp3_quality=self.cb_mp3.currentText(),
+            codec=self.cb_codec.currentText(), audio_format=self.cb_afmt.currentText(),
+            tooltips=self.tip_filter.enabled,
+            gif_width=self.cb_gif_w.currentText(), gif_fps=self.cb_gif_fps.currentText(),
+            gif_colors=self.cb_gif_col.currentText(), outdir=self.outdir.text().strip(),
+            mode=self.seg.value(), theme=self.theme, accent=self.accent, save_thumb=self.cb_thumb.isChecked(),
+            volume=self.vol.value(), join=self.seg_join.value(),
+            aspect=self.seg_aspect.value(), upscale=self.cb_up.currentText(), model=self.cb_model.currentText(),
+            sub_mode=self.seg_submode.value(), save_srt=self.cb_srt.isChecked(),
+            geometry=bytes(self.saveGeometry().toBase64()).decode())
+        try:
+            self.cfg["target_mb"] = float(self.target_mb.text().replace(",", "."))
+        except ValueError:
+            pass
+        save_cfg(self.cfg)
+
+    def apply_theme(self, theme, accent, save=True):
+        self.theme, self.accent = theme, accent
+        c = theme_colors(theme, accent)
+        QtWidgets.QApplication.instance().setStyleSheet(build_qss(c))
+        self.slider.set_colors(c)
+        self.thumb.set_colors(c)
+        self.lane.set_colors(c)
+        if self.canvas is not None:
+            self.canvas.set_colors(c)
+        set_dark_titlebar(self, c["dark"])
+        if save:
+            self.cfg.update(theme=theme, accent=accent)
+            save_cfg(self.cfg)
+
+    def set_tooltips(self, on):
+        self.tip_filter.enabled = bool(on)
+        if not on:
+            QtWidgets.QToolTip.hideText()
+        self.cfg["tooltips"] = bool(on)
+        save_cfg(self.cfg)
+
+    def _set_preview_mode(self, mode):
+        self.cfg["preview_mode"] = mode
+        save_cfg(self.cfg)
+
+    def _set_auto_preview(self, on):
+        self.cfg["auto_preview"] = bool(on)
+        save_cfg(self.cfg)
+
+    def _settings(self):
+        dlg = SettingsDialog(self, self.theme, self.accent, self.tip_filter.enabled,
+                             self.apply_theme, self.set_tooltips, bool(self.cfg.get("auto_preview", True)),
+                             self._set_auto_preview, self.cfg.get("preview_mode", "stream"), self._set_preview_mode)
+        self.settings_dlg = dlg
+        dlg.exec()
+        self.settings_dlg = None
+        self._frame_info()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        set_dark_titlebar(self, THEMES.get(self.theme, THEMES[DEFAULT_THEME])["dark"])
+
+    # ------------------------------------------------------------------ format / size
+    def _codec(self):
+        return CODECS.get(self.cb_codec.currentText(), CODECS[DEFAULT_CODEC])
+
+    def _afmt(self):
+        return AUDIO_FORMATS.get(self.cb_afmt.currentText(), "mp3")
+
+    def _ext(self, mode=None):
+        mode = mode or self.seg.value()
+        if mode == "mp4":
+            return video_ext(self._codec()[0])
+        if mode == "mp3":
+            return "." + self._afmt()
+        return ".gif"
+
+    def _refresh_ext(self):
+        self.lbl_ext.setText(self._ext())
+        self._set_button_text()
+
+    @staticmethod
+    def _fit_stack(stack):
+        """A stacked widget is as high as its current page (not as its biggest one)."""
+        for i in range(stack.count()):
+            pol = QtWidgets.QSizePolicy.Policy.Preferred if i == stack.currentIndex() else QtWidgets.QSizePolicy.Policy.Ignored
+            stack.widget(i).setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, pol)
+        stack.adjustSize()
+
+    def _mode_changed(self, mode):
+        self.stack.setCurrentIndex(["mp4", "mp3", "gif"].index(mode))
+        self._fit_stack(self.stack)
+        self._fit_stack(self.tabstack)
+        self._refresh_ext()
+        self._update_clip_info()
+        if self.canvas is not None:
+            self.canvas.set_aspect(self._aspect(), self.box)
+        self._frame_info()
+        self._lane_range()
+        self._subs_ui()
+
+    def _codec_changed(self, _name=None):
+        prores = self._codec()[0] == "prores"
+        for w in (self.lbl_size, self.cb_size, self.lbl_encoder, self.cb_encoder):
+            w.setVisible(not prores)
+        self._size_changed(self.cb_size.currentText())
+        self._refresh_ext()
+
+    def _afmt_changed(self, _name=None):
+        a = self._afmt()
+        self.lbl_bitrate.setVisible(a != "wav")
+        self.cb_mp3.setVisible(a != "wav")
+        self.audio_hint.setText(AUDIO_HINTS[a])
+        self._refresh_ext()
+
+    def _is_local(self):
+        return bool(self.info.get("local")) and self.info_url == self.url.text().strip()
+
+    def _set_button_text(self):
+        if not self.busy:
+            local = self._is_local()
+            mode, ext = self.seg.value(), self._ext()[1:].upper()
+            verb = {"mp4": "Export" if local else "Download", "mp3": "Extract" if local else "Download",
+                    "gif": "Create"}[mode]
+            if self._multi():
+                n = len(self.clips)
+                if self.seg_join.value() == "join":
+                    txt = f"{verb} {ext}  ·  {n} clip{'s' if n != 1 else ''} joined"
+                else:
+                    txt = f"{verb} {n} {ext}{'s' if n != 1 else ''}"
+            else:
+                txt = f"{verb} {ext}"
+            self.btn.setText(txt)
+            tip(self.btn, self.btn.text(), "Starts – the file is saved to the output folder. "
+                                           "Enter in any field does the same.")
+
+    def _size_changed(self, name):
+        codec, profile = self._codec()
+        mb = SIZES.get(name) == "mb" and codec != "prores"
+        self._mp4_grid.removeWidget(self.cb_size)
+        self._mp4_grid.addWidget(self.cb_size, 2, 1, 1, 1 if mb else 3)
+        self.target_mb.setVisible(mb)
+        self.lbl_mb.setVisible(mb)
+        if codec == "prores":
+            hint = PRORES_HINTS.get(profile, "") + " · audio as uncompressed PCM"
+        elif codec == "hevc" and SIZES.get(name) is None:
+            hint = "High-quality H.265 (the YouTube file is re-encoded)"
+        else:
+            hint = SIZE_HINTS.get(name, "")
+        self.size_hint.setText(hint)
+
+    # ------------------------------------------------------------------ preview fetch
+    def _url_changed(self, text):
+        self._fetch_timer.start()
+
+    def _start_fetch(self):
+        url = self.url.text().strip()
+        if url == self.info_url and self.info:
+            return
+        self._req += 1
+        req = self._req
+        self.info, self.info_url = {}, ""
+        self.slider.hide()
+        self.btn_thumb.hide()
+        self._reset_player()
+        self.clips, self.cur = [], 0
+        self._refresh_clip_list()
+        self._clear_times()
+        self._set_button_text()
+        self.btn_chapters.hide()
+        self.vol_pts.clear()
+        self.lane.update()
+        self._sub_req += 1
+        self._fill_subs([])
+        self.box = None
+        for c in self.clips:
+            c.box = None
+        if self.canvas is not None:
+            self.canvas.clear()
+            self.canvas.set_aspect(self._aspect())
+        self._frame_info()
+        lp = local_path(url)
+        if lp:
+            self.thumb.set_loading()
+            self.vtitle.setText(lp.name)
+            self.vmeta.setText("Reading file …")
+            ffmpeg, ffprobe = self.ffmpeg, self.ffprobe
+
+            def work_local():
+                try:
+                    if not ffprobe:
+                        raise RuntimeError("FFprobe not found – please run the setup again.")
+                    li = local_info(lp, ffprobe)
+                    dur = li["duration"]
+                    data = grab_frame(lp, min((dur or 0) * 0.1, 5.0), ffmpeg, width=960) \
+                        if (ffmpeg and li["vcodec"]) else None
+                    if li["vcodec"]:
+                        parts = [f"{li['width']}×{li['height']}" if li["width"] else "",
+                                 f"{li['fps']:.3g} fps" if li["fps"] else "", li["vcodec"]]
+                    else:
+                        parts = ["audio", li["acodec"] or ""]
+                    meta = {"title": lp.stem, "local": str(lp), "duration": dur, "has_video": bool(li["vcodec"]),
+                            "fps": li["fps"], "width": li["width"], "height": li["height"],
+                            "chapters": li["chapters"], "subs": li["subs"],
+                            "channel": "Your file  ·  " + " · ".join(x for x in parts if x)}
+                    self.emit("meta", (req, url, meta, data))
+                except Exception as ex:  # noqa: BLE001
+                    self.emit("meta_err", (req, clean_error(ex)))
+            threading.Thread(target=work_local, daemon=True).start()
+            return
+        if url and ANY_URL.match(url) and not YT_URL.match(url):
+            self.thumb.set_text("Only YouTube links (and your own files) are supported.")
+            self.vtitle.setText("")
+            self.vmeta.setText("")
+            self._update_clip_info()
+            return
+        if not re.match(r"https?://\S+\.\S+", url):
+            self.thumb.set_text("Paste a YouTube link to see a preview")
+            self.vtitle.setText("")
+            self.vmeta.setText("")
+            self._update_clip_info()
+            return
+        self.thumb.set_loading()
+        self.vtitle.setText("Loading video info …")
+        self.vmeta.setText("")
+
+        def work():
+            try:
+                self.update_done.wait()
+                info = fetch_info(url)
+                data = None
+                if info.get("thumb"):
+                    try:
+                        data = fetch_bytes(info["thumb"])
+                    except Exception:
+                        data = None
+                self.emit("meta", (req, url, info, data))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("meta_err", (req, clean_error(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_meta(self, val):
+        req, url, info, data = val
+        if req != self._req:
+            return
+        self.info, self.info_url = info, url
+        dur = info.get("duration")
+        badge = fmt_ts(dur) if dur else ""
+        self.thumb.set_image(data, badge)
+        self.vtitle.setText(info.get("title") or "")
+        meta = [x for x in (info.get("channel"), fmt_ts(dur) if dur else "") if x]
+        if info.get("playlist"):
+            meta.append(f"playlist · {info['playlist']} videos (only the linked video is downloaded)")
+        self.vmeta.setText("  ·  ".join(meta))
+        if dur:
+            self.slider.set_duration(dur)
+            self.slider.show()
+        self.btn_thumb.setVisible(bool(info.get("has_video")) if info.get("local")
+                                  else bool(info.get("thumbs") or info.get("thumb")))
+        self._times_committed()
+        if self._multi():
+            self._init_clips()
+        self._update_clip_info()
+        self._set_button_text()
+        ch = info.get("chapters") or []
+        self.btn_chapters.setText(f"≡  Chapters ({len(ch)})")
+        self.btn_chapters.setVisible(len(ch) > 1)
+        self._fill_subs(info.get("subs") or [])
+        self._frame_info()
+        self._lane_range()
+        self._history_add(url, info, data)
+        self._setup_preview(info, url)
+
+    def _on_meta_err(self, val):
+        req, msg = val
+        if req != self._req:
+            return
+        self.btn_thumb.hide()
+        self.thumb.set_text("No preview available – you can still download.")
+        self.vtitle.setText("")
+        self.vmeta.setText((msg.splitlines()[0][:160] if msg else "") + login_hint(msg).replace("\n", "  "))
+        self._update_clip_info()
+
+    # ------------------------------------------------------------------ clip range
+    def _duration(self):
+        return self.info.get("duration") if self.info_url == self.url.text().strip() else None
+
+    def _range(self):
+        """-> (start, end) in seconds or None; raises ValueError for bad input."""
+        s, e = parse_time(self.t_from.text()), parse_time(self.t_to.text())
+        return s, e
+
+    def _slider_changed(self, lo, hi):
+        dur = self.slider.duration()
+        self.t_from.setText("" if lo < 0.005 else fmt_tf(lo))
+        self.t_to.setText("" if hi > dur - 0.005 else fmt_tf(hi))
+        set_state(self.t_from, "")
+        set_state(self.t_to, "")
+        self._update_clip_info()
+
+    def _times_edited(self, *_):
+        self._update_clip_info()
+
+    def _times_committed(self):
+        try:
+            s, e = self._range()
+        except ValueError:
+            return
+        dur = self._duration()
+        if dur and self.slider.isVisible():
+            self.slider.set_range(s or 0.0, e if e is not None else dur)
+
+    def _chip(self, secs):
+        if secs is None:
+            self._clear_times()
+            if self.slider.isVisible():
+                self.slider.set_range(0, self.slider.duration())
+        else:
+            try:
+                s = parse_time(self.t_from.text()) or 0.0
+            except ValueError:
+                s = 0.0
+            dur = self._duration()
+            e = s + secs
+            if dur:
+                e = min(e, dur)
+                s = max(0.0, min(s, e - 0.1))
+            self.t_from.setText("" if s < 0.005 else fmt_tf(s))
+            self.t_to.setText(fmt_tf(e))
+            self._times_committed()
+        self._update_clip_info()
+
+    def _clear_times(self):
+        self.t_from.setText("")
+        self.t_to.setText("")
+
+    def _update_clip_info(self):
+        """Length label, hints (GIF limits) and the default file name."""
+        if hasattr(self, "lane"):
+            self._lane_range()
+        if self._multi():
+            return self._update_multi_info()
+        mode = self.seg.value()
+        dur = self._duration()
+        ok = True
+        try:
+            s, e = self._range()
+            set_state(self.t_from, "")
+            set_state(self.t_to, "")
+        except ValueError:
+            bad = []
+            for w in (self.t_from, self.t_to):
+                try:
+                    parse_time(w.text())
+                    set_state(w, "")
+                except ValueError:
+                    set_state(w, "error")
+                    bad.append(w)
+            self.lbl_len.setText("")
+            self._hint("Time not recognized – e.g. 10 (= minute 10), 1:30, 1:02:30 or 90s", "error")
+            self._update_name(None, None)
+            return
+        if s is not None and e is not None and e <= s:
+            self.lbl_len.setText("")
+            self._hint("'to' must be after 'from'.", "error")
+            self._update_name(s, e)
+            return
+        full = (s in (None, 0)) and e is None
+        length = None
+        if full:
+            length = dur
+        elif e is not None:
+            length = e - (s or 0)
+        elif dur:
+            length = dur - (s or 0)
+        if dur and s and s >= dur:
+            self._hint("The start is past the end of the video.", "error")
+            ok = False
+        self.lbl_len.setText(("whole video · " if full else "clip · ") + fmt_ts(length) if length else
+                             ("whole video" if full else ""))
+        if ok:
+            if mode == "gif":
+                if length is None:
+                    self._hint(f"Set a time range for the GIF (max {GIF_MAX} s).", "warn")
+                elif length > GIF_MAX:
+                    self._hint(f"GIFs can be at most {GIF_MAX} s – shorten the range (e.g. with the 10 s button).",
+                               "error")
+                elif length > GIF_RECOMMENDED:
+                    self._hint(f"Works, but GIFs get big quickly – {GIF_RECOMMENDED} s or less is ideal.", "warn")
+                else:
+                    self._hint("Drag the handles or type times to pick the GIF part.", "")
+            else:
+                self._hint("Leave empty for the whole video, or drag the handles / type times "
+                           "(10 = minute 10, 1:30, 90s).", "")
+        self._update_name(s, e)
+
+    def _hint(self, text, state):
+        self.clip_hint.setText(text)
+        set_state(self.clip_hint, state)
+
+    def _default_name(self, s=None, e=None):
+        title = self.info.get("title") if self.info_url == self.url.text().strip() else ""
+        if not title:
+            return ""
+        if self._multi():
+            return safe_name(f"{title}_{len(self.clips)} clips" if len(self.clips) != 1 else title + _suffix(*self.clips[0]))
+        if s == 0 and e is None:
+            s = None
+        return safe_name(title + _suffix(s, e))
+
+    def _update_name(self, s, e):
+        d = self._default_name(s, e)
+        self.name.setPlaceholderText(d or "File name (default: video title)")
+
+    # ------------------------------------------------------------------ video preview (player)
+    def _make_audio(self):
+        try:
+            a = QAudioOutput(self)
+            a.setVolume(self.vol.value() / 100)
+            return a
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _ensure_player(self):
+        if self.player is None and PLAYER_OK and self.vview.video is not None:
+            try:
+                self.player = QMediaPlayer(self)
+                self.audio_out = self._make_audio()
+                if self.audio_out is not None:
+                    self.player.setAudioOutput(self.audio_out)
+                self.player.setVideoOutput(self.vview.video.sink)
+                self.player.positionChanged.connect(self._on_ppos)
+                self.player.durationChanged.connect(self._on_pdur)
+                self.player.playbackStateChanged.connect(self._on_pstate)
+                self.player.mediaStatusChanged.connect(self._on_mstatus)
+                self.player.errorOccurred.connect(self._on_perror)
+            except Exception as ex:  # noqa: BLE001
+                self.player = None
+                self._on_log(f"Video preview not available: {ex}")
+        return self.player
+
+    def _ensure_aplayer(self):
+        if self.aplayer is None and PLAYER_OK:
+            try:
+                self.aplayer = QMediaPlayer(self)
+                self.a_out2 = self._make_audio()
+                if self.a_out2 is not None:
+                    self.aplayer.setAudioOutput(self.a_out2)
+                self.aplayer.errorOccurred.connect(self._on_aerror)
+            except Exception:  # noqa: BLE001
+                self.aplayer = None
+        return self.aplayer
+
+    def _audio_follows(self):
+        return self.aplayer is not None and not self.aplayer.source().isEmpty()
+
+    def _has_media(self):
+        return self.player is not None and self._pv_state == "ready" and not self.player.source().isEmpty()
+
+    def _reset_player(self):
+        self._stop_playback()
+        if self.player is not None:
+            self.player.setSource(QtCore.QUrl())
+        if self.aplayer is not None:
+            self.aplayer.setSource(QtCore.QUrl())
+        self._pv_state = ""
+        self._pv_kind = ""
+        self.thumb.set_overlay("")
+        self.vview.show_video(False)
+        if self.canvas is not None:
+            self.canvas.clear()
+        self.transport.hide()
+        self.slider.set_playhead(None)
+        self.seek.setRange(0, 0)
+        self.ed_tc.setText("0:00.00")
+        self.lbl_ptime.setText("/ 0:00")
+
+    def _stop_playback(self):
+        self._clip_stop = None
+        if self.player is not None and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+
+    def _pv_mode(self):
+        return self.cfg.get("preview_mode", "stream")
+
+    def _can_stream(self, url=None):
+        url = url or self.info_url
+        return bool(self.info.get("stream")) and url not in self._stream_failed
+
+    def _setup_preview(self, info, url):
+        """After the video info: own files play directly; YouTube videos are streamed through the app
+        (or a small copy is downloaded, depending on Settings)."""
+        if not PLAYER_OK or self.vview.video is None:
+            return
+        if info.get("local"):
+            self._load_player(info["local"], bool(info.get("has_video")), kind="file")
+            return
+        if url in self._pv_cache and Path(self._pv_cache[url]).exists():
+            self._load_player(self._pv_cache[url], True, kind="copy")
+            return
+        auto = self.cfg.get("auto_preview", True)
+        dur = info.get("duration") or 0
+        if self._pv_mode() == "stream" and self._can_stream(url):
+            if auto:
+                self._start_stream()
+            else:
+                self._pv_state = "offer"
+                self.thumb.set_overlay("▶  Play preview  (streamed, no download)")
+            return
+        if auto and dur and dur <= PREVIEW_AUTO_MAX:
+            self._load_preview()
+        else:
+            self._pv_state = "offer"
+            mb = f"  (≈ {max(1, round(dur / 60 * PREVIEW_MB_PER_MIN))} MB)" if dur else ""
+            self.thumb.set_overlay(f"▶  Load video preview{mb}")
+
+    def _thumb_clicked(self):
+        if self._pv_state in ("offer", "error") and self._is_info_current() and not self.info.get("local"):
+            if self._pv_mode() == "stream" and self._can_stream():
+                self._start_stream()
+            else:
+                self._load_preview()
+        elif self._has_media():
+            self._toggle_play()
+
+    def _start_stream(self):
+        st = self.info.get("stream")
+        if not st:
+            return self._load_preview()
+        try:
+            if self._proxy is None:
+                self._proxy = StreamProxy()
+            v = self._proxy.add(st["video"])
+            a = self._proxy.add(st["audio"]) if st.get("audio") else None
+        except Exception as ex:  # noqa: BLE001
+            self._on_log(f"Streaming not possible ({ex}) – downloading a small copy instead.")
+            self._stream_failed.add(self.info_url)
+            return self._load_preview()
+        self._load_player(v, True, audio_url=a, kind="stream")
+
+    def _load_preview(self):
+        url, req = self.info_url, self._req
+        if not url or not self.ffmpeg:
+            return
+        self._pv_state = "loading"
+        self.thumb.set_overlay("Loading video preview …", 0.0)
+        self.vview.show_video(False)
+        self.transport.hide()
+        outdir = self._pv_dir / f"p{req}"
+        ffmpeg = self.ffmpeg
+
+        def em(kind, val=None):
+            if kind == "progress" and val is not None:
+                self.emit("pv_progress", (req, float(val)))
+
+        def work():
+            try:
+                self.update_done.wait()
+                path = preview_video(url, outdir, ffmpeg=ffmpeg, emit=em)
+                self.emit("pv_ready", (req, url, str(path)))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("pv_err", (req, clean_error(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_pv_progress(self, val):
+        req, pct = val
+        if req == self._req and self._pv_state == "loading":
+            self.thumb.set_overlay(f"Loading video preview … {pct:.0f} %", pct / 100)
+
+    def _on_pv_ready(self, val):
+        req, url, path = val
+        self._pv_cache[url] = path
+        if req == self._req:
+            self._load_player(path, True, kind="copy")
+
+    def _on_pv_err(self, val):
+        req, msg = val
+        if req != self._req:
+            return
+        self._pv_state = "error"
+        self.thumb.set_overlay("▶  Preview failed – click to try again")
+        self._on_log("Preview: " + msg)
+
+    def _load_player(self, src, has_video, audio_url=None, kind="copy"):
+        if self._ensure_player() is None:
+            return
+        self._pv_state = "ready"
+        self._pv_kind = kind
+        self.thumb.set_overlay("")
+        url = QtCore.QUrl(src) if str(src).startswith("http") else QtCore.QUrl.fromLocalFile(str(src))
+        self.player.setSource(url)
+        if audio_url and self._ensure_aplayer() is not None:
+            self.aplayer.setSource(QtCore.QUrl(audio_url))
+        elif self.aplayer is not None:
+            self.aplayer.setSource(QtCore.QUrl())
+        self.player.pause()      # shows the first frame
+        self.transport.show()
+        self.vview.show_video(has_video)
+        site = "YouTube"
+        self.lbl_pv_src.setText({"stream": f"streaming from {site}", "copy": "preview copy (360p)",
+                                 "file": "your file"}.get(kind, ""))
+        tip(self.lbl_pv_src, "Preview source", {
+            "stream": f"Played straight from {site} through the app – nothing is downloaded for the preview. "
+                      "Switch to a downloaded copy in Settings.",
+            "copy": "A small 360p copy, only for the preview – your download uses the quality you pick.",
+            "file": "Your own file is played directly."}.get(kind, ""))
+        rng = self._cur_range()
+        if rng and rng[0] > 0:
+            self._seek_to(rng[0])
+
+    def _on_mstatus(self, st):
+        if st in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia) \
+                and self._seek_target is not None:
+            self._seek_timer.start()
+
+    def _on_perror(self, *_):
+        if self.player is None or not self.player.errorString():
+            return
+        msg = self.player.errorString()
+        if self._pv_kind == "stream" and self._is_info_current():
+            self._on_log(f"Streaming the preview failed ({msg}) – downloading a small copy instead.")
+            self._stream_failed.add(self.info_url)
+            self.player.setSource(QtCore.QUrl())
+            if self.aplayer is not None:
+                self.aplayer.setSource(QtCore.QUrl())
+            self._load_preview()
+        else:
+            self._on_log(f"Preview player: {msg}")
+
+    def _on_aerror(self, *_):
+        if self.aplayer is not None and self.aplayer.errorString():
+            self._on_log(f"Preview sound not available: {self.aplayer.errorString()}")
+            self.aplayer.setSource(QtCore.QUrl())
+
+    def _fps(self):
+        f = self.info.get("fps") if self._is_info_current() else None
+        if self._pv_kind == "stream":
+            f = (self.info.get("stream") or {}).get("fps") or f
+        return float(f) if f and 1 <= float(f) <= 240 else 30.0
+
+    def _on_pdur(self, ms):
+        self.seek.setRange(0, max(0, ms))
+        self.lbl_ptime.setText(f"/ {fmt_ts(ms / 1000)}")
+
+    def _on_ppos(self, ms):
+        t = ms / 1000
+        if not self.seek.isSliderDown():
+            self.seek.setValue(ms)
+        if not self.ed_tc.hasFocus():
+            self.ed_tc.setText(fmt_tc(t))
+            set_state(self.ed_tc, "")
+        self.slider.set_playhead(t)
+        self.lane.set_playhead(t)
+        self._update_sub_overlay(t)
+        if self.vol_pts:
+            self._apply_gain(t)
+        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if playing and self._audio_follows() and abs(self.aplayer.position() - ms) > 250:
+            self.aplayer.setPosition(ms)
+        if self._clip_stop is not None and t >= self._clip_stop - 0.02:
+            self._clip_stop = None
+            self.player.pause()
+
+    def _on_pstate(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.btn_play.setText("❚❚" if playing else "▶")
+        if self._audio_follows():
+            if playing:
+                self.aplayer.setPosition(self.player.position())
+                self.aplayer.play()
+            else:
+                self.aplayer.pause()
+
+    def _on_volume(self, v):
+        self._apply_gain()
+
+    def _toggle_play(self):
+        if not self._has_media():
+            if self._pv_state in ("offer", "error") and self._is_info_current():
+                self._thumb_clicked()
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self._clip_stop = None
+            self.player.play()
+
+    def _cur_range(self):
+        """Start/end of the clip being edited (empty fields -> 0 / end of the video)."""
+        try:
+            s, e = self._range()
+        except ValueError:
+            return None
+        dur = self._duration() or 0
+        s = s or 0.0
+        e = dur if e is None else e
+        return (s, e) if e > s else None
+
+    def _set_pos(self, t):
+        ms = int(round(max(0.0, t) * 1000))
+        self.player.setPosition(ms)
+        if self._audio_follows():
+            self.aplayer.setPosition(ms)
+        self._pos_hint = (t, time.monotonic())
+        self.slider.set_playhead(t)
+        if not self.ed_tc.hasFocus():
+            self.ed_tc.setText(fmt_tc(t))
+            set_state(self.ed_tc, "")
+
+    def _play_clip(self, rng=None):
+        rng = rng or self._cur_range()
+        if not self._has_media() or not rng:
+            return
+        self._set_pos(rng[0])
+        self._clip_stop = rng[1]
+        self.player.play()
+
+    def _seek_to(self, t):
+        self._seek_target = max(0.0, t)
+        self._pos_hint = (self._seek_target, time.monotonic())
+        if not self._seek_timer.isActive():
+            self._seek_timer.start()
+
+    def _do_seek(self):
+        if self._seek_target is not None and self._has_media():
+            self._set_pos(self._seek_target)
+            self._seek_target = None
+
+    def _on_handle_dragged(self, _which, t):
+        if self._has_media() and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            self._seek_to(t)
+
+    def _player_pos(self):
+        if not self._has_media():
+            return None
+        t, when = self._pos_hint
+        if t is not None and time.monotonic() - when < 0.6:   # a jump that the player hasn't reported yet
+            return t
+        return self.player.position() / 1000
+
+    def _step(self, frames):
+        """Move by whole frames (pauses first)."""
+        if not self._has_media():
+            return
+        self._stop_playback()
+        fd = 1.0 / self._fps()
+        t = self._player_pos() or 0.0
+        n = round(t / fd) + frames
+        dur = self.player.duration() / 1000 if self.player.duration() > 0 else None
+        target = max(0.0, n * fd)
+        if dur:
+            target = min(target, max(0.0, dur - fd))
+        self._seek_to(target)
+
+    def _nudge(self, d):
+        if self._has_media():
+            self._stop_playback()
+            self._seek_to((self._player_pos() or 0.0) + d)
+
+    def _tc_entered(self):
+        try:
+            t = parse_time(self.ed_tc.text())
+        except ValueError:
+            set_state(self.ed_tc, "error")
+            return
+        if t is None or not self._has_media():
+            return
+        set_state(self.ed_tc, "")
+        dur = self.player.duration() / 1000 if self.player.duration() > 0 else None
+        if dur:
+            t = min(t, dur)
+        self._stop_playback()
+        self._seek_to(t)
+        self.ed_tc.clearFocus()
+
+    def _set_in(self):
+        t = self._player_pos()
+        if t is None or not self.slider.isVisible() or self.busy:
+            return
+        lo, hi = self.slider.values()
+        if t >= hi - 0.1:
+            hi = min(self.slider.duration(), t + max(1.0, hi - lo))
+        self.slider.set_range(t, hi)
+        self._slider_changed(*self.slider.values())
+
+    def _set_out(self):
+        t = self._player_pos()
+        if t is None or not self.slider.isVisible() or self.busy:
+            return
+        lo, hi = self.slider.values()
+        if t <= lo + 0.1:
+            lo = max(0.0, t - max(1.0, hi - lo))
+        self.slider.set_range(lo, t)
+        self._slider_changed(*self.slider.values())
+
+    def keyPressEvent(self, e):   # arrows only arrive here when no field / list / slider uses them
+        if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right) and self._has_media():
+            d = 1 if e.key() == Qt.Key.Key_Right else -1
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._nudge(d * 1.0)
+            else:
+                self._step(d)
+            return
+        super().keyPressEvent(e)
+
+    # ------------------------------------------------------------------ several clips
+    def _multi(self):
+        return self.seg_clips.value() == "multi"
+
+    def _clip_mode_changed(self, mode):
+        multi = mode == "multi"
+        self.multi_box.setVisible(multi)
+        if multi:
+            self._init_clips()
+        else:
+            self.slider.set_others([])
+            if self.clips:
+                self._load_range(*self.clips[self.cur])
+        self._update_clip_info()
+        self._set_button_text()
+
+    def _init_clips(self):
+        if self.clips or not self._duration():
+            self._refresh_clip_list()
+            return
+        dur = self._duration()
+        rng = self._cur_range()
+        if not rng or (rng[0] == 0 and rng[1] >= dur - 0.05):
+            rng = (0.0, min(dur, 10.0))
+        self.clips = [Clip(*rng, box=self.box)]
+        self.cur = 0
+        self._refresh_clip_list()
+        self._load_range(*rng)
+
+    def _refresh_clip_list(self):
+        self.clip_list.blockSignals(True)
+        self.clip_list.clear()
+        n = len(self.clips)
+        for i, c in enumerate(self.clips):
+            it = QtWidgets.QListWidgetItem()
+            row = ClipRow(i, c[0], c[1], n, name=getattr(c, "label", ""))
+            row.action.connect(self._clip_action)
+            it.setSizeHint(QtCore.QSize(0, 34))
+            self.clip_list.addItem(it)
+            self.clip_list.setItemWidget(it, row)
+        if n:
+            self.cur = min(self.cur, n - 1)
+            self.clip_list.setCurrentRow(self.cur)
+        self.clip_list.blockSignals(False)
+        self._update_others()
+        total = sum(e - s for s, e in self.clips)
+        self.lbl_clips.setText(f"{n} · {fmt_ts(total)}" if n else "")
+
+    def _update_others(self):
+        self.slider.set_others([(s, e, i + 1) for i, (s, e) in enumerate(self.clips) if i != self.cur]
+                               if self._multi() else [])
+
+    def _load_range(self, s, e):
+        """Shows a clip in the timeline and the time fields."""
+        self._loading_clip = True
+        dur = self._duration() or e
+        self.t_from.setText("" if s < 0.005 else fmt_tf(s))
+        self.t_to.setText("" if e > dur - 0.005 else fmt_tf(e))
+        if self.slider.isVisible():
+            self.slider.set_range(s, e)
+        self._loading_clip = False
+
+    def _select_clip(self, row):
+        if row < 0 or row >= len(self.clips):
+            return
+        self.cur = row
+        s, e = self.clips[row]
+        self._load_range(s, e)
+        self._update_others()
+        self._update_clip_info()
+        if self._aspect():
+            self.box = self.clips[row].box
+            if self.canvas is not None:
+                self.canvas.set_box(self.box)
+                self.box = self.canvas.box
+                self.clips[row].box = self.box
+            self._frame_info()
+        if self._has_media():
+            self._stop_playback()
+            self._seek_to(s)
+
+    def _store_current(self):
+        if self._loading_clip or not self.clips or self.cur >= len(self.clips):
+            return
+        rng = self._cur_range()
+        if not rng or [round(x, 3) for x in rng] == [round(x, 3) for x in self.clips[self.cur]]:
+            return
+        self.clips[self.cur][:] = list(rng)
+        it = self.clip_list.item(self.cur)
+        row = self.clip_list.itemWidget(it) if it is not None else None
+        if row is not None:
+            row.set_clip(self.cur, rng[0], rng[1], len(self.clips))
+        self.lbl_clips.setText(f"{len(self.clips)} · {fmt_ts(sum(e - s for s, e in self.clips))}")
+
+    def _add_clip(self):
+        dur = self._duration()
+        if not dur:
+            return
+        start = None
+        t = self._player_pos()
+        if t is not None and not any(s <= t < e for s, e in self.clips):
+            start = t
+        if start is None:
+            start = max((e for _s, e in self.clips), default=0.0)
+        if start >= dur - 0.5:
+            start = max(0.0, dur - 5.0)
+        self.clips.append(Clip(start, min(dur, start + 5.0), box=self.box))
+        self.cur = len(self.clips) - 1
+        self._refresh_clip_list()
+        self._select_clip(self.cur)
+        self._set_button_text()
+
+    def _clip_action(self, what, i):
+        if i >= len(self.clips) or self.busy:
+            return
+        if what == "play":
+            self._select_clip(i)
+            self._play_clip(tuple(self.clips[i]))
+            return
+        if what == "del":
+            self.clips.pop(i)
+            if self.cur >= i and self.cur > 0:
+                self.cur -= 1
+        elif what in ("up", "down"):
+            j = i - 1 if what == "up" else i + 1
+            if 0 <= j < len(self.clips):
+                self.clips[i], self.clips[j] = self.clips[j], self.clips[i]
+                self.cur = j
+        self._refresh_clip_list()
+        if self.clips:
+            self._select_clip(self.cur)
+        else:
+            self._update_clip_info()
+        self._set_button_text()
+
+    def _update_multi_info(self):
+        self._store_current()
+        n = len(self.clips)
+        total = sum(e - s for s, e in self.clips)
+        self.lbl_len.setText(f"{n} clip{'s' if n != 1 else ''} · {fmt_ts(total)}" if n else "")
+        mode, join = self.seg.value(), self.seg_join.value() == "join"
+        try:
+            s, e = self._range()
+            bad = s is not None and e is not None and e <= s
+        except ValueError:
+            bad = True
+        if bad:
+            self._hint("Time not recognized or 'to' before 'from' – this clip keeps its last valid times.", "error")
+        elif not n:
+            self._hint("Add a clip with “+ Add clip”.", "warn")
+        elif mode == "gif" and join and total > GIF_MAX:
+            self._hint(f"Joined GIFs can be at most {GIF_MAX} s – now {total:.1f} s.", "error")
+        elif mode == "gif" and not join and any(b - a > GIF_MAX for a, b in self.clips):
+            self._hint(f"Each GIF can be at most {GIF_MAX} s.", "error")
+        else:
+            self._hint(f"Editing clip {self.cur + 1}: drag the handles, type times, or press ⇤ Start / End ⇥ "
+                       "while the preview plays. Pick another clip in the list on the right.", "")
+        title = self.info.get("title") if self._is_info_current() else ""
+        if join:
+            self.name.setPlaceholderText(self._default_name() or "File name (default: video title)")
+        else:
+            self.name.setPlaceholderText((safe_name(title) + "_01, _02 …") if title
+                                         else "File name (default: video title)")
+        self._set_button_text()
+
+    # ------------------------------------------------------------------ events from worker threads
+    def emit(self, kind, val=None):
+        self.bridge.sig.emit(kind, val)
+
+    def _dispatch(self, kind, val):
+        getattr(self, f"_on_{kind}")(val)
+
+    def _on_log(self, msg):
+        self.log.appendPlainText(str(msg).rstrip())
+
+    def _on_status(self, text):
+        set_state(self.status, "")
+        self.status.setText(text)
+
+    def _on_progress(self, pct):
+        if pct is None:
+            self._pb_anim.stop()
+            self.pb.setRange(0, 0)
+            return
+        if self.pb.maximum() == 0:
+            self.pb.setRange(0, 1000)
+            self.pb.setValue(0)
+        self._pb_anim.stop()
+        self._pb_anim.setStartValue(self.pb.value())
+        self._pb_anim.setEndValue(int(pct * 10))
+        self._pb_anim.start()
+
+    def _on_done(self, files):
+        self._set_busy(False)
+        self._on_progress(100)
+        self.last_files = files
+
+        def mb(f):
+            try:
+                return f" ({Path(f).stat().st_size / 1048576:.1f} MB)"
+            except OSError:
+                return ""
+        names = ", ".join(Path(f).name + mb(f) for f in files)
+        self.btn_show.setEnabled(True)
+        self.status.setText(f"✓  Done: {names}")
+        set_state(self.status, "ok")
+        self._on_log(f"✓ {names}")
+        QtWidgets.QApplication.alert(self)
+        self.name.clear()
+
+    def _on_error(self, msg):
+        self._set_busy(False)
+        self._on_progress(0)
+        msg = (msg or "Unknown error").strip()
+        self.status.setText("✕  " + msg.splitlines()[0][:200])
+        set_state(self.status, "error")
+        self._on_log("✕ " + msg)
+        if len(msg.splitlines()) > 1 and not self.log.isVisible():
+            self._toggle_log()
+
+    def _on_updated(self, ok):
+        self.update_done.set()
+        self.btn_upd.setEnabled(True)
+        if ok:
+            self.cfg["last_update"] = time.time()
+            save_cfg(self.cfg)
+            if "yt_dlp" in sys.modules:
+                self._on_log("The new yt-dlp version takes effect after restarting the app.")
+        if not self.busy:
+            self._on_status("Ready.")
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        for w in (self.url, self.btn_paste, self.btn_file, self.t_from, self.t_to, self.slider, self.seg, self.tabstack,
+                  self.name, self.outdir, self.btn_browse, self.btn_upd, self.cb_thumb, self.btn_thumb, *self.chips,
+                  self.seg_clips, self.multi_box, self.btn_set_in, self.btn_set_out, self.btn_hist, self.btn_still,
+                  self.btn_chapters, self.btn_app_upd):
+            w.setEnabled(not busy)
+        self.btn.setEnabled(not busy)
+        if busy:
+            self.btn.setText("Working …")
+        else:
+            self._set_button_text()
+
+    # ------------------------------------------------------------------ actions
+    def start(self):
+        if self.busy:
+            return
+        url = self.url.text().strip()
+        if not url:
+            return self._on_error("Paste a link first.")
+        if ANY_URL.match(url) and not YT_URL.match(url):
+            return self._on_error("Only YouTube links (and your own files) are supported.")
+        if self._multi():
+            return self._start_multi(url)
+        try:
+            s, e = self._range()
+        except ValueError:
+            return self._on_error("Time not recognized – e.g. 10, 1:30, 1:02:30 or 90s")
+        if s is not None and e is not None and e <= s:
+            return self._on_error("'to' must be after 'from'.")
+        if s == 0 and e is None:
+            s = None
+        if not self.ffmpeg:
+            return self._on_error("FFmpeg not found – please run the setup again.")
+        mode = self.seg.value()
+        dur = self._duration()
+        if mode == "gif":
+            end = e if e is not None else dur
+            if end is None:
+                return self._on_error(f"Set a time range for the GIF (max {GIF_MAX} s).")
+            if end - (s or 0) > GIF_MAX + 0.01:
+                return self._on_error(f"GIFs can be at most {GIF_MAX} s – shorten the time range.")
+        outdir = Path(self.outdir.text().strip() or Path.home() / "Downloads")
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            return self._on_error(f"Invalid folder: {ex}")
+        name = self.name.text().strip() or self._default_name(s, e)
+        ext = self._ext(mode)
+        name = unique_name(outdir, name, ext) if name else None
+        fx = self._fx(mode)
+        if fx_needed(mode, fx):
+            if not self._is_info_current() or not dur:
+                return self._on_error("Wait until the video info is loaded (needed for crop, volume and subtitles).")
+            if not self._check_ai():
+                return
+            return self._start_multi(url, single=((s or 0.0), e if e is not None else dur), name=name)
+        lp = local_path(url)
+        if lp and self._is_local():
+            has_video = self.info.get("has_video", True)
+            if mode in ("mp4", "gif") and not has_video:
+                return self._on_error("This file has no video – choose Audio.")
+        src = lp if lp else url
+        thumb = None
+        if self.cb_thumb.isChecked() and (not lp or self.info.get("has_video", True)):
+            dur_ = self._duration() or 0
+            at = s if s else min(dur_ * 0.1, 5.0)
+            thumb = (url, None if lp or not self._is_info_current() else self.info, at)
+
+        kw = {}
+        if mode == "mp4":
+            size = self.cb_size.currentText()
+            codec, profile = self._codec()
+            kw = {"codec": codec, "profile": profile}
+            target_mb = None
+            if SIZES.get(size) == "mb" and codec != "prores":
+                try:
+                    target_mb = float(self.target_mb.text().replace(",", ".").lower().replace("mb", "").strip())
+                    if target_mb <= 0:
+                        raise ValueError
+                except ValueError:
+                    return self._on_error("Target size not recognized – e.g. 50")
+            args = (src, s, e, QUALITIES.get(self.cb_quality.currentText()), self.cb_encoder.currentText(),
+                    size, target_mb, outdir)
+            desc = f"{self.cb_codec.currentText()} · {self.cb_quality.currentText()}"
+            if codec != "prores":
+                desc += f" · {f'{target_mb:g} MB' if target_mb else size}"
+        elif mode == "mp3":
+            afmt = self._afmt()
+            kw = {"afmt": afmt}
+            args = (src, s, e, MP3_QUALITIES.get(self.cb_mp3.currentText(), 320), outdir)
+            desc = afmt.upper() + ("" if afmt == "wav" else f" · {self.cb_mp3.currentText()}")
+        else:
+            args = (src, s, e, GIF_WIDTHS[self.cb_gif_w.currentText()], GIF_FPS[self.cb_gif_fps.currentText()],
+                    GIF_COLORS[self.cb_gif_col.currentText()], outdir)
+            desc = f"GIF · {self.cb_gif_w.currentText()} · {self.cb_gif_fps.currentText()}"
+        self._save_settings()
+
+        rng = "whole video" if s is None and e is None else f"{fmt_ts(s or 0)} – {fmt_ts(e) if e is not None else 'end'}"
+        self._on_log(f"\n— {url}\n  {rng} · {desc}" + (f" · {name}{ext}" if name else ""))
+        self._set_busy(True)
+        self.btn_show.setEnabled(False)
+        self._on_status("Starting …")
+        self._on_progress(None)
+        fn = ({"mp4": local_mp4, "mp3": local_mp3, "gif": local_gif} if lp else
+              {"mp4": download, "mp3": download_mp3, "gif": make_gif})[mode]
+        srt = self._srt_job()
+        if srt:
+            kw["_srt"] = ([((s or 0.0), e if e is not None else (dur or 1e9))], srt, True)
+        threading.Thread(target=self._worker, args=(fn, args, name, thumb, bool(lp), kw), daemon=True).start()
+
+    def _check_ai(self):
+        """AI enlarging picked but the upscaler is missing -> offer to install it (then start again)."""
+        if self.seg.value() != "mp4" or not self._ai_wanted():
+            return True
+        dims = self._frame_dims()
+        if not dims or dims[2] <= dims[0] * 1.05 or upscaler_exe() is not None:
+            return True
+        if self._ask_install():
+            self._install_upscaler(then=self.start)
+        return False
+
+    def _is_info_current(self):
+        return bool(self.info) and self.info_url == self.url.text().strip()
+
+    def _format_params(self):
+        """-> (params for export_multi, description) or raises ValueError with a message."""
+        mode = self.seg.value()
+        if mode == "mp4":
+            size = self.cb_size.currentText()
+            codec, profile = self._codec()
+            target_mb = None
+            if SIZES.get(size) == "mb" and codec != "prores":
+                try:
+                    target_mb = float(self.target_mb.text().replace(",", ".").lower().replace("mb", "").strip())
+                    if target_mb <= 0:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError("Target size not recognized – e.g. 50") from None
+            p = {"height": QUALITIES.get(self.cb_quality.currentText()), "encoder": self.cb_encoder.currentText(),
+                 "size": size, "target_mb": target_mb, "codec": codec, "profile": profile}
+            desc = f"{self.cb_codec.currentText()} · {self.cb_quality.currentText()}"
+            if codec != "prores":
+                desc += f" · {f'{target_mb:g} MB' if target_mb else size}"
+            return p, desc
+        if mode == "mp3":
+            afmt = self._afmt()
+            return ({"kbps": MP3_QUALITIES.get(self.cb_mp3.currentText(), 320), "afmt": afmt},
+                    afmt.upper() + ("" if afmt == "wav" else f" · {self.cb_mp3.currentText()}"))
+        return ({"width": GIF_WIDTHS[self.cb_gif_w.currentText()], "fps": GIF_FPS[self.cb_gif_fps.currentText()],
+                 "colors": GIF_COLORS[self.cb_gif_col.currentText()]},
+                f"GIF · {self.cb_gif_w.currentText()} · {self.cb_gif_fps.currentText()}")
+
+    def _start_multi(self, url, single=None, name=None):
+        clips = [single] if single else [(c[0], c[1], getattr(c, "label", "")) for c in self.clips]
+        if not clips:
+            return self._on_error("Add at least one clip.")
+        if not self._is_info_current() or not self._duration():
+            return self._on_error("Wait until the video info is loaded.")
+        if any(c[1] <= c[0] for c in clips):
+            return self._on_error("A clip ends before it starts – check the clip list.")
+        if not self.ffmpeg:
+            return self._on_error("FFmpeg not found – please run the setup again.")
+        mode = self.seg.value()
+        join = self.seg_join.value() == "join" or bool(single)
+        if mode == "gif":
+            if join and sum(c[1] - c[0] for c in clips) > GIF_MAX + 0.01:
+                return self._on_error(f"Joined GIFs can be at most {GIF_MAX} s – shorten or remove clips.")
+            if not join and any(c[1] - c[0] > GIF_MAX + 0.01 for c in clips):
+                return self._on_error(f"GIFs can be at most {GIF_MAX} s each – shorten the long clips.")
+        lp = local_path(url)
+        if lp and mode in ("mp4", "gif") and not self.info.get("has_video", True):
+            return self._on_error("This file has no video – choose Audio.")
+        try:
+            params, desc = self._format_params()
+        except ValueError as ex:
+            return self._on_error(str(ex))
+        outdir = Path(self.outdir.text().strip() or Path.home() / "Downloads")
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            return self._on_error(f"Invalid folder: {ex}")
+        ext = self._ext(mode)
+        fx = self._fx(mode)
+        if fx_needed(mode, fx) and not single and not self._check_ai():
+            return
+        if single:
+            name = name or unique_name(outdir, self._default_name(*single) or "clip", ext)
+        else:
+            name = self.name.text().strip()
+            if join:
+                name = unique_name(outdir, name or self._default_name(), ext)
+            elif name:
+                name = safe_name(name)
+            elif any(len(c) > 2 and c[2] for c in clips):     # chapter names -> "Title_01 Intro" …
+                name = safe_name(self.info.get("title") or "clip")
+            else:
+                name = None
+        thumb = None
+        if self.cb_thumb.isChecked() and (not lp or self.info.get("has_video", True)):
+            thumb = (url, None if lp else self.info, clips[0][0])
+        self._save_settings()
+        span = ", ".join(f"{fmt_ts(c[0])}–{fmt_ts(c[1])}" for c in clips)
+        self._on_log(f"\n— {url}\n  {len(clips)} clips ({span}) · {'joined' if join else 'separate files'} · {desc}"
+                     + (f" · {name}{ext if join else ''}" if name else ""))
+        self._stop_playback()
+        self._set_busy(True)
+        self.btn_show.setEnabled(False)
+        self._on_status("Starting …")
+        self._on_progress(None)
+        kw = {"local": bool(lp), "join": join, "params": params, "info": None if lp else self.info, "fx": fx}
+        srt = self._srt_job()
+        if srt:
+            kw["_srt"] = ([(c[0], c[1]) for c in clips], srt, join)
+        threading.Thread(target=self._worker, args=(export_multi, (mode, lp or url, clips, outdir), name, thumb,
+                                                    bool(lp), kw), daemon=True).start()
+
+    def _worker(self, fn, args, name, thumb, local, kw=None):
+        kw = dict(kw or {})
+        srt = kw.pop("_srt", None)
+        try:
+            if not local and not self.update_done.is_set():
+                self.emit("status", "Waiting for yt-dlp update …")
+                self.update_done.wait()
+            self.emit("status", "Reading file …" if local else "Fetching video info …")
+            files = [str(f) for f in fn(*args, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, emit=self.emit, name=name,
+                                        **kw)]
+            if srt and files:
+                try:
+                    files += [str(f) for f in save_srts(files, *srt)]
+                except Exception as ex:  # noqa: BLE001
+                    self.emit("log", f"WARNING: .srt not saved: {clean_error(ex)}")
+            if thumb and files:
+                try:
+                    self.emit("status", "Saving thumbnail …")
+                    base = Path(files[0])
+                    dst = base.parent / (unique_name(base.parent, base.stem, ".jpg") + ".jpg")
+                    save_thumbnail(thumb[0], dst, ffmpeg=self.ffmpeg, info=thumb[1], at=thumb[2])
+                    files.append(str(dst))
+                except Exception as ex:  # noqa: BLE001
+                    self.emit("log", f"WARNING: thumbnail not saved: {clean_error(ex)}")
+            self.emit("done", files)
+        except ImportError:
+            self.emit("error", "yt-dlp is not installed – please run the setup again.")
+        except Exception as ex:  # noqa: BLE001
+            msg = clean_error(ex)
+            self.emit("error", msg + login_hint(msg))
+
+    def _save_thumb_now(self):
+        url = self.url.text().strip()
+        if not self._is_info_current() or self.busy:
+            return
+        outdir = Path(self.outdir.text().strip() or Path.home() / "Downloads")
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            return self._on_error(f"Invalid folder: {ex}")
+        try:
+            s, _e = self._range()
+        except ValueError:
+            s = None
+        lp = local_path(url)
+        base = self.name.text().strip() or safe_name(self.info.get("title") or "thumbnail")
+        if lp and s:
+            base += f"_{fmt_t(s)}"
+        dst = outdir / (unique_name(outdir, base, ".jpg") + ".jpg")
+        at = s if s else min((self.info.get("duration") or 0) * 0.1, 5.0)
+        info = None if lp else self.info
+        self.btn_thumb.setEnabled(False)
+        self._on_status("Saving thumbnail …")
+
+        def work():
+            try:
+                save_thumbnail(url, dst, ffmpeg=self.ffmpeg, info=info, at=at)
+                self.emit("thumb_saved", str(dst))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("thumb_err", clean_error(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_thumb_saved(self, path):
+        self.btn_thumb.setEnabled(True)
+        self.last_files = [path]
+        self.btn_show.setEnabled(True)
+        try:
+            size = f" ({Path(path).stat().st_size / 1024:.0f} KB)"
+        except OSError:
+            size = ""
+        self.status.setText(f"✓  Thumbnail saved: {Path(path).name}{size}")
+        set_state(self.status, "ok")
+        self._on_log(f"✓ {Path(path).name}")
+
+    def _on_thumb_err(self, msg):
+        self.btn_thumb.setEnabled(True)
+        self.status.setText("✕  " + msg.splitlines()[0][:200])
+        set_state(self.status, "error")
+        self._on_log("✕ " + msg)
+
+    def _open_file(self):
+        start = self.cfg.get("last_in") or str(Path.home())
+        exts = " ".join(f"*{x}" for x in sorted(LOCAL_EXTS))
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open a video or audio file", start,
+                                                        f"Media ({exts});;All files (*.*)")
+        if path:
+            self.cfg["last_in"] = str(Path(path).parent)
+            self.url.setText(str(Path(path)))
+            self.name.clear()
+
+    def _grab_clipboard(self):
+        if self.busy:
+            return
+        clip = QtWidgets.QApplication.clipboard().text().strip()
+        if clip and clip != self.last_clip and YT_URL.fullmatch(clip):
+            self.last_clip = clip
+            if self.url.text().strip() != clip:
+                self.url.setText(clip)
+                self.name.clear()
+                self._on_status("Link taken from the clipboard.")
+
+    def _paste(self):
+        clip = QtWidgets.QApplication.clipboard().text().strip()
+        if clip:
+            self.url.setText(clip)
+            self.name.clear()
+
+    def _pick_dir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose folder",
+                                                       self.outdir.text() or str(Path.home()))
+        if d:
+            self.outdir.setText(str(Path(d)))
+
+    def _open_dir(self):
+        d = Path(self.outdir.text().strip() or Path.home() / "Downloads")
+        if d.exists():
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(d)))
+
+    def _reveal(self):
+        if self.last_files and Path(self.last_files[-1]).exists():
+            if WIN:
+                subprocess.Popen(f'explorer /select,"{self.last_files[-1]}"')
+            else:
+                self._open_dir()
+
+    def _toggle_log(self):
+        show = not self.log.isVisible()
+        self.log.setVisible(show)
+        self.btn_details.setText(("▾" if show else "▸") + "  Details")
+
+    def _check_tools(self):
+        missing = [n for n, p in (("FFmpeg", self.ffmpeg), ("FFprobe", self.ffprobe), ("Deno", self.deno)) if not p]
+        if missing:
+            self._on_log("Missing: " + ", ".join(missing) + " – please run the setup again.")
+
+    def _maybe_update(self):
+        if time.time() - float(self.cfg.get("last_update", 0)) < UPDATE_INTERVAL:
+            self.update_done.set()
+        else:
+            self._run_update()
+
+    # ------------------------------------------------------------------ app update (GitHub repo)
+    def _check_app_update(self, manual=True):
+        if manual:
+            self.btn_app_upd.setEnabled(False)
+            self._on_status("Checking for a new app version …")
+
+        def work():
+            try:
+                self.emit("appupd", ("checked", (manual, check_app_update())))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("appupd", ("check_err", (manual, clean_error(ex))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _app_update_clicked(self):
+        if self.busy:
+            return
+        self._check_app_update(manual=True)
+
+    def _on_appupd(self, val):
+        kind, v = val
+        if kind == "checked":
+            manual, info = v
+            self.cfg["last_app_check"] = time.time()
+            save_cfg(self.cfg)
+            self.btn_app_upd.setEnabled(not self.busy)
+            if info.get("newer"):
+                self._app_update = info
+                self.btn_app_upd.setText(f"Update app → {info.get('version')}")
+                set_state(self.btn_app_upd, "ok")
+                self._on_log(f"New app version {info.get('version')} available (you have {APP_VERSION}).")
+                if not manual:
+                    return
+                notes = str(info.get("notes") or "").strip()
+                q = QtWidgets.QMessageBox.question(
+                    self, "Update app", f"Version {info.get('version')} is available (you have {APP_VERSION})."
+                    + (f"\n\n{notes[:600]}" if notes else "") + "\n\nUpdate now? The app restarts afterwards.")
+                if q == QtWidgets.QMessageBox.StandardButton.Yes:
+                    self._install_app_update(info)
+                else:
+                    self._on_status("Ready.")
+            elif manual:
+                self._on_status(f"✓  You have the newest version ({APP_VERSION}).")
+                set_state(self.status, "ok")
+        elif kind == "check_err":
+            manual, msg = v
+            self.btn_app_upd.setEnabled(not self.busy)
+            if manual:
+                self._on_error("Update check failed: " + msg)
+            else:
+                self._on_log("App update check: " + msg)
+        elif kind == "installed":
+            self._on_log(f"✓ App updated to {v} – restarting …")
+            self._restart()
+        elif kind == "install_err":
+            self._on_error("App update failed: " + v)
+
+    def _install_app_update(self, info):
+        if self.busy:
+            return
+        self._set_busy(True)
+        self._on_progress(None)
+        script = Path(__file__).resolve()
+
+        def work():
+            try:
+                install_app_update(info, script, self.emit)
+                self.emit("appupd", ("installed", info.get("version")))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("appupd", ("install_err", clean_error(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _restart(self):
+        self.busy = False
+        self._save_settings()
+        for pl in (self.player, self.aplayer):
+            if pl is not None:
+                pl.stop()
+        if self._proxy is not None:
+            self._proxy.close()
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve())], cwd=str(Path(__file__).resolve().parent),
+                             close_fds=True)
+        except OSError as ex:
+            self._set_busy(False)
+            return self._on_error(f"Please start the app again ({ex}).")
+        QtCore.QTimer.singleShot(150, lambda: os._exit(0))
+
+    def _run_update(self, manual=False):
+        if manual and self.busy:
+            return
+        self.update_done.clear()
+        self.btn_upd.setEnabled(False)
+        self._on_status("Checking for yt-dlp update …")
+        threading.Thread(target=lambda: self.emit("updated", update_ytdlp(self.emit)), daemon=True).start()
+
+    # drag & drop a link onto the window
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() or e.mimeData().hasText():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        md = e.mimeData()
+        if md.hasUrls():
+            u = md.urls()[0]
+            text = u.toLocalFile() if u.isLocalFile() else u.toString()
+        else:
+            text = md.text()
+        if text.strip():
+            self.url.setText(text.strip())
+            self.name.clear()
+
+    def closeEvent(self, e):
+        if self.busy and QtWidgets.QMessageBox.question(
+                self, APP, "A download is still running. Quit anyway?") != QtWidgets.QMessageBox.StandardButton.Yes:
+            e.ignore()
+            return
+        self._save_settings()
+        for pl in (self.player, self.aplayer):
+            if pl is not None:
+                pl.stop()
+                pl.setSource(QtCore.QUrl())
+        if self._proxy is not None:
+            self._proxy.close()
+        shutil.rmtree(self._pv_dir, ignore_errors=True)
+        e.accept()
+        QtCore.QTimer.singleShot(0, lambda: os._exit(0))
+
+
+def main():
+    if sys.stdout is None or sys.stderr is None:  # pythonw has no console -> write to a log file
+        try:
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            sink = open(APP_DIR / "last_run.log", "w", encoding="utf-8", buffering=1)
+        except OSError:
+            sink = open(os.devnull, "w")
+        sys.stdout = sys.stdout or sink
+        sys.stderr = sys.stderr or sink
+    if WIN:
+        try:  # own taskbar entry instead of being grouped with other pythonw apps
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except Exception:
+            pass
+    app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName(APP)
+    app.setOrganizationName("tfrog")
+    app.setStyle("Fusion")
+    font = QtGui.QFont()
+    font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter", "Helvetica Neue", "Arial"])
+    font.setPointSize(10)
+    app.setFont(font)
+    icon = Path(__file__).with_name("icon.ico")
+    if icon.exists():
+        app.setWindowIcon(QtGui.QIcon(str(icon)))
+    win = MainWindow()
+    if not win.cfg.get("geometry"):
+        win.resize(1220, 900)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

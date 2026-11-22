@@ -1,0 +1,211 @@
+# -*- coding: utf-8 -*-
+"""
+YouTube Downloader (by tfrog)
+Paste a link (or open your own video), optionally pick a time range,
+get an MP4 (H.264 + AAC), an MP3 or a GIF - and the thumbnail as JPG.
+
+Requires: Python 3.10+, yt-dlp[default], PySide6, FFmpeg, Deno  ->  installed by the setup.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+APP = "YouTube Downloader"
+APP_VERSION = "2.6.0"
+UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
+UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
+APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
+APP_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "tfrog_ytclip"
+CFG_FILE = APP_DIR / "config.json"
+WIN = os.name == "nt"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+YT_URL = re.compile(r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/\S+", re.I)
+ANY_URL = re.compile(r"https?://\S+", re.I)
+YDL_EXTRA: dict = {}   # options for every yt-dlp call (browser login / cookies), set by the app
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+UPDATE_INTERVAL = 20 * 3600  # auto-update yt-dlp at most once a day
+
+QUALITIES = {
+    "Best available": None,
+    "2160p (4K)": 2160,
+    "1440p": 1440,
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+}
+MP3_QUALITIES = {"320 kbps": 320, "256 kbps": 256, "192 kbps": 192, "128 kbps": 128}
+ENCODERS = ["CPU", "NVIDIA GPU (NVENC)"]
+CODECS = {  # label -> (codec, ProRes profile)
+    "H.264 (MP4)": ("h264", None),
+    "H.265 / HEVC (MP4)": ("hevc", None),
+    "ProRes 422 (MOV)": ("prores", 2),
+    "ProRes 422 HQ (MOV)": ("prores", 3),
+}
+AUDIO_FORMATS = {"MP3": "mp3", "WAV": "wav", "M4A (AAC)": "m4a"}
+DEFAULT_CODEC = "H.264 (MP4)"
+DEFAULT_AUDIO = "MP3"
+SIZES = {  # name -> CRF  (None = original, "mb" = target size)
+    "Original": None,
+    "High": 20,
+    "Medium": 23,
+    "Small": 26,
+    "Target MB": "mb",
+}
+SIZE_HINTS = {
+    "Original": "YouTube file without re-encoding when possible",
+    "High": "CRF 20 · barely visible difference",
+    "Medium": "CRF 23 · good balance",
+    "Small": "CRF 26 · much smaller, fine detail suffers",
+    "Target MB": "file ends up about this size",
+}
+GIF_WIDTHS = {"320 px": 320, "480 px": 480, "640 px": 640, "800 px": 800}
+GIF_FPS = {"10 fps": 10, "12 fps": 12, "15 fps": 15, "20 fps": 20, "25 fps": 25}
+GIF_COLORS = {"Best (256 colors)": 256, "Smaller (128 colors)": 128, "Smallest (64 colors)": 64}
+GIF_MAX = 30          # seconds
+GIF_RECOMMENDED = 10  # seconds
+ORIGINAL_CRF = 18  # used when "Original" still has to encode (clips, VP9/AV1 sources)
+PIECE_CRF = 14     # intermediate clips that get encoded once more (joining, crop, subtitles …)
+DEFAULT_QUALITY = "Best available"
+DEFAULT_MP3 = "320 kbps"
+DEFAULT_ENCODER = ENCODERS[0]
+DEFAULT_SIZE = "Original"
+VIDEO_TAIL = ["-pix_fmt", "yuv420p"]
+PP_NAMES = {
+    "Merger": "Merging video + audio",
+    "ExtractAudio": "Converting audio",
+    "Metadata": "Writing tags",
+    "EmbedThumbnail": "Embedding cover art",
+    "ThumbnailsConvertor": "Preparing cover art",
+    "MoveFiles": "Finishing",
+}
+EXT = {"mp4": ".mp4", "mp3": ".mp3", "gif": ".gif"}  # mode keys (kept for old settings files)
+PRORES_HINTS = {2: "Editing codec · 10-bit 4:2:2 · roughly 1 GB per minute at 1080p",
+                3: "Editing codec · 10-bit 4:2:2 · roughly 1.5 GB per minute at 1080p"}
+AUDIO_HINTS = {"mp3": "With title, artist and cover art.",
+               "wav": "Uncompressed 16-bit PCM for editing · ~10 MB per minute · no cover art",
+               "m4a": "AAC with title and cover art · YouTube audio is kept without re-encoding"}
+
+# ---- hover help (Settings → "Show help when hovering")
+ITEM_HELP = {
+    # quality
+    "Best available": "The highest resolution this video has.",
+    "2160p (4K)": "Up to 3840 × 2160. Big files.",
+    "1440p": "Up to 2560 × 1440.",
+    "1080p": "Up to 1920 × 1080 (Full HD).",
+    "720p": "Up to 1280 × 720. Small and quick.",
+    "480p": "Up to 854 × 480. Smallest.",
+    # codec
+    "H.264 (MP4)": "Plays everywhere: phones, browsers, editing apps, WhatsApp, Discord …",
+    "H.265 / HEVC (MP4)": "Same look at roughly half the size. Needs a newer device or player "
+                          "and takes longer to encode.",
+    "ProRes 422 (MOV)": "Editing codec for Premiere, After Effects, Resolve … "
+                        "Scrubs smoothly, but the files are very large.",
+    "ProRes 422 HQ (MOV)": "Higher-quality ProRes for grading and compositing. Even larger files.",
+    # size
+    "Original": "Keeps the YouTube file as it is when possible – best quality, no waiting for an encode.",
+    "High": "Re-encodes with almost no visible difference. Noticeably smaller.",
+    "Medium": "Good balance of quality and size.",
+    "Small": "Much smaller files. Fine detail and dark areas suffer.",
+    "Target MB": "Type a size in MB – the bitrate is chosen so the file ends up about that big "
+                 "(e.g. for upload limits).",
+    # encoder
+    "CPU": "Encodes on the processor. Works on every PC and gives the best quality per MB.",
+    "NVIDIA GPU (NVENC)": "Encodes on an NVIDIA graphics card – much faster. "
+                          "Falls back to the CPU automatically if the card or driver can't do it.",
+    # audio format
+    "MP3": "Plays everywhere. Small, with title, artist and cover art.",
+    "WAV": "Uncompressed audio for editing and DAWs. Large, no cover art.",
+    "M4A (AAC)": "Better quality per MB than MP3. YouTube's own AAC audio is copied without re-encoding.",
+    # bitrate
+    "320 kbps": "Highest quality · about 2.4 MB per minute.",
+    "256 kbps": "Very good · about 1.9 MB per minute.",
+    "192 kbps": "Good · about 1.4 MB per minute.",
+    "128 kbps": "OK for speech and podcasts · about 1 MB per minute.",
+    # gif
+    "320 px": "Tiny – stickers and reactions.",
+    "480 px": "Good default for chats and forums.",
+    "640 px": "Sharper, but noticeably bigger files.",
+    "800 px": "Large – only for very short clips.",
+    "10 fps": "Choppy but very small.",
+    "12 fps": "Slightly smoother, still small.",
+    "15 fps": "Good default – smooth enough, reasonable size.",
+    "20 fps": "Smooth motion, bigger files.",
+    "25 fps": "Smoothest, biggest files.",
+    "Best (256 colors)": "Best-looking gradients and skin tones.",
+    "Smaller (128 colors)": "Smaller file, slight banding in gradients.",
+    "Smallest (64 colors)": "Smallest file, visible banding.",
+    # upscaling
+    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",
+    "2×": "Twice as wide and high.",
+    "3×": "Three times as wide and high.",
+    "4×": "Four times as wide and high.",
+    "To 1080p": "Short side 1080 px: 1920 × 1080, or 1080 × 1920 for a 9:16 crop (Reels / Shorts / TikTok).",
+    "To 1440p": "Short side 1440 px: 2560 × 1440, or 1440 × 2560 for 9:16.",
+    "To 4K (2160p)": "Short side 2160 px: 3840 × 2160, or 2160 × 3840 for 9:16.",
+    "Standard (fast)": "Normal scaling (Lanczos) – instant, a bit soft when enlarging a lot.",
+    "AI · real footage": "Real-ESRGAN x4plus: invents fine detail. Slow (about 0.3–2 s per frame on a graphics card) – "
+                         "best for stills and short clips.",
+    "AI · anime video": "Real-ESRGAN anime video model: clean lines, fast, steady from frame to frame.",
+    "AI · anime stills": "Real-ESRGAN x4plus-anime: the sharpest anime model, slower – great for single frames.",
+    "Load own model …": "Add a Real-ESRGAN compatible ncnn model (a .param + .bin pair, e.g. 4x-UltraSharp from the "
+                "Upscayl model collection).",
+    # theme
+    "Dark": "Neutral dark grey.",
+    "Midnight": "Dark blue.",
+    "Light": "Bright theme for daylight.",
+}
+# ---- frame (crop / output size / upscaling)
+ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "3:4": (3, 4)}
+# upscaling (Output tab): target of the result -> ("x", factor) or ("short", short side in px)
+UPSCALES = {"Off": None, "2×": ("x", 2), "3×": ("x", 3), "4×": ("x", 4), "To 1080p": ("short", 1080),
+            "To 1440p": ("short", 1440), "To 4K (2160p)": ("short", 2160)}
+# built-in models: label -> (kind, Real-ESRGAN model name, native scale; None = the model can do 2/3/4)
+MODELS = {"Standard (fast)": ("std", None, None),
+          "AI · real footage": ("esr", "realesrgan-x4plus", 4),
+          "AI · anime video": ("esr", "realesr-animevideov3", None),
+          "AI · anime stills": ("esr", "realesrgan-x4plus-anime", 4)}
+MODEL_LOAD = "Load own model …"
+CUSTOM_MODELS_DIR = APP_DIR / "models"
+FONTS_DIR = APP_DIR / "fonts"
+SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
+             "bold": True, "pos": None}
+BROWSERS = ["Off", "Firefox", "Chrome", "Edge", "Brave", "Opera", "Vivaldi"]
+UPSCALER_DIR = APP_DIR / "upscaler"
+UPSCALER_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+                "realesrgan-ncnn-vulkan-20220424-windows.zip")
+UPSCALER_SHA256 = "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d"
+UPSCALER_MB = 45
+HISTORY_FILE = APP_DIR / "history.json"
+HISTORY_DIR = APP_DIR / "history"
+HISTORY_MAX = 500
+SUB_TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+
+LOCAL_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".m2ts", ".mts", ".flv", ".wmv", ".mpg",
+              ".mpeg", ".3gp", ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+
+# ---- appearance (user can change theme + accent color in the app)
+THEMES = {
+    "Dark": dict(bg="#0d0e10", panel="#15161a", panel2="#1d1f24", field="#111216", border="#272a31",
+                 border_hi="#3a3e47", text="#ececee", muted="#8b8f99", dark=True),
+    "Midnight": dict(bg="#0a0f1c", panel="#101829", panel2="#172036", field="#0c1323", border="#22304a",
+                     border_hi="#33456a", text="#e6ebf5", muted="#8792aa", dark=True),
+    "Light": dict(bg="#eef0f3", panel="#ffffff", panel2="#f2f3f6", field="#f7f8fa", border="#dcdfe5",
+                  border_hi="#c3c8d1", text="#16181d", muted="#6b7280", dark=False),
+}
+ACCENTS = [("Lime", "#c4f240"), ("Mint", "#3ddc97"), ("Cyan", "#22d3ee"), ("Blue", "#4d8bff"),
+           ("Violet", "#a78bfa"), ("Pink", "#ff5fa2"), ("Red", "#ff4d4d"), ("Orange", "#ff9f43"),
+           ("Yellow", "#ffd43b")]
+DEFAULT_THEME = "Dark"
+DEFAULT_ACCENT = "#c4f240"
+WARN_COLOR = "#f0b429"
+ERR_COLOR = "#ff6b6b"
+
+

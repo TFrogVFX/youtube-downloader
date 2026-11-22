@@ -1,0 +1,1002 @@
+# ----------------------------------------------------------------------------- helpers
+
+def refresh_path() -> None:
+    """Reload PATH from the registry so fresh winget installs are found without logging off."""
+    if not WIN:
+        return
+    import winreg
+    dirs: list[str] = []
+    for hive, key in (
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                dirs += os.path.expandvars(winreg.QueryValueEx(k, "Path")[0]).split(";")
+        except OSError:
+            pass
+    dirs += [
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+        os.path.expandvars(r"%ProgramFiles%\WinGet\Links"),
+        os.path.expanduser(r"~\.deno\bin"),
+    ]
+    seen, merged = set(), []
+    for d in os.environ.get("PATH", "").split(os.pathsep) + dirs:
+        if d and d.lower() not in seen:
+            seen.add(d.lower())
+            merged.append(d)
+    os.environ["PATH"] = os.pathsep.join(merged)
+
+
+def find_tool(name: str) -> str | None:
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    if WIN:  # fallback: search winget package folders
+        base = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+        for pattern in (f"*/*/bin/{name}.exe", f"*/{name}.exe"):
+            for p in base.glob(pattern):
+                os.environ["PATH"] = str(p.parent) + os.pathsep + os.environ.get("PATH", "")
+                return str(p)
+    return None
+
+
+def parse_time(text: str) -> float | None:
+    """'10' = minute 10 · '10:30' · '1:02:30' · '90s' · '1.5h'  ->  seconds"""
+    s = text.strip().lower().replace(",", ".")
+    if not s:
+        return None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) > 3:
+            raise ValueError(text)
+        sec = 0.0
+        for p in parts:
+            sec = sec * 60 + float(p or 0)
+        if sec < 0:
+            raise ValueError(text)
+        return sec
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(h|hr|m|min|s|sec)?", s)
+    if not m:
+        raise ValueError(text)
+    mult = {"h": 3600, "hr": 3600, "s": 1, "sec": 1}.get(m.group(2), 60)
+    return float(m.group(1)) * mult
+
+
+def fmt_t(sec: float) -> str:
+    sec = int(round(sec))
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+
+
+def fmt_ts(sec: float) -> str:
+    """Display format for time fields: 1:05, 1:05.5, 1:02:03"""
+    sec = max(0.0, float(sec))
+    whole = int(sec)
+    frac = sec - whole
+    h, rest = divmod(whole, 3600)
+    m, s = divmod(rest, 60)
+    out = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    if frac >= 0.05:
+        out += f".{int(round(frac * 10)) % 10}"
+    return out
+
+
+def fmt_tf(sec: float) -> str:
+    """Time fields: as exact as needed (frame-accurate cuts) - 1:05, 1:05.5, 1:05.52"""
+    cs = int(round(max(0.0, float(sec)) * 100))
+    s_, c_ = divmod(cs, 100)
+    h, rest = divmod(s_, 3600)
+    m, s_ = divmod(rest, 60)
+    out = f"{h}:{m:02d}:{s_:02d}" if h else f"{m}:{s_:02d}"
+    return out + (f".{c_:02d}".rstrip("0") if c_ else "")
+
+
+def fmt_tc(sec: float) -> str:
+    """Timecode of the preview with 1/100 s: 1:31.24, 1:02:03.50"""
+    cs = int(round(max(0.0, float(sec)) * 100))
+    s, c = divmod(cs, 100)
+    h, rest = divmod(s, 3600)
+    m, s = divmod(rest, 60)
+    return (f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}") + f".{c:02d}"
+
+
+def safe_name(name: str) -> str:
+    """File name without characters Windows does not allow."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip(" .")
+    return name[:150]
+
+
+def unique_name(outdir, name: str, ext: str) -> str:
+    """name -> name (2) -> name (3) ... if a file with that name already exists."""
+    base = safe_name(name) or "download"
+    cand, i = base, 2
+    while (Path(outdir) / f"{cand}{ext}").exists():
+        cand = f"{base} ({i})"
+        i += 1
+    return cand
+
+
+def load_cfg() -> dict:
+    try:
+        return json.loads(CFG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cfg(cfg: dict) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        CFG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def probe(ffprobe: str | None, path: Path):
+    """-> (video_codec, audio_codec, duration_sec)"""
+    if not ffprobe:
+        return None, None, 0.0
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name:stream_disposition=attached_pic:format=duration",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
+    )
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+    streams = data.get("streams", [])
+    v = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"
+              and not (s.get("disposition") or {}).get("attached_pic")), None)
+    a = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), None)
+    try:
+        dur = float(data.get("format", {}).get("duration") or 0)
+    except ValueError:
+        dur = 0.0
+    return v, a, dur
+
+
+def video_ext(codec: str) -> str:
+    return ".mov" if codec == "prores" else ".mp4"
+
+
+def video_args(encoder: str, crf: int | None = None, kbps: int | None = None,
+               codec: str = "h264", profile: int | None = None) -> list[str]:
+    if codec == "prores":  # editing codec: 10-bit 4:2:2, size is fixed by the profile
+        return ["-c:v", "prores_ks", "-profile:v", str(profile or 2), "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
+    nv = encoder.startswith("NVIDIA")
+    rate = (["-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{kbps * 2}k"] if kbps else None)
+    if codec == "hevc":  # CRF scale of x265 is ~4 higher than x264 for the same look
+        if nv:
+            v = ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr"] + (rate or ["-cq", str(crf + 3), "-b:v", "0"])
+        else:
+            v = ["-c:v", "libx265", "-preset", "medium", "-x265-params", "log-level=error"] + \
+                (rate or ["-crf", str(crf + 4)])
+        return v + ["-tag:v", "hvc1"] + VIDEO_TAIL  # hvc1 tag: plays in QuickTime / Apple devices
+    if nv:
+        v = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr"] + (rate or ["-cq", str(crf + 1), "-b:v", "0"])
+    else:
+        v = ["-c:v", "libx264", "-preset", "medium"] + (rate or ["-crf", str(crf)])
+    return v + VIDEO_TAIL
+
+
+def encode_args(encoder: str, size: str, target_mb: float | None, duration: float | None,
+                codec: str = "h264", profile: int | None = None):
+    """-> (video_args, audio_args) for the selected size and codec"""
+    if codec == "prores":
+        return video_args(encoder, codec="prores", profile=profile), ["-c:a", "pcm_s16le"]
+    mode = SIZES.get(size)
+    abr = 128 if mode in ("mb", 26) else 192
+    aargs = ["-c:a", "aac", "-b:a", f"{abr}k"]
+    if mode == "mb":
+        if not duration:
+            raise RuntimeError("Video length unknown – 'Target MB' can't be used here.")
+        total_kbit = target_mb * 1048576 * 8 / 1000
+        kbps = int(total_kbit / duration * 0.96) - abr  # 4 % headroom for container/variance
+        if kbps < 200:
+            need = (200 + abr) * duration / 0.96 / (1048576 * 8 / 1000)
+            raise RuntimeError(f"{target_mb:g} MB is too small for {fmt_t(duration)} – "
+                               f"you need at least ~{need:.0f} MB (or a shorter clip).")
+        return video_args(encoder, kbps=kbps, codec=codec), aargs
+    crf = PIECE_CRF if size == "_piece" else (mode if isinstance(mode, int) else ORIGINAL_CRF)
+    return video_args(encoder, crf=crf, codec=codec), aargs
+
+
+FF_REPORT = APP_DIR / "ffmpeg_report_ffmpeg.log"  # written by ffmpeg itself (FFREPORT)
+
+
+def enable_ffmpeg_report() -> None:
+    """Every ffmpeg run (also the ones started by yt-dlp) writes its warnings/errors to a file.
+    Without this, ffmpeg's error text is lost under pythonw and only an exit code remains."""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    base = str(APP_DIR).replace("%", "%%").replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    os.environ["FFREPORT"] = f"file={base}/ffmpeg_report_%p.log:level=24"
+
+
+def ffmpeg_report_tail(since: float, n: int = 6) -> str:
+    """Last error lines of the most recent ffmpeg run (only if it ran after `since`)."""
+    try:
+        if FF_REPORT.stat().st_mtime < since - 1:
+            return ""
+        lines = FF_REPORT.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for i, line in enumerate(lines):
+        if line.startswith("Command line:"):
+            lines = lines[i + 2:]
+            break
+    lines = [x.strip() for x in lines if x.strip() and not x.startswith("Report written")]
+    return "\n".join(lines[-n:])
+
+
+def clean_error(ex) -> str:
+    msg = ANSI.sub("", str(ex)).strip() or ex.__class__.__name__
+    return re.sub(r"^ERROR:\s*", "", msg)
+
+
+_NVENC: dict = {}
+
+
+def check_encoder(encoder: str, ffmpeg, emit, codec: str = "h264") -> str:
+    """NVENC needs an NVIDIA GPU with a recent driver - fall back to the CPU instead of failing."""
+    if codec == "prores" or not encoder.startswith("NVIDIA") or not ffmpeg:
+        return encoder
+    nv = "hevc_nvenc" if codec == "hevc" else "h264_nvenc"
+    key = (ffmpeg, nv)
+    if key not in _NVENC:
+        try:
+            r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                                "-i", "color=c=black:s=256x256:d=0.2", "-c:v", nv, "-f", "null", "-"],
+                               capture_output=True, timeout=60, creationflags=NO_WINDOW)
+            _NVENC[key] = r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _NVENC[key] = False
+    if _NVENC[key]:
+        return encoder
+    emit("log", f"NVENC ({nv}) is not available on this PC (no NVIDIA GPU or driver too old) – using the CPU.")
+    return DEFAULT_ENCODER
+
+
+def run_encode(cmd, dur, emit, label, cwd=None) -> None:
+    """Run ffmpeg (with -progress pipe:1), report progress, raise with ffmpeg's own error text."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd,
+                            encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    err: list[str] = []
+    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
+    reader.start()
+    last = 0.0
+    for line in proc.stdout:
+        if dur and line.startswith(("out_time_us=", "out_time_ms=")):
+            try:
+                pct = min(100.0, int(line.split("=", 1)[1]) / 1e6 / dur * 100)
+            except ValueError:
+                continue
+            if pct - last >= 0.5:
+                last = pct
+                emit("progress", pct)
+                emit("status", f"{label} … {pct:.0f} %")
+    rc = proc.wait()
+    reader.join(5)
+    if rc != 0:
+        lines = [x for x in "".join(err).splitlines() if x.strip() and not x.startswith("Report written")]
+        raise RuntimeError("FFmpeg error:\n" + ("\n".join(lines[-8:]) or f"exit code {rc}"))
+
+
+def cut_local(src: Path, dst: Path, start: float, end, extra_args, ffmpeg, emit, label) -> Path:
+    """Frame-accurate cut of a local file (input seeking + the given codec args)."""
+    length = (end - start) if end is not None else None
+    tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(src)]
+    if length:
+        cmd += ["-t", f"{length:.3f}"]
+    cmd += [*extra_args, "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0 if length else None)
+    try:
+        run_encode(cmd, length, emit, label)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def _clip_bounds(start, end, dur):
+    s = start or 0.0
+    if dur and s >= dur:
+        raise ValueError(f"Start time {fmt_t(s)} is past the end of the video ({fmt_t(dur)}).")
+    e = end
+    if dur:
+        e = dur if e is None else min(e, dur)
+    return s, e
+
+
+def _remove_leftovers(dst: Path) -> None:
+    """Delete what the failed direct attempt left next to the result (thumbnail, .part files)."""
+    import glob
+    for f in Path(dst.parent).glob(glob.escape(dst.stem) + ".*"):
+        if f.name != dst.name and f.is_file():
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def _note_fallback(ex, since, emit) -> None:
+    emit("log", f"Direct clip download failed: {clean_error(ex)}")
+    tail = ffmpeg_report_tail(since)
+    if tail:
+        emit("log", "ffmpeg said:\n" + tail)
+    emit("log", "Falling back: downloading the whole video and cutting it locally …")
+
+
+def finalize(src: Path, encoder, size, target_mb, ffmpeg, ffprobe, emit, encoded: bool,
+             codec: str = "h264", profile: int | None = None) -> Path:
+    """Make sure the result has the requested codec (H.264/H.265 MP4 or ProRes MOV) and size."""
+    v, a, dur = probe(ffprobe, src)
+    if ffprobe and v is None and a is None:
+        src.unlink(missing_ok=True)
+        raise RuntimeError("The file is empty – is the start time past the end of the video?")
+    ext = video_ext(codec)
+    a_ok = ("pcm_s16le", "pcm_s24le") if codec == "prores" else ("aac",)
+    force = codec != "prores" and SIZES.get(size) is not None and not encoded  # a size was picked
+    usable = src.suffix.lower() == ext and v in (codec, None) and a in (*a_ok, None)
+    if usable and not force:
+        return src
+
+    need_v = force or (v is not None and v != codec)
+    need_a = force or (a is not None and a not in a_ok)
+    enc_v, enc_a = (encode_args(encoder, size, target_mb, dur, codec, profile) if (need_v or need_a)
+                    else ([], []))
+    vargs = enc_v if need_v else ["-c:v", "copy"]
+    aargs = enc_a if need_a else ["-c:a", "copy"]
+
+    dst = src.with_suffix(ext)
+    tmp = src.with_name(src.stem + ".encoding" + ext)
+    what = "ProRes" if codec == "prores" else ("H.265" if codec == "hevc" else "H.264")
+    label_ = (f"Encoding {what}" + ("" if codec == "prores" or size == "_piece" else f" ({size})")) if need_v \
+        else f"Remuxing to {ext[1:].upper()}"
+    emit("status", f"{label_} …")
+    emit("progress", 0 if dur else None)
+
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+           "-map", "0:v:0?", "-map", "0:a:0?", *vargs, *aargs, "-movflags", "+faststart",
+           "-progress", "pipe:1", "-nostats", str(tmp)]
+    try:
+        run_encode(cmd, dur, emit, label_)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    if usable and tmp.stat().st_size >= src.stat().st_size:
+        # the YouTube file was already smaller -> re-encoding would only lose quality
+        tmp.unlink(missing_ok=True)
+        emit("log", f"'{size}' would be larger than the YouTube original – kept the original.")
+        return src
+    os.replace(tmp, dst)
+    if src != dst:
+        src.unlink(missing_ok=True)
+    return dst
+
+
+def collect_files(info) -> list[str]:
+    if not info:
+        return []
+    if info.get("entries") is not None:
+        out: list[str] = []
+        for e in info["entries"]:
+            out += collect_files(e)
+        return out
+    return [d["filepath"] for d in info.get("requested_downloads") or [] if d.get("filepath")]
+
+
+class _Log:
+    def __init__(self, emit):
+        self.emit = emit
+
+    def debug(self, msg):
+        if not msg.startswith("[debug] "):
+            self.emit("log", ANSI.sub("", msg))
+
+    def info(self, msg):
+        self.emit("log", ANSI.sub("", msg))
+
+    def warning(self, msg):
+        self.emit("log", "WARNING: " + ANSI.sub("", msg))
+
+    def error(self, msg):
+        self.emit("log", ANSI.sub("", msg))
+
+
+def make_ranges(start, end, on_section=None):
+    def ranges(info, _ydl):
+        s = start or 0.0
+        e = end
+        dur = info.get("duration")
+        known = True
+        if dur:
+            if s >= dur:
+                raise ValueError(f"Start time {fmt_t(s)} is past the end of the video ({fmt_t(dur)}).")
+            e = dur if e is None else min(e, dur)
+        elif e is None:
+            e = s + 12 * 3600  # length unknown: ffmpeg stops at end of file
+            known = False
+        if on_section:
+            on_section(e - s if known else None)
+        yield {"start_time": s, "end_time": e}
+    return ranges
+
+
+def format_sort(height, prefer_h264: bool = True) -> list[str]:
+    # best resolution <= limit (else the next larger one); at equal resolution prefer H.264/AAC
+    # -> the YouTube file can often be used 1:1 without re-encoding
+    res = [f"res:{height}" if height else "res", "fps"]
+    return res + ["vcodec:h264", "acodec:aac"] if prefer_h264 else res
+
+
+def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
+    stem = safe_name(name).replace("%", "%%") if name else f"%(title).120B{suffix}"
+    tmpl = str(Path(outdir)).replace("%", "%%") + os.sep + stem + ".%(ext)s"
+
+    def hook(d):
+        st = d.get("status")
+        if st == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes") or 0
+            pct = done / total * 100 if total else None
+            what = "clip" if section else (
+                "audio" if (d.get("info_dict") or {}).get("vcodec") == "none" else "video")
+            parts = [f"Downloading {what}"]
+            if pct is not None:
+                parts.append(f"{pct:.0f} %")
+            elif done:
+                parts.append(f"{done / 1048576:.1f} MB")
+            if d.get("speed"):
+                parts.append(f"{d['speed'] / 1048576:.1f} MB/s")
+            if d.get("eta"):
+                parts.append(f"{int(d['eta']) // 60}:{int(d['eta']) % 60:02d} left")
+            emit("progress", pct)
+            emit("status", " · ".join(parts))
+        elif st == "finished":
+            emit("progress", 100)
+
+    def pp_hook(d):
+        if d.get("status") == "started":
+            name = d.get("postprocessor", "")
+            emit("status", f"{PP_NAMES.get(name, 'Post-processing: ' + name)} …")
+            emit("progress", None)
+
+    return {
+        "outtmpl": tmpl,
+        "noplaylist": True,
+        "progress_hooks": [hook],
+        "postprocessor_hooks": [pp_hook],
+        "logger": _Log(emit),
+        "noprogress": True,
+        "concurrent_fragment_downloads": 4,
+        **YDL_EXTRA,
+    }
+
+
+def _suffix(start, end) -> str:
+    if start is None and end is None:
+        return ""
+    return f"_{fmt_t(start or 0)}-{fmt_t(end) if end is not None else 'end'}"
+
+
+def download(url, start, end, height, encoder, size, target_mb, outdir, *,
+             ffmpeg, ffprobe, emit, extra_opts=None, name=None, codec="h264", profile=None):
+    """Video -> H.264/H.265 MP4 or ProRes MOV"""
+    from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
+
+    section = start is not None or end is not None
+    t_start = time.time()
+    enable_ffmpeg_report()
+    encoder = check_encoder(encoder, ffmpeg, emit, codec)
+    opts = _base_opts(outdir, _suffix(start, end), section, emit, name=name)
+    opts.update({
+        "format": "bv*+ba/b",
+        "format_sort": format_sort(height, codec == "h264"),
+        "merge_output_format": "mp4/mkv" if codec == "h264" else "mkv",
+    })
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    if section:
+        out_args: list[str] = []  # filled in once the clip length is known
+
+        container = "mov" if codec == "prores" else "mp4"
+
+        def on_section(dur):
+            vargs, aargs = encode_args(encoder, size, target_mb, dur, codec, profile)
+            # -f overrides yt-dlp's container choice (e.g. if the source is webm)
+            out_args[:] = vargs + aargs + ["-movflags", "+faststart", "-f", container]
+
+        opts.update({
+            "download_ranges": make_ranges(start, end, on_section),
+            "force_keyframes_at_cuts": True,  # frame-accurate cut (re-encodes)
+            "merge_output_format": container,
+            "external_downloader_args": {"ffmpeg_o": out_args},
+        })
+    if extra_opts:
+        opts.update(extra_opts)
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            if section:
+                emit("status", "Downloading clip and encoding frame-accurately …")
+                emit("progress", None)
+            info = ydl.extract_info(url, download=True)
+    except ValueError:
+        raise
+    except Exception as ex:
+        if not section:
+            tail = ffmpeg_report_tail(t_start)
+            raise RuntimeError(clean_error(ex) + (f"\nffmpeg said:\n{tail}" if tail else "")) from ex
+        _note_fallback(ex, t_start, emit)
+        return [_full_then_cut_video(url, start, end, height, encoder, size, target_mb, outdir,
+                                     ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, name=name,
+                                     codec=codec, profile=profile)]
+
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("No file was downloaded.")
+    return [finalize(Path(f), encoder, size, target_mb, ffmpeg, ffprobe, emit, encoded=section,
+                     codec=codec, profile=profile) for f in files]
+
+
+def _full_then_cut_video(url, start, end, height, encoder, size, target_mb, outdir, *, ffmpeg, ffprobe, emit,
+                         name=None, codec="h264", profile=None):
+    """Fallback for clips: normal (robust) download of the whole video, then cut locally."""
+    from yt_dlp import YoutubeDL
+
+    tmpdir = Path(outdir) / ".ytclip_tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    try:
+        opts = _base_opts(tmpdir, "", False, emit)
+        opts.update({"format": "bv*+ba/b", "format_sort": format_sort(height, codec == "h264"),
+                     "merge_output_format": "mkv"})
+        if ffmpeg:
+            opts["ffmpeg_location"] = ffmpeg
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        files = collect_files(info)
+        if not files:
+            raise RuntimeError("No file was downloaded.")
+        src = Path(files[0])
+        _v, _a, dur = probe(ffprobe, src)
+        s, e = _clip_bounds(start, end, dur or (info or {}).get("duration"))
+        vargs, aargs = encode_args(encoder, size, target_mb, (e - s) if e is not None else None, codec, profile)
+        ext = video_ext(codec)
+        dst = Path(outdir) / (f"{safe_name(name)}{ext}" if name else f"{src.stem}{_suffix(start, end)}{ext}")
+        cut_local(src, dst, s, e, ["-map", "0:v:0?", "-map", "0:a:0?", *vargs, *aargs,
+                                   "-movflags", "+faststart"],
+                  ffmpeg, emit, "Cutting + encoding" + ("" if size == "_piece" else f" ({size})"))
+        _remove_leftovers(dst)
+        return dst
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def download_mp3(url, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, extra_opts=None, name=None,
+                 afmt="mp3"):
+    """Audio -> MP3 / M4A (tags + cover art) or WAV (lossless PCM, for editing)"""
+    from yt_dlp import YoutubeDL
+
+    section = start is not None or end is not None
+    t_start = time.time()
+    enable_ffmpeg_report()
+    opts = _base_opts(outdir, _suffix(start, end), section, emit, name=name)
+    cover = afmt in ("mp3", "m4a")
+    pps = [{"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"}] if cover else []
+    pps.append({"key": "FFmpegExtractAudio", "preferredcodec": afmt,
+                "preferredquality": None if afmt == "wav" else str(kbps)})
+    if cover:
+        pps += [{"key": "FFmpegMetadata", "add_metadata": True}, {"key": "EmbedThumbnail"}]
+    opts.update({
+        # M4A: take YouTube's AAC stream -> copied without re-encoding
+        "format": "ba[ext=m4a]/ba/b" if afmt == "m4a" else "ba/b",
+        "writethumbnail": cover,
+        "postprocessors": pps,
+    })
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    if section:
+        opts["download_ranges"] = make_ranges(start, end)
+        # copying the stream would only cut at WebM cluster borders (seconds off) -> decode to a
+        # lossless intermediate (ALAC) so ffmpeg seeks sample-accurately; the final format comes after
+        opts["external_downloader_args"] = {"ffmpeg_o": ["-vn", "-c:a", "alac", "-f", "mp4"]}
+    if extra_opts:
+        opts.update(extra_opts)
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            if section:
+                emit("status", "Downloading clip …")
+                emit("progress", None)
+            info = ydl.extract_info(url, download=True)
+    except ValueError:
+        raise
+    except Exception as ex:
+        if not section:
+            tail = ffmpeg_report_tail(t_start)
+            raise RuntimeError(clean_error(ex) + (f"\nffmpeg said:\n{tail}" if tail else "")) from ex
+        _note_fallback(ex, t_start, emit)
+        return [_full_then_cut_mp3(url, start, end, kbps, outdir, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit,
+                                   name=name, afmt=afmt)]
+
+    files = [Path(f) for f in collect_files(info)]
+    if not files:
+        raise RuntimeError("No file was downloaded.")
+    for f in files:
+        _v, a, _d = probe(ffprobe, f)
+        if ffprobe and a is None:
+            f.unlink(missing_ok=True)
+            raise RuntimeError("The file is empty – is the start time past the end of the video?")
+    return files
+
+
+def _full_then_cut_mp3(url, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, name=None, afmt="mp3"):
+    """Fallback for audio clips: whole track (with tags + cover), then cut locally without re-encoding."""
+    tmpdir = Path(outdir) / ".ytclip_tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    try:
+        src = download_mp3(url, None, None, kbps, tmpdir, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, afmt=afmt)[0]
+        _v, _a, dur = probe(ffprobe, src)
+        s, e = _clip_bounds(start, end, dur)
+        ext = "." + afmt
+        dst = Path(outdir) / (f"{safe_name(name)}{ext}" if name else f"{src.stem}{_suffix(start, end)}{ext}")
+        maps = {"mp3": ["-map", "0:a:0", "-map", "0:v?", "-c", "copy", "-id3v2_version", "3", "-write_id3v1", "1"],
+                "m4a": ["-map", "0:a:0", "-map", "0:v?", "-c", "copy", "-disposition:v", "attached_pic",
+                        "-movflags", "+faststart"],
+                "wav": ["-map", "0:a:0", "-c", "copy"]}[afmt]
+        cut_local(src, dst, s, e, maps, ffmpeg, emit, f"Cutting {afmt.upper()}")
+        _remove_leftovers(dst)
+        return dst
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def make_gif(url, start, end, width, fps, colors, outdir, *, ffmpeg, ffprobe, emit, name=None, extra_opts=None):
+    """Short clip -> animated GIF (two-pass palette for clean colors, loops forever)."""
+    tmpdir = Path(outdir) / ".ytclip_tmp_gif"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    try:
+        height = 1080 if width > 640 else 720
+        clip = download(url, start, end, height, DEFAULT_ENCODER, "Original", None, tmpdir,
+                        ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, extra_opts=extra_opts)[0]
+        _v, _a, dur = probe(ffprobe, clip)
+        if dur and dur > GIF_MAX + 0.5:
+            raise RuntimeError(f"GIFs can be at most {GIF_MAX} s long – set a shorter time range.")
+        dst = Path(outdir) / ((safe_name(name) if name else clip.stem) + ".gif")
+        return [gif_encode(clip, dst, None, None, dur, width, fps, colors, ffmpeg, emit)]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def gif_encode(src, dst, start, length, dur, width, fps, colors, ffmpeg, emit) -> Path:
+    """Two-pass palette GIF (clean colors, small file), loops forever."""
+    tmp = dst.with_name(dst.stem + ".part.gif")
+    vf = (f"fps={fps},scale=w='min({width},iw)':h=-1:flags=lanczos,split[a][b];"
+          f"[a]palettegen=max_colors={colors}:stats_mode=diff[p];"
+          f"[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle")
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    if length:
+        cmd += ["-t", f"{length:.3f}"]
+    cmd += ["-i", str(src), "-an", "-vf", vf, "-loop", "0", "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, length or dur, emit, "Creating GIF")
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+# ----------------------------------------------------------------------------- local files
+
+def local_path(text):
+    """Path of an existing local file (also accepts "quoted" paths and file:// URLs), else None."""
+    t = (text or "").strip().strip('"').strip("'")
+    if not t or ANY_URL.match(t):
+        return None
+    if t.lower().startswith("file:"):
+        from urllib.parse import unquote, urlparse
+        t = unquote(urlparse(t).path)
+        if re.match(r"^/[A-Za-z]:", t):
+            t = t[1:]
+    try:
+        p = Path(t)
+        return p if p.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def local_info(path, ffprobe) -> dict:
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries",
+         "stream=index,codec_type,codec_name,width,height,avg_frame_rate:stream_tags=language,title"
+         ":stream_disposition=attached_pic:format=duration", "-show_chapters", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+    streams = data.get("streams", [])
+    v = next((x for x in streams if x.get("codec_type") == "video"
+              and not (x.get("disposition") or {}).get("attached_pic")), None)
+    a = next((x for x in streams if x.get("codec_type") == "audio"), None)
+    if not v and not a:
+        raise RuntimeError("This file has no video or audio that FFmpeg can read.")
+    fps = None
+    if v and v.get("avg_frame_rate") not in (None, "0/0"):
+        try:
+            n, d = v["avg_frame_rate"].split("/")
+            fps = float(n) / float(d) if float(d) else None
+        except (ValueError, ZeroDivisionError):
+            fps = None
+    try:
+        dur = float(data.get("format", {}).get("duration") or 0) or None
+    except ValueError:
+        dur = None
+    chapters = []
+    for ch in data.get("chapters") or []:
+        try:
+            chapters.append((float(ch["start_time"]), float(ch["end_time"]), (ch.get("tags") or {}).get("title") or ""))
+        except (KeyError, ValueError):
+            pass
+    subs, k = [], 0
+    for x in streams:
+        if x.get("codec_type") != "subtitle":
+            continue
+        tags = x.get("tags") or {}
+        if x.get("codec_name") in SUB_TEXT_CODECS:
+            name = " · ".join(t for t in (tags.get("language"), tags.get("title")) if t) or f"Track {k + 1}"
+            subs.append({"label": f"{name} (in the file)", "kind": "embedded", "key": k})
+        k += 1
+    subs += sidecar_subs(path)
+    return {"duration": dur, "vcodec": v.get("codec_name") if v else None,
+            "acodec": a.get("codec_name") if a else None,
+            "width": v.get("width") if v else None, "height": v.get("height") if v else None, "fps": fps,
+            "chapters": chapters, "subs": subs}
+
+
+def grab_frame(path, t, ffmpeg, width=None) -> bytes | None:
+    """One frame as JPEG bytes."""
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(path),
+           "-frames:v", "1"]
+    if width:
+        cmd += ["-vf", f"scale='min({width},iw)':-2"]
+    cmd += ["-q:v", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout[:2] == b"\xff\xd8" else None
+
+
+def _local_dst(src, outdir, name, start, end, ext) -> Path:
+    dst = Path(outdir) / ((safe_name(name) if name else f"{Path(src).stem}{_suffix(start, end)}") + ext)
+    if dst.resolve() == Path(src).resolve():  # never overwrite the source
+        dst = dst.with_name(unique_name(dst.parent, dst.stem, ext) + ext)
+    return dst
+
+
+def local_mp4(src, start, end, height, encoder, size, target_mb, outdir, *, ffmpeg, ffprobe, emit, name=None,
+              codec="h264", profile=None):
+    """Cut / convert a local file to H.264/H.265 MP4 or ProRes MOV (frame-accurate)."""
+    src = Path(src)
+    info = local_info(src, ffprobe)
+    if not info["vcodec"]:
+        raise RuntimeError("This file has no video – choose Audio instead.")
+    dur = info["duration"]
+    s, e = _clip_bounds(start, end, dur)
+    whole = not s and (e is None or (dur and e >= dur - 0.01))
+    encoder = check_encoder(encoder, ffmpeg, emit, codec)
+    dst = _local_dst(src, outdir, name, start, end, video_ext(codec))
+    too_big = bool(height and info["height"] and info["height"] > height)
+    if (whole and codec in ("h264", "hevc") and SIZES.get(size) is None and info["vcodec"] == codec
+            and info["acodec"] in ("aac", None) and not too_big):
+        args, label_ = ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart"], "Remuxing"
+    else:
+        length = ((e if e is not None else dur) or 0) - s or None
+        vargs, aargs = encode_args(encoder, size, target_mb, length, codec, profile)
+        vf = ["-vf", f"scale=-2:{height}"] if too_big else []
+        args = ["-map", "0:v:0", "-map", "0:a:0?", *vf, *vargs, *aargs, "-movflags", "+faststart"]
+        what = "ProRes" if codec == "prores" else ("H.265" if codec == "hevc" else "H.264")
+        label_ = f"Encoding {what}" + ("" if codec == "prores" or size == "_piece" else f" ({size})")
+    emit("status", f"{label_} …")
+    return [cut_local(src, dst, s, None if whole else e, args, ffmpeg, emit, label_)]
+
+
+def local_mp3(src, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, name=None, afmt="mp3"):
+    """Audio of a local file -> MP3 / M4A (title tag + a video frame as cover) or WAV."""
+    src = Path(src)
+    info = local_info(src, ffprobe)
+    if not info["acodec"]:
+        raise RuntimeError("This file has no audio track.")
+    dur = info["duration"]
+    s, e = _clip_bounds(start, end, dur)
+    length = (e - s) if e is not None else None
+    ext = "." + afmt
+    dst = _local_dst(src, outdir, name, start, end, ext)
+    tmp = dst.with_name(dst.stem + ".part" + ext)
+    cover = None
+    if info["vcodec"] and afmt != "wav":
+        span = length or ((dur or 2) - s)
+        data = grab_frame(src, s + min(1.0, span / 2), ffmpeg, width=800)
+        if data:
+            cover = dst.with_name(dst.stem + ".cover.jpg")
+            cover.write_bytes(data)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if s:
+        cmd += ["-ss", f"{s:.3f}"]
+    if length:
+        cmd += ["-t", f"{length:.3f}"]
+    cmd += ["-i", str(src)]
+    if cover:
+        cmd += ["-i", str(cover)]
+    cmd += ["-map", "0:a:0"]
+    if cover:
+        cmd += ["-map", "1:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+        if afmt == "mp3":
+            cmd += ["-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+    if afmt == "mp3":
+        cmd += ["-c:a", "libmp3lame", "-b:a", f"{kbps}k", "-id3v2_version", "3", "-write_id3v1", "1"]
+    elif afmt == "m4a":
+        cmd += (["-c:a", "copy"] if info["acodec"] == "aac" else ["-c:a", "aac", "-b:a", f"{kbps}k"])
+        cmd += ["-movflags", "+faststart"]
+    else:  # wav: 24-bit if the source is lossless, else 16-bit
+        lossless = info["acodec"] and (info["acodec"].startswith("pcm_") or info["acodec"] in ("flac", "alac", "truehd"))
+        cmd += ["-c:a", "pcm_s24le" if lossless else "pcm_s16le"]
+    cmd += ["-metadata", f"title={dst.stem}", "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, length or ((dur or 0) - s) or None, emit, f"Converting to {afmt.upper()}")
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+        if cover:
+            cover.unlink(missing_ok=True)
+    return [dst]
+
+
+def local_gif(src, start, end, width, fps, colors, outdir, *, ffmpeg, ffprobe, emit, name=None):
+    src = Path(src)
+    info = local_info(src, ffprobe)
+    if not info["vcodec"]:
+        raise RuntimeError("This file has no video – a GIF needs a picture.")
+    dur = info["duration"]
+    s, e = _clip_bounds(start, end, dur)
+    end_t = e if e is not None else dur
+    if end_t is None:
+        raise RuntimeError(f"Set a time range for the GIF (max {GIF_MAX} s).")
+    length = end_t - s
+    if length > GIF_MAX + 0.01:
+        raise RuntimeError(f"GIFs can be at most {GIF_MAX} s long – set a shorter time range.")
+    dst = _local_dst(src, outdir, name, start, end, ".gif")
+    return [gif_encode(src, dst, s, length, length, width, fps, colors, ffmpeg, emit)]
+
+
+# ----------------------------------------------------------------------------- thumbnails
+
+def save_jpg(data: bytes, dst: Path, ffmpeg) -> Path:
+    """Write image bytes as JPG (converts WebP/PNG with ffmpeg)."""
+    if data[:3] == b"\xff\xd8\xff":
+        dst.write_bytes(data)
+        return dst
+    tmp = dst.with_name(dst.stem + ".src.img")
+    tmp.write_bytes(data)
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(tmp), "-q:v", "2",
+                            str(dst)], capture_output=True, timeout=60, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError("Could not convert the thumbnail to JPG.")
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def save_thumbnail(source, dst: Path, *, ffmpeg, info=None, at=0.0) -> Path:
+    """Best available YouTube thumbnail -> JPG, or for local files a full-size frame at `at` seconds."""
+    lp = local_path(source)
+    if lp:
+        data = grab_frame(lp, at, ffmpeg)
+        if not data:
+            raise RuntimeError("Could not read a frame from the file.")
+        dst.write_bytes(data)
+        return dst
+    info = info or fetch_info(source)
+    for u in info.get("thumbs") or ([info["thumb"]] if info.get("thumb") else []):
+        try:
+            data = fetch_bytes(u)
+        except Exception:  # noqa: BLE001 - try the next (smaller) one
+            continue
+        if data:
+            return save_jpg(data, dst, ffmpeg)
+    raise RuntimeError("No thumbnail found for this video.")
+
+
+class _Silent:
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
+def fetch_info(url: str) -> dict:
+    """Title, channel, duration and thumbnail URL for the preview card."""
+    from yt_dlp import YoutubeDL
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+            "extract_flat": "in_playlist", "logger": _Silent(), **YDL_EXTRA}
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = info.get("entries")
+    vids = [f for f in info.get("formats") or [] if f.get("vcodec") not in (None, "none") and f.get("height")]
+    best = max(vids, key=lambda f: (f.get("height") or 0, f.get("width") or 0), default=None)
+    return {
+        "id": info.get("id") or "",
+        "site": info.get("extractor_key") or info.get("extractor") or "",
+        "width": (best or {}).get("width") or info.get("width"),
+        "height": (best or {}).get("height") or info.get("height"),
+        "chapters": [(float(c.get("start_time") or 0), float(c.get("end_time") or 0), c.get("title") or "")
+                     for c in info.get("chapters") or [] if c.get("end_time")],
+        "subs": list_subs(info),
+        "title": info.get("title") or "",
+        "channel": info.get("channel") or info.get("uploader") or "",
+        "duration": float(info["duration"]) if info.get("duration") else None,
+        "thumb": pick_thumb(info),
+        "thumbs": [t["url"] for t in reversed(info.get("thumbnails") or []) if t.get("url")],
+        "playlist": len(list(entries)) if entries is not None else 0,
+        "fps": info.get("fps") or max((f.get("fps") or 0 for f in info.get("formats") or []), default=0) or None,
+        "stream": pick_streams(info) if entries is None else None,
+    }
+
+
+def pick_thumb(info: dict) -> str | None:
+    """Prefer a JPG thumbnail (Qt can always decode those), biggest up to 1280 px wide."""
+    thumbs = [t for t in (info.get("thumbnails") or []) if t.get("url")]
+    jpgs = [t for t in thumbs if t["url"].split("?")[0].lower().endswith(".jpg")
+            and (t.get("width") or 0) <= 1280]
+    if jpgs:
+        jpgs.sort(key=lambda t: ((t.get("width") or 0), t.get("preference") or 0))
+        return jpgs[-1]["url"]
+    url = info.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None)
+    if url and "i.ytimg.com" in url:
+        url = url.replace("/vi_webp/", "/vi/").replace(".webp", ".jpg")
+    return url
+
+
+def fetch_bytes(url: str, timeout: float = 15.0) -> bytes:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def update_ytdlp(emit) -> bool:
+    py = Path(sys.executable)
+    if py.name.lower() == "pythonw.exe" and py.with_name("python.exe").exists():
+        py = py.with_name("python.exe")
+    emit("log", "Checking for yt-dlp update …")
+    base = [str(py), "-m", "pip", "install", "-U", "-q", "--disable-pip-version-check", "yt-dlp[default]"]
+    r = None
+    for extra in ([], ["--user"]):
+        r = subprocess.run(base + extra, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", creationflags=NO_WINDOW)
+        if r.returncode == 0:
+            break
+    else:
+        emit("log", "yt-dlp update failed:\n" + ((r.stderr or r.stdout) if r else "").strip()[-600:])
+        return False
+    v = subprocess.run([str(py), "-m", "yt_dlp", "--version"], capture_output=True, text=True,
+                       creationflags=NO_WINDOW)
+    emit("log", f"yt-dlp {v.stdout.strip()} is up to date.")
+    return True
+
+

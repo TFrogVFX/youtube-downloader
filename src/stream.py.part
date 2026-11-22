@@ -1,0 +1,160 @@
+
+
+# ----------------------------------------------------------------------------- streamed preview (no download)
+
+STREAM_CHUNK = 2 * 1024 * 1024   # bytes per request to YouTube (big open requests get throttled)
+
+
+def _stream_fmt(f, info) -> dict:
+    hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
+            if k.lower() not in ("accept-encoding", "range")}
+    ck = _cookie_header(f.get("cookies") or info.get("cookies"))   # TikTok & co. need their cookies
+    if ck:
+        hdrs["Cookie"] = ck
+    return {"url": f["url"], "headers": hdrs, "size": f.get("filesize") or None, "ext": f.get("ext") or "mp4",
+            "height": f.get("height"), "fps": f.get("fps")}
+
+
+def pick_streams(info) -> dict | None:
+    """Plain HTTP files of the video for the player: one with picture + sound if there is one (≤720p),
+    else a picture-only file (around 480p, H.264 preferred) plus a sound-only file."""
+    fmts = [f for f in info.get("formats") or []
+            if f.get("url") and str(f.get("protocol") or "") in ("http", "https")
+            and not f.get("fragments") and f.get("ext") in ("mp4", "webm", "m4a")]
+
+    def has_v(f):
+        return f.get("vcodec") not in (None, "none")
+
+    def has_a(f):
+        return f.get("acodec") not in (None, "none")
+
+    def short(f):   # vertical videos (TikTok, Reels, Shorts): the short side counts
+        w, h = f.get("width") or 0, f.get("height") or 0
+        return min(w, h) if w and h else h
+
+    def vrank(f):
+        h = short(f)
+        return (abs(min(h, 720) - 480) if h else 9999, 0 if str(f.get("vcodec") or "").startswith("avc") else 1,
+                f.get("tbr") or 0)
+
+    both = [f for f in fmts if has_v(f) and has_a(f) and short(f) <= 720]
+    if both:
+        best = min(both, key=vrank)
+        return {"video": _stream_fmt(best, info), "audio": None, "fps": best.get("fps")}
+    vids = [f for f in fmts if has_v(f) and not has_a(f) and short(f) <= 720]
+    auds = [f for f in fmts if has_a(f) and not has_v(f)]
+    if not vids:
+        big = [f for f in fmts if has_v(f) and has_a(f)]      # only big files with picture + sound: take the smallest
+        if not big:
+            return None
+        best = min(big, key=lambda f: (short(f) or 9999, f.get("tbr") or 0))
+        return {"video": _stream_fmt(best, info), "audio": None, "fps": best.get("fps")}
+    v = min(vids, key=vrank)
+    a = min(auds, key=lambda f: (0 if f.get("ext") == "m4a" else 1, abs((f.get("abr") or 128) - 128))) if auds else None
+    return {"video": _stream_fmt(v, info), "audio": _stream_fmt(a, info) if a else None, "fps": v.get("fps")}
+
+
+class StreamProxy:
+    """Tiny local web server for the player: it asks for byte ranges, the proxy fetches them from YouTube in
+    small pieces (with the same headers yt-dlp uses). Nothing is written to disk, there are no ads."""
+
+    def __init__(self):
+        import http.server
+        proxy = self
+        self.items: dict[str, dict] = {}
+        self._n = 0
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_HEAD(self):
+                proxy._serve(self, head=True)
+
+            def do_GET(self):
+                proxy._serve(self, head=False)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def add(self, item: dict) -> str:
+        self._n += 1
+        key = f"s{self._n}"
+        self.items[key] = dict(item)
+        return f"http://127.0.0.1:{self.port}/{key}.{item.get('ext') or 'mp4'}"
+
+    def close(self):
+        try:
+            self.server.shutdown()
+            self.server.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _open(item, a, b):
+        import urllib.request
+        req = urllib.request.Request(item["url"], headers={**item["headers"], "Range": f"bytes={a}-{b}"})
+        return urllib.request.urlopen(req, timeout=20)
+
+    def _size(self, item) -> int:
+        if not item.get("size"):
+            with self._open(item, 0, 0) as r:
+                m = re.search(r"/(\d+)", r.headers.get("Content-Range", ""))
+                item["size"] = int(m.group(1)) if m else int(r.headers.get("Content-Length") or 0)
+        return int(item["size"])
+
+    def _serve(self, h, head):
+        item = self.items.get(h.path.lstrip("/").split(".")[0])
+        if item is None:
+            h.send_error(404)
+            return
+        try:
+            total = self._size(item)
+        except Exception:  # noqa: BLE001 - expired link, no internet …
+            h.send_error(502)
+            return
+        m = re.match(r"bytes=(\d*)-(\d*)", h.headers.get("Range") or "")
+        start, end = 0, total - 1
+        if m and m.group(1):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total - 1
+        elif m and m.group(2):
+            start = max(0, total - int(m.group(2)))
+        end = min(end, total - 1)
+        if start > end:
+            h.send_response(416)
+            h.send_header("Content-Range", f"bytes */{total}")
+            h.send_header("Content-Length", "0")
+            h.end_headers()
+            return
+        h.send_response(206 if m else 200)
+        h.send_header("Content-Type", {"mp4": "video/mp4", "m4a": "audio/mp4", "webm": "video/webm"}
+                      .get(item.get("ext"), "application/octet-stream"))
+        h.send_header("Accept-Ranges", "bytes")
+        h.send_header("Content-Length", str(end - start + 1))
+        if m:
+            h.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        h.end_headers()
+        if head:
+            return
+        pos = start
+        try:
+            while pos <= end:
+                b = min(end, pos + STREAM_CHUNK - 1)
+                with self._open(item, pos, b) as r:
+                    while True:
+                        data = r.read(65536)
+                        if not data:
+                            break
+                        h.wfile.write(data)
+                        pos += len(data)
+                if pos <= b:          # YouTube sent less than asked -> stop cleanly
+                    break
+        except OSError:               # the player jumped elsewhere or stopped - normal
+            pass
+        if pos <= end:
+            h.close_connection = True

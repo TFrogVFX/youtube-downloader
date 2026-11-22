@@ -1,0 +1,280 @@
+
+
+# ----------------------------------------------------------------------------- video preview for the player
+
+PREVIEW_HEIGHT = 360
+PREVIEW_AUTO_MAX = 20 * 60       # load the preview by itself for videos up to 20 minutes
+PREVIEW_MB_PER_MIN = 4.0         # rough size of the 360p preview (for the "≈ N MB" hint)
+
+
+def preview_video(url, outdir, *, ffmpeg, emit) -> Path:
+    """Small (≤360p) copy of a YouTube video for the built-in player. H.264/AAC is preferred
+    (plays everywhere); yt-dlp does the downloading, so it works wherever downloads work."""
+    from yt_dlp import YoutubeDL
+    opts = _base_opts(outdir, "", False, emit, name="preview")
+    opts.update({
+        "format": f"bv*[height<={PREVIEW_HEIGHT}]+ba/b[height<={PREVIEW_HEIGHT}]/wv*+wa/w",
+        "format_sort": [f"res:{PREVIEW_HEIGHT}", "vcodec:h264", "acodec:aac", "+size"],
+        "merge_output_format": "mp4/mkv",
+        "overwrites": True,
+    })
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("The preview could not be downloaded.")
+    return Path(files[0])
+
+
+# ----------------------------------------------------------------------------- several clips
+
+def _sub_emit(emit, k, n, label):
+    """Progress of step k of n -> overall progress; status gets a 'Clip 2/3 · ' prefix."""
+    def sub(kind, val=None):
+        if kind == "progress":
+            emit("progress", None if val is None else (k + min(100.0, float(val)) / 100.0) / n * 100.0)
+        elif kind == "status":
+            emit("status", f"{label} · {val}")
+        else:
+            emit(kind, val)
+    return sub
+
+
+def _single_export(kind, src, s, e, outdir, local, p, name, ffmpeg, ffprobe, emit):
+    kw = dict(ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, name=name)
+    if kind == "mp4":
+        fn = local_mp4 if local else download
+        return fn(src, s, e, p["height"], p["encoder"], p["size"], p["target_mb"], outdir,
+                  codec=p["codec"], profile=p["profile"], **kw)
+    if kind == "mp3":
+        fn = local_mp3 if local else download_mp3
+        return fn(src, s, e, p["kbps"], outdir, afmt=p["afmt"], **kw)
+    fn = local_gif if local else make_gif
+    return fn(src, s, e, p["width"], p["fps"], p["colors"], outdir, **kw)
+
+
+def _kind_ext(kind, p):
+    if kind == "mp4":
+        return video_ext(p["codec"])
+    if kind == "mp3":
+        return "." + p["afmt"]
+    return ".gif"
+
+
+def _piece(kind, src, s, e, tmp, k, local, p, ffmpeg, ffprobe, emit) -> Path:
+    """One clip in a good intermediate quality (it gets encoded once more when joining)."""
+    kw = dict(ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, name=f"piece_{k:02d}")
+    if kind == "mp3":
+        fn = local_mp3 if local else download_mp3
+        return fn(src, s, e, 320, tmp, afmt="wav", **kw)[0]
+    height = p.get("height") if kind == "mp4" else (1080 if p.get("width", 480) > 640 else 720)
+    enc = p.get("encoder", DEFAULT_ENCODER) if kind == "mp4" else DEFAULT_ENCODER
+    fn = local_mp4 if local else download
+    return fn(src, s, e, height, enc, "_piece", None, tmp, codec="h264", **kw)[0]
+
+
+def media_info(path, ffprobe) -> dict:
+    """Size, frame rate and sample rate of a piece."""
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,duration"
+         ":stream_disposition=attached_pic:format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+    streams = data.get("streams", [])
+    v = next((x for x in streams if x.get("codec_type") == "video"
+              and not (x.get("disposition") or {}).get("attached_pic")), None)
+    a = next((x for x in streams if x.get("codec_type") == "audio"), None)
+    rate = (v or {}).get("r_frame_rate") or "30/1"
+    if rate in ("0/0", "0/1"):
+        rate = "30/1"
+    try:
+        dur = float(data.get("format", {}).get("duration") or 0)
+    except ValueError:
+        dur = 0.0
+    def _d(x):
+        try:
+            return float((x or {}).get("duration") or 0) or dur
+        except ValueError:
+            return dur
+    return {"duration": dur, "vdur": _d(v), "adur": _d(a), "video": bool(v), "audio": bool(a),
+            "width": (v or {}).get("width"),
+            "height": (v or {}).get("height"), "rate": rate,
+            "sr": int((a or {}).get("sample_rate") or 48000), "acodec": (a or {}).get("codec_name")}
+
+
+def _audio_chain(i, dur, sr, exact=False, extra=""):
+    """Same format for every piece + 10 ms fades at the cuts (no clicks). exact: audio gets exactly
+    `dur` long (the video length) - otherwise AAC padding would push the next clip by a frame.
+    extra: more filters (e.g. the volume curve), time 0 = start of the piece."""
+    fo = max(0.0, dur - 0.012)
+    fit = f"apad=whole_dur={dur:.6f},atrim=duration={dur:.6f}," if exact else ""
+    ex = f"{extra}," if extra else ""
+    return (f"[{i}:a:0]aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,"
+            f"{fit}{ex}afade=t=in:d=0.01,afade=t=out:st={fo:.3f}:d=0.01[a{i}]")
+
+
+def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, label="Joining clips",
+               crops=None, size=None, afx=None, post_vf="", sub_track=None, sub_lang=None, cwd=None,
+               infos=None) -> Path:
+    """Puts the pieces one after another (frame-accurate, one encode). All pieces get the size and
+    frame rate of the first one.
+    crops: per piece None or (w, h, x, y) in pixels · size: (w, h) of the result · afx: per piece extra audio
+    filters · post_vf: filter on the joined picture (burned-in subtitles) · sub_track: .srt as subtitle track.
+    File names in post_vf / sub_track are relative to `cwd`."""
+    infos = infos or [media_info(p, ffprobe) for p in pieces]
+    first = infos[0]
+    if not first["video"]:
+        raise RuntimeError("The clips have no video.")
+    w, h, rate = first["width"], first["height"], first["rate"]
+    if size:
+        w, h = size
+    has_a = audio and all(i["audio"] for i in infos)
+    total = sum(i["vdur"] for i in infos)
+    parts, labels = [], ""
+    for i, inf in enumerate(infos):
+        fps = "" if inf["rate"] == rate else f"fps={rate},"   # fps adds a frame at the end -> only if needed
+        cr = (crops or [None] * len(infos))[i]
+        crop = f"crop={cr[0]}:{cr[1]}:{cr[2]}:{cr[3]}," if cr else ""
+        parts.append(f"[{i}:v:0]{crop}scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                     f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,{fps}setpts=PTS-STARTPTS[v{i}]")
+        if has_a:
+            parts.append(_audio_chain(i, inf["vdur"], first["sr"], exact=True, extra=(afx or [""] * len(infos))[i]))
+        labels += f"[v{i}]" + (f"[a{i}]" if has_a else "")
+    vout = "[vc]" if post_vf else "[v]"
+    graph = ";".join(parts) + f";{labels}concat=n={len(pieces)}:v=1:a={1 if has_a else 0}{vout}" + ("[a]" if has_a else "")
+    if post_vf:
+        graph += f";[vc]{post_vf}[v]"
+    tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for p in pieces:
+        cmd += ["-i", str(p)]
+    if sub_track:
+        cmd += ["-i", str(sub_track)]
+    cmd += ["-filter_complex", graph, "-map", "[v]"]
+    if has_a:
+        cmd += ["-map", "[a]"]
+    if sub_track:
+        cmd += ["-map", f"{len(pieces)}:s", "-c:s", "mov_text"]
+        if sub_lang:
+            cmd += ["-metadata:s:s:0", f"language={_iso639_2(sub_lang)}"]
+    cmd += [*vargs, *(aargs if has_a else ["-an"]), "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, total, emit, label, cwd=cwd)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def join_audio(pieces, dst, *, afmt, kbps, ffmpeg, ffprobe, emit, title=None, cover=None, afx=None,
+               label="Joining clips") -> Path:
+    infos = [media_info(p, ffprobe) for p in pieces]
+    sr = infos[0]["sr"]
+    total = sum(i["duration"] for i in infos)
+    graph = ";".join(_audio_chain(i, inf["adur"], sr, extra=(afx or [""] * len(infos))[i])
+                     for i, inf in enumerate(infos))
+    graph += ";" + "".join(f"[a{i}]" for i in range(len(pieces))) + f"concat=n={len(pieces)}:v=0:a=1[a]"
+    tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for p in pieces:
+        cmd += ["-i", str(p)]
+    use_cover = bool(cover) and afmt in ("mp3", "m4a")
+    if use_cover:
+        cmd += ["-i", str(cover)]
+    cmd += ["-filter_complex", graph, "-map", "[a]"]
+    if use_cover:
+        cmd += ["-map", f"{len(pieces)}:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+    if afmt == "mp3":
+        cmd += ["-c:a", "libmp3lame", "-b:a", f"{kbps}k", "-id3v2_version", "3", "-write_id3v1", "1"]
+    elif afmt == "m4a":
+        cmd += ["-c:a", "aac", "-b:a", f"{kbps}k", "-movflags", "+faststart"]
+    else:
+        s24 = any(str(i["acodec"]).endswith("24le") for i in infos)
+        cmd += ["-c:a", "pcm_s24le" if s24 else "pcm_s16le"]
+    if title:
+        cmd += ["-metadata", f"title={title}"]
+    cmd += ["-progress", "pipe:1", "-nostats", str(tmp)]
+    emit("progress", 0)
+    try:
+        run_encode(cmd, total, emit, label)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
+
+
+def export_multi(kind, src, clips, outdir, *, local, join, name, params, ffmpeg, ffprobe, emit, info=None, fx=None):
+    """Several clips of one source -> one file (clips one after another) or one file per clip.
+    kind: 'mp4' | 'mp3' | 'gif'   clips: [(start, end[, label]), ...] in seconds   params: settings of the format.
+    fx: crop / output size / upscaling / volume curve / subtitles (see export_fx)."""
+    labels = [str(c[2]) if len(c) > 2 and c[2] else "" for c in clips]
+    clips = [(float(c[0] or 0.0), float(c[1])) for c in clips]
+    if not clips:
+        raise RuntimeError("Add at least one clip.")
+    for s, e in clips:
+        if e <= s:
+            raise RuntimeError(f"Clip {fmt_t(s)} – {fmt_t(e)}: the end must be after the start.")
+    n = len(clips)
+    outdir = Path(outdir)
+    ext = _kind_ext(kind, params)
+    if kind == "gif":
+        too_long = [k + 1 for k, (s, e) in enumerate(clips) if e - s > GIF_MAX + 0.01]
+        if join and sum(e - s for s, e in clips) > GIF_MAX + 0.01:
+            raise RuntimeError(f"Joined GIFs can be at most {GIF_MAX} s – shorten or remove clips.")
+        if not join and too_long:
+            raise RuntimeError(f"GIFs can be at most {GIF_MAX} s – clip {too_long[0]} is longer.")
+
+    if fx_needed(kind, fx):
+        return export_fx(kind, src, clips, labels, outdir, local=local, join=join, name=name, params=params,
+                         fx=fx, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=emit, info=info)
+    if not join:
+        files = []
+        for k, (s, e) in enumerate(clips):
+            nm = unique_name(outdir, clip_file_name(name, k, labels[k]), ext) if name else None
+            files += _single_export(kind, src, s, e, outdir, local, params, nm, ffmpeg, ffprobe,
+                                    _sub_emit(emit, k, n, f"Clip {k + 1}/{n}"))
+        return [Path(f) for f in files]
+
+    tmp = outdir / f".ytclip_join_{os.getpid()}_{int(time.time() * 1000) % 100000}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        pieces = []
+        for k, (s, e) in enumerate(clips):
+            pieces.append(_piece(kind, src, s, e, tmp, k, local, params, ffmpeg, ffprobe,
+                                 _sub_emit(emit, k, n + 1, f"Clip {k + 1}/{n}")))
+        jemit = _sub_emit(emit, n, n + 1, "Joining")
+        dst = outdir / ((safe_name(name) if name else "clips") + ext)
+        if kind == "mp4":
+            codec, profile = params["codec"], params["profile"]
+            enc = check_encoder(params["encoder"], ffmpeg, emit, codec)
+            total = sum(e - s for s, e in clips)
+            vargs, aargs = encode_args(enc, params["size"], params["target_mb"], total, codec, profile)
+            jemit("status", f"{n} clips …")
+            return [join_video(pieces, dst, vargs=vargs, aargs=aargs, ffmpeg=ffmpeg, ffprobe=ffprobe, emit=jemit)]
+        if kind == "mp3":
+            cover = None
+            if params["afmt"] in ("mp3", "m4a"):
+                try:
+                    at = clips[0][0] + min(1.0, (clips[0][1] - clips[0][0]) / 2)
+                    cover = save_thumbnail(src if not local else str(src), tmp / "cover.jpg", ffmpeg=ffmpeg,
+                                           info=info, at=at)
+                except Exception:  # noqa: BLE001 - no cover is fine
+                    cover = None
+            return [join_audio(pieces, dst, afmt=params["afmt"], kbps=params["kbps"], ffmpeg=ffmpeg,
+                               ffprobe=ffprobe, emit=jemit, title=dst.stem, cover=cover)]
+        # GIF: join to a clean intermediate, then the usual two-pass palette
+        mid = tmp / "joined.mp4"
+        join_video(pieces, mid, vargs=["-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-pix_fmt", "yuv420p"],
+                   aargs=[], ffmpeg=ffmpeg, ffprobe=ffprobe, emit=_sub_emit(emit, n, n + 2, "Joining"), audio=False)
+        dur = media_info(mid, ffprobe)["duration"]
+        return [gif_encode(mid, dst, None, None, dur, params["width"], params["fps"], params["colors"], ffmpeg,
+                           _sub_emit(emit, n + 1, n + 2, "GIF"))]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
