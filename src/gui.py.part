@@ -1365,14 +1365,18 @@ class SubsEditor(QtWidgets.QDialog):
         self.table.setHorizontalHeaderLabels(self.COLS)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(32)
-        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hh = self.table.horizontalHeader()      # fixed widths: "resize to contents" re-measures every row on each edit
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        tw = QtGui.QFontMetrics(self.table.font()).horizontalAdvance("0:00:00.00") + 26
+        self.table.setColumnWidth(0, tw)
+        self.table.setColumnWidth(1, tw)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
                                    | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed)
         self.table.itemChanged.connect(self._edited)
-        self.table.currentCellChanged.connect(lambda r, _c, _r2, _c2: self._jump(r))
+        self.table.cellClicked.connect(lambda r, _c: self._jump(r))
         lay.addWidget(self.table, 1)
         r1 = QtWidgets.QHBoxLayout()
         r1.setSpacing(6)
@@ -1421,20 +1425,56 @@ class SubsEditor(QtWidgets.QDialog):
         lay.addLayout(bot)
         self._fill()
 
+    @staticmethod
+    def _cells(c):
+        return fmt_tc(c[0]), fmt_tc(c[1]), c[2].replace("\n", " / ")
+
     def _fill(self, select=None):
+        """Builds the whole table (only when lines are added or change their order)."""
         self._busy = True
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        self.table.clearContents()
         self.table.setRowCount(len(self.cues))
-        for r, (s0, e0, txt) in enumerate(self.cues):
-            for col, val in enumerate((fmt_tc(s0), fmt_tc(e0), txt.replace("\n", " / "))):
+        for r, c in enumerate(self.cues):
+            for col, val in enumerate(self._cells(c)):
                 it = QtWidgets.QTableWidgetItem(val)
                 if col < 2:
                     it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(r, col, it)
+        self.table.blockSignals(False)
+        self.table.setUpdatesEnabled(True)
         self._busy = False
         self.count.setText(f"{len(self.cues)} lines")
         self._filter(self.search.text())
         if select is not None and 0 <= select < len(self.cues):
             self.table.selectRow(select)
+            self.table.scrollToItem(self.table.item(select, 0))
+
+    def _update_row(self, r):
+        """Only this row's cells – fast, whatever the number of lines."""
+        self._busy = True
+        self.table.blockSignals(True)
+        for col, val in enumerate(self._cells(self.cues[r])):
+            it = self.table.item(r, col)
+            if it is not None and it.text() != val:
+                it.setText(val)
+        self.table.blockSignals(False)
+        self._busy = False
+
+    def _send(self):
+        self.changed.emit([(round(a, 3), round(b, 3), t) for a, b, t in self.cues if b > a and t.strip()])
+
+    def _emit_one(self, c):
+        """A line was changed: update its row – the table is only rebuilt if the order changed."""
+        r = self.cues.index(c)
+        self.cues.sort(key=lambda x: x[0])
+        r2 = self.cues.index(c)
+        if r2 == r:
+            self._update_row(r)
+        else:
+            self._fill(r2)
+        self._send()
 
     def _filter(self, text):
         t = text.strip().lower()
@@ -1445,7 +1485,7 @@ class SubsEditor(QtWidgets.QDialog):
     def _emit(self, select=None):
         self.cues.sort(key=lambda c: c[0])
         self._fill(select)
-        self.changed.emit([(round(a, 3), round(b, 3), t) for a, b, t in self.cues if b > a and t.strip()])
+        self._send()
 
     def _edited(self, it):
         if self._busy:
@@ -1461,7 +1501,7 @@ class SubsEditor(QtWidgets.QDialog):
                     raise ValueError
             except ValueError:
                 QtWidgets.QApplication.beep()
-                self._fill(r)
+                self._update_row(r)
                 return
             c[col] = v
             if c[1] <= c[0]:
@@ -1469,7 +1509,7 @@ class SubsEditor(QtWidgets.QDialog):
                 c[0] = min(c[0], c[1] - 0.1)
         else:
             c[2] = "\n".join(x.strip() for x in it.text().split(" / ")).strip()
-        self._emit(self.cues.index(c))
+        self._emit_one(c)
 
     def _rows(self):
         return sorted({i.row() for i in self.table.selectedIndexes()})
@@ -1494,7 +1534,16 @@ class SubsEditor(QtWidgets.QDialog):
         if not rows:
             return
         self.cues = [c for i, c in enumerate(self.cues) if i not in rows]
-        self._emit(min(rows[0], len(self.cues) - 1))
+        self._busy = True
+        self.table.blockSignals(True)
+        for r in reversed(rows):
+            self.table.removeRow(r)
+        self.table.blockSignals(False)
+        self._busy = False
+        self.count.setText(f"{len(self.cues)} lines")
+        if self.cues:
+            self.table.selectRow(min(rows[0], len(self.cues) - 1))
+        self._send()
 
     def _set_time(self, col):
         rows = self._rows()
@@ -1508,7 +1557,7 @@ class SubsEditor(QtWidgets.QDialog):
                 c[1] = c[0] + 1.0
             else:
                 c[0] = max(0.0, c[1] - 1.0)
-        self._emit(self.cues.index(c))
+        self._emit_one(c)
 
     def _shift(self):
         try:
@@ -1764,11 +1813,13 @@ class SettingsDialog(QtWidgets.QDialog):
         tip(self.cb_browser, "Browser login",
             "Uses your YouTube login from this browser – needed for age-restricted or members-only videos. Sign in to "
             "YouTube in that browser first. Firefox works best; Chrome / Edge sometimes refuse while they are open.")
-        self.cb_browser.currentTextChanged.connect(lambda t: parent._set_browser(t))
+        self.cb_browser.currentTextChanged.connect(self._browser_changed)
         br.addWidget(label("Use the login from", "field"))
         br.addWidget(self.cb_browser, 1)
         right.addLayout(br)
-        right.addWidget(label("Only needed for age-restricted or members-only videos.", "hint"))
+        self.lbl_login = label("Only needed for age-restricted or members-only videos.", "hint")
+        self.lbl_login.setWordWrap(True)
+        right.addWidget(self.lbl_login)
         right.addSpacing(4)
         right.addWidget(section("AI upscaler"))
         self.lbl_esr = label("", "muted")
@@ -1798,6 +1849,7 @@ class SettingsDialog(QtWidgets.QDialog):
         right.addStretch(1)
         self.refresh_esr()
         self._fill_own()
+        self.show_login_state()
 
         bot = QtWidgets.QHBoxLayout()
         reset = tip(QtWidgets.QPushButton("Reset to default"), "Reset to default",
@@ -1814,6 +1866,24 @@ class SettingsDialog(QtWidgets.QDialog):
         outer.addLayout(bot)
         self._sync()
 
+    def _browser_changed(self, name):
+        self.main._set_browser(name)
+        self.show_login_state()
+
+    def show_login_state(self):
+        name = self.cb_browser.currentText()
+        prob = getattr(self.main, "login_problem", "")
+        if name == "Off":
+            txt, st = "Only needed for age-restricted or members-only videos.", ""
+        elif prob:
+            txt, st = prob.replace(f"Browser login ({name}) doesn't work: ", "✕ ") + "  Not used right now.", "error"
+        elif YDL_EXTRA:
+            txt, st = f"Checking / using your YouTube login from {name}. Firefox works best.", ""
+        else:
+            txt, st = "Not used.", ""
+        self.lbl_login.setText(txt)
+        set_state(self.lbl_login, st)
+
     def refresh_esr(self):
         busy = self.main._esr_job is not None
         exe = upscaler_exe()
@@ -1822,7 +1892,8 @@ class SettingsDialog(QtWidgets.QDialog):
             self.btn_esr.setText("Installing …")
             self.btn_esr.setEnabled(False)
         elif exe:
-            self.lbl_esr.setText("✓ Real-ESRGAN is installed (photo + anime models). Pick “AI” under Frame → Enlarge.")
+            self.lbl_esr.setText("✓ Real-ESRGAN is installed (photo + anime models). Pick it under Output → Upscale → "
+                                 "Model.")
             self.btn_esr.setText("Remove")
             self.btn_esr.setEnabled(True)
         else:
@@ -3209,11 +3280,49 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_browser(self, name, save=True):
         name = name if name in BROWSERS else "Off"
         YDL_EXTRA.clear()
+        COOKIE_NOTE.clear()
+        self.login_problem = ""
         if name != "Off":
             YDL_EXTRA["cookiesfrombrowser"] = (name.lower(),)
+
+            def work():
+                try:
+                    self.emit("cookie", (name, check_browser_login(name)))
+                except Exception as ex:  # noqa: BLE001
+                    self.emit("cookie", (name, clean_error(ex)))
+            threading.Thread(target=work, daemon=True).start()
         self.cfg["browser"] = name
         if save:
             save_cfg(self.cfg)
+
+    def _on_login_failed(self, msg):
+        if not YDL_EXTRA:
+            name = self.cfg.get("browser", "browser")
+            self.login_problem = f"Browser login ({name}) doesn't work: {msg.splitlines()[0][:160]}"
+            self._on_log(f"WARNING: {self.login_problem} – continuing without login.")
+
+    def _on_cookie(self, val):
+        name, msg = val
+        if self.cfg.get("browser") != name:
+            return
+        if msg:
+            self._drop_login(f"Browser login ({name}) doesn't work: {msg}")
+        else:
+            self._on_log(f"Browser login: using your YouTube login from {name}.")
+        dlg = getattr(self, "settings_dlg", None)
+        if dlg is not None:
+            dlg.show_login_state()
+
+    def _drop_login(self, why):
+        """The browser login breaks yt-dlp -> work without it (for this session) and say why."""
+        if not YDL_EXTRA:
+            return
+        YDL_EXTRA.clear()
+        self.login_problem = why
+        self._on_log(f"WARNING: {why} – continuing without login.")
+        if not self.busy:
+            self.status.setText(f"⚠  {why.splitlines()[0][:150]} – continuing without login.")
+            set_state(self.status, "error")
 
     def _fx(self, mode):
         """Crop / size / volume / subtitles for export_multi (None if nothing is switched on)."""
@@ -3511,7 +3620,15 @@ class MainWindow(QtWidgets.QMainWindow):
         def work():
             try:
                 self.update_done.wait()
-                info = fetch_info(url)
+                try:
+                    info = fetch_info(url)
+                except Exception as ex:  # noqa: BLE001
+                    msg = clean_error(ex)
+                    if not cookie_problem(msg):
+                        raise
+                    self.emit("login_failed", msg)
+                    YDL_EXTRA.clear()
+                    info = fetch_info(url)
                 data = None
                 if info.get("thumb"):
                     try:
@@ -3560,7 +3677,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if req != self._req:
             return
         self.btn_thumb.hide()
-        self.thumb.set_text("No preview available – you can still download.")
+        first = (msg or "").splitlines()[0][:140] if msg else ""
+        self.thumb.set_text("Couldn't load this video" + (f":\n{first}" if first else "."))
         self.vtitle.setText("")
         self.vmeta.setText((msg.splitlines()[0][:160] if msg else "") + login_hint(msg).replace("\n", "  "))
         self._update_clip_info()
@@ -3795,7 +3913,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._load_preview()
         else:
             self._pv_state = "offer"
-            mb = f"  (≈ {max(1, round(dur / 60 * PREVIEW_MB_PER_MIN))} MB)" if dur else ""
+            mb = f"  (≈ {preview_mb(dur)} MB)" if dur else ""
             self.thumb.set_overlay(f"▶  Load video preview{mb}")
 
     def _thumb_clicked(self):
@@ -3832,6 +3950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport.hide()
         outdir = self._pv_dir / f"p{req}"
         ffmpeg = self.ffmpeg
+        dur = self.info.get("duration") if self._is_info_current() else None
 
         def em(kind, val=None):
             if kind == "progress" and val is not None:
@@ -3840,7 +3959,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def work():
             try:
                 self.update_done.wait()
-                path = preview_video(url, outdir, ffmpeg=ffmpeg, emit=em)
+                path = preview_video(url, outdir, ffmpeg=ffmpeg, emit=em, duration=dur)
                 self.emit("pv_ready", (req, url, str(path)))
             except Exception as ex:  # noqa: BLE001
                 self.emit("pv_err", (req, clean_error(ex)))
@@ -3861,9 +3980,16 @@ class MainWindow(QtWidgets.QMainWindow):
         req, msg = val
         if req != self._req:
             return
+        if cookie_problem(msg):
+            self._drop_login(f"Browser login ({self.cfg.get('browser')}) doesn't work")
+            self._pv_state = "offer"
+            return self._load_preview()
         self._pv_state = "error"
         self.thumb.set_overlay("▶  Preview failed – click to try again")
         self._on_log("Preview: " + msg)
+        if not self.busy:
+            self.status.setText("✕  Preview: " + (msg.splitlines()[0][:180] if msg else "failed") + login_hint(msg))
+            set_state(self.status, "error")
 
     def _load_player(self, src, has_video, audio_url=None, kind="copy"):
         if self._ensure_player() is None:
@@ -4258,6 +4384,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _dispatch(self, kind, val):
         getattr(self, f"_on_{kind}")(val)
+        if COOKIE_NOTE and not self.login_problem:      # yt-dlp switched the browser login off by itself
+            self.login_problem = COOKIE_NOTE[0]
+            self._on_log("WARNING: " + COOKIE_NOTE[0])
+            if not self.busy:
+                self.status.setText("⚠  " + COOKIE_NOTE[0][:200])
+                set_state(self.status, "error")
+            dlg = getattr(self, "settings_dlg", None)
+            if dlg is not None:
+                dlg.show_login_state()
 
     def _on_log(self, msg):
         self.log.appendPlainText(str(msg).rstrip())
@@ -4564,6 +4699,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.emit("error", "yt-dlp is not installed – please run the setup again.")
         except Exception as ex:  # noqa: BLE001
             msg = clean_error(ex)
+            if cookie_problem(msg):
+                YDL_EXTRA.clear()
+                self.emit("error", "The browser login couldn't be read – it is off for now. Please try again.\n" + msg)
+                return
             self.emit("error", msg + login_hint(msg))
 
     def _save_thumb_now(self):

@@ -482,6 +482,37 @@ def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
     }
 
 
+COOKIE_NOTE: list[str] = []   # set when the browser login could not be read (shown once in the app)
+
+
+def _cookie_problem(ex) -> bool:
+    return type(ex).__name__ == "CookieLoadError" or bool(
+        re.search(r"cookie|dpapi|keyring|decrypt", str(ex), re.I))
+
+
+def ydl_extract(opts, url, download=True):
+    """yt-dlp with the browser login – if the login can't be read (Chrome / Edge lock and encrypt it on Windows),
+    it is switched off for this session and the same thing runs again without it."""
+    from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
+    try:
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=download)
+    except Exception as ex:  # noqa: BLE001
+        if not opts.get("cookiesfrombrowser") or not _cookie_problem(ex):
+            raise
+        name = str(opts["cookiesfrombrowser"][0]).title()
+        YDL_EXTRA.pop("cookiesfrombrowser", None)
+        COOKIE_NOTE[:] = [f"The {name} login could not be read ({clean_error(ex).splitlines()[0][:140]}). "
+                          f"Continuing without it. {name} locks its login while it is open – close it, use Firefox, "
+                          "or set Settings → Browser login to Off."]
+        logger = opts.get("logger")
+        if logger is not None and hasattr(logger, "warning"):
+            logger.warning(COOKIE_NOTE[0])
+        opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"}
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=download)
+
+
 def _suffix(start, end) -> str:
     if start is None and end is None:
         return ""
@@ -491,7 +522,6 @@ def _suffix(start, end) -> str:
 def download(url, start, end, height, encoder, size, target_mb, outdir, *,
              ffmpeg, ffprobe, emit, extra_opts=None, name=None, codec="h264", profile=None):
     """Video -> H.264/H.265 MP4 or ProRes MOV"""
-    from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
 
     section = start is not None or end is not None
     t_start = time.time()
@@ -525,11 +555,10 @@ def download(url, start, end, height, encoder, size, target_mb, outdir, *,
         opts.update(extra_opts)
 
     try:
-        with YoutubeDL(opts) as ydl:
-            if section:
-                emit("status", "Downloading clip and encoding frame-accurately …")
-                emit("progress", None)
-            info = ydl.extract_info(url, download=True)
+        if section:
+            emit("status", "Downloading clip and encoding frame-accurately …")
+            emit("progress", None)
+        info = ydl_extract(opts, url, download=True)
     except ValueError:
         raise
     except Exception as ex:
@@ -551,7 +580,6 @@ def download(url, start, end, height, encoder, size, target_mb, outdir, *,
 def _full_then_cut_video(url, start, end, height, encoder, size, target_mb, outdir, *, ffmpeg, ffprobe, emit,
                          name=None, codec="h264", profile=None):
     """Fallback for clips: normal (robust) download of the whole video, then cut locally."""
-    from yt_dlp import YoutubeDL
 
     tmpdir = Path(outdir) / ".ytclip_tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -561,8 +589,7 @@ def _full_then_cut_video(url, start, end, height, encoder, size, target_mb, outd
                      "merge_output_format": "mkv"})
         if ffmpeg:
             opts["ffmpeg_location"] = ffmpeg
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        info = ydl_extract(opts, url, download=True)
         files = collect_files(info)
         if not files:
             raise RuntimeError("No file was downloaded.")
@@ -584,7 +611,6 @@ def _full_then_cut_video(url, start, end, height, encoder, size, target_mb, outd
 def download_mp3(url, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, extra_opts=None, name=None,
                  afmt="mp3"):
     """Audio -> MP3 / M4A (tags + cover art) or WAV (lossless PCM, for editing)"""
-    from yt_dlp import YoutubeDL
 
     section = start is not None or end is not None
     t_start = time.time()
@@ -613,11 +639,10 @@ def download_mp3(url, start, end, kbps, outdir, *, ffmpeg, ffprobe, emit, extra_
         opts.update(extra_opts)
 
     try:
-        with YoutubeDL(opts) as ydl:
-            if section:
-                emit("status", "Downloading clip …")
-                emit("progress", None)
-            info = ydl.extract_info(url, download=True)
+        if section:
+            emit("status", "Downloading clip …")
+            emit("progress", None)
+        info = ydl_extract(opts, url, download=True)
     except ValueError:
         raise
     except Exception as ex:
@@ -931,11 +956,9 @@ class _Silent:
 
 def fetch_info(url: str) -> dict:
     """Title, channel, duration and thumbnail URL for the preview card."""
-    from yt_dlp import YoutubeDL
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
             "extract_flat": "in_playlist", "logger": _Silent(), **YDL_EXTRA}
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = ydl_extract(opts, url, download=False)
     entries = info.get("entries")
     vids = [f for f in info.get("formats") or [] if f.get("vcodec") not in (None, "none") and f.get("height")]
     best = max(vids, key=lambda f: (f.get("height") or 0, f.get("width") or 0), default=None)

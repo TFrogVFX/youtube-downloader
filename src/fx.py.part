@@ -354,14 +354,12 @@ def fetch_subs(url, item, ffmpeg=None) -> list:
             raise RuntimeError("Could not read the subtitles: " + r.stderr.decode("utf-8", "replace").strip()[-200:])
         return parse_srt_vtt(r.stdout.decode("utf-8", "replace"))
     import tempfile
-    from yt_dlp import YoutubeDL
     with tempfile.TemporaryDirectory(prefix="ytclip_subs_") as td:
         opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
                 "writesubtitles": kind == "yt", "writeautomaticsub": kind == "yt-auto",
                 "subtitleslangs": [key], "subtitlesformat": "json3/srt/vtt/best",
                 "outtmpl": str(Path(td) / "subs.%(ext)s"), "logger": _Silent(), **YDL_EXTRA}
-        with YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
+        ydl_extract(opts, url, download=True)
         files = [f for f in Path(td).iterdir() if f.is_file()]
         if not files:
             raise RuntimeError("These subtitles could not be downloaded.")
@@ -744,12 +742,10 @@ def _cookie_header(s) -> str:
 
 def media_url(url, height=None):
     """Direct address (+ HTTP headers) of the best picture up to `height` – for grabbing single frames."""
-    from yt_dlp import YoutubeDL
     fmt = f"bv*[height<={height}]/b[height<={height}]/bv*/b" if height else "bv*/b"
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "format": fmt,
             "logger": _Silent(), **YDL_EXTRA}
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = ydl_extract(opts, url, download=False)
     f = (info.get("requested_formats") or [info])[0]
     hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
             if k.lower() not in ("accept-encoding", "range")}
@@ -880,6 +876,51 @@ def history_remove(url) -> None:
 def history_clear() -> None:
     shutil.rmtree(HISTORY_DIR, ignore_errors=True)
     HISTORY_FILE.unlink(missing_ok=True)
+
+
+COOKIE_ERR = re.compile(r"cookie|dpapi|decrypt|keyring|keychain", re.I)
+
+
+def cookie_problem(msg) -> bool:
+    """Did yt-dlp fail because the browser login (cookies) couldn't be read?"""
+    return bool(YDL_EXTRA) and bool(COOKIE_ERR.search(msg or ""))
+
+
+class _CookieLog:
+    def __init__(self):
+        self.warnings: list[str] = []
+
+    def debug(self, *a, **k):
+        pass
+
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, msg, *a, **k):
+        self.warnings.append(ANSI.sub("", str(msg)))
+
+    def error(self, msg, *a, **k):
+        self.warnings.append(ANSI.sub("", str(msg)))
+
+
+def check_browser_login(browser) -> str:
+    """'' if the YouTube login of this browser can be read, else why not."""
+    from yt_dlp.cookies import extract_cookies_from_browser
+    log = _CookieLog()
+    try:
+        jar = extract_cookies_from_browser(str(browser).lower(), logger=log)
+    except Exception as ex:  # noqa: BLE001
+        msg = clean_error(ex)
+        if re.search(r"could not copy", msg, re.I):
+            return f"{browser} is open and keeps its login locked – close {browser} or use Firefox."
+        return msg.splitlines()[0][:200]
+    names = {c.name for c in jar if "youtube.com" in (c.domain or "")}
+    if not names & {"SAPISID", "__Secure-3PSID", "LOGIN_INFO", "SID", "__Secure-1PSID"}:
+        if any("decrypt" in w.lower() for w in log.warnings):
+            return (f"{browser} encrypts its login so other apps can't read it (since 2024) – use Firefox "
+                    "for the browser login.")
+        return f"No YouTube login found in {browser} – sign in to YouTube there first."
+    return ""
 
 
 def login_hint(msg) -> str:

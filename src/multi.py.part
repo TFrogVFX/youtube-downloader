@@ -7,21 +7,31 @@ PREVIEW_AUTO_MAX = 20 * 60       # load the preview by itself for videos up to 2
 PREVIEW_MB_PER_MIN = 4.0         # rough size of the 360p preview (for the "≈ N MB" hint)
 
 
-def preview_video(url, outdir, *, ffmpeg, emit) -> Path:
-    """Small (≤360p) copy of a YouTube video for the built-in player. H.264/AAC is preferred
+def preview_height(duration) -> int:
+    """Long videos get a smaller preview copy, so it loads in reasonable time."""
+    d = float(duration or 0)
+    return 360 if d <= 30 * 60 else 240 if d <= 90 * 60 else 144
+
+
+def preview_mb(duration) -> int:
+    per_min = {360: PREVIEW_MB_PER_MIN, 240: 2.4, 144: 1.3}[preview_height(duration)]
+    return max(1, round(float(duration or 0) / 60 * per_min))
+
+
+def preview_video(url, outdir, *, ffmpeg, emit, duration=None) -> Path:
+    """Small (≤360p, long videos less) copy of a YouTube video for the built-in player. H.264/AAC is preferred
     (plays everywhere); yt-dlp does the downloading, so it works wherever downloads work."""
-    from yt_dlp import YoutubeDL
+    h = preview_height(duration)
     opts = _base_opts(outdir, "", False, emit, name="preview")
     opts.update({
-        "format": f"bv*[height<={PREVIEW_HEIGHT}]+ba/b[height<={PREVIEW_HEIGHT}]/wv*+wa/w",
-        "format_sort": [f"res:{PREVIEW_HEIGHT}", "vcodec:h264", "acodec:aac", "+size"],
+        "format": f"bv*[height<={h}]+ba/b[height<={h}]/wv*+wa/w",
+        "format_sort": [f"res:{h}", "vcodec:h264", "acodec:aac", "+size"],
         "merge_output_format": "mp4/mkv",
         "overwrites": True,
     })
     if ffmpeg:
         opts["ffmpeg_location"] = ffmpeg
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = ydl_extract(opts, url, download=True)
     files = collect_files(info)
     if not files:
         raise RuntimeError("The preview could not be downloaded.")

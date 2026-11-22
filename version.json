@@ -1,8 +1,8 @@
 {
-  "version": "2.6.0",
+  "version": "2.6.1",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "dd19002936ce05d3ee6a33cda5519d85e3f79cf8e31f01345cd330726a5898d7",
-  "notes": "Edit subtitles, own fonts and colors, place subtitles anywhere. Upscaling moved to Output with own models. Update button. YouTube only.",
+  "sha256": "5d781e0b129e16878396ae1d1df3ba725fb51c4f1202dd0d8579984836885374",
+  "notes": "Faster subtitle editing (also with thousands of lines). Browser login that can't be read (Chrome/Edge) is switched off by itself instead of breaking previews and downloads. Smaller preview copies for long videos, preview errors are shown.",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
