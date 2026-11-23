@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.9"
+APP_VERSION = "2.9.10"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -172,6 +172,7 @@ AI_MODELS = {
                                  "Real-ESRGAN x4plus anime: quick and clean."),
 }
 DEFAULT_AI_MODEL = "UltraSharp – photos, films"
+AI_PX_PRESETS = [(1920, "Full HD"), (2560, "QHD"), (3840, "4K"), (5120, "5K"), (7680, "8K")]
 FREE = "free"            # "Custom": a box of any shape
 ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "Custom": FREE}
 # volume curve: how the volume goes from a point to the next one

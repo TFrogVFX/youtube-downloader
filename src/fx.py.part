@@ -780,34 +780,55 @@ def run_engine(plan, src, dst, on_tick=None) -> None:
         raise RuntimeError(f"AI upscaling failed.{hint}" + (f"\n{tail}" if tail else ""))
 
 
-def ai_upscale_image(src, dst, factor, model_label, *, ffmpeg, emit) -> Path:
-    """One picture -> AI upscaled to exactly `factor` × its size (PNG or JPG by the name of dst)."""
+AI_PX_MAX = 16384     # longest side we make
+
+
+def ai_target(w, h, ai) -> tuple[int, int]:
+    """Final size for a w×h picture: factor × size, or the long side set to ai['px'] (aspect kept)."""
+    if ai.get("px"):
+        s_ = min(int(ai["px"]), AI_PX_MAX) / max(w, h)
+        return max(1, round(w * s_)), max(1, round(h * s_))
+    f = int(ai.get("factor") or 1)
+    return w * f, h * f
+
+
+def ai_upscale_image(src, dst, ai, *, ffmpeg, emit) -> Path:
+    """One picture -> AI upscaled to 2× / 4× or to a pixel size (long side), PNG or JPG by the name of dst.
+    Big targets run the AI twice (e.g. a 360p thumbnail to 8K); the last step scales to the exact size."""
     import tempfile
-    plan = ai_plan(model_label, factor)
-    ensure_engine(plan["engine"], emit)
-    if plan["file"] and not ai_file_ok(plan["file"]):
-        f = AI_FILES[plan["file"]]
-        emit("log", f"Downloading the AI model {f['name']} (≈ {f['mb']} MB, only once) …")
-        emit("status", f"Downloading the AI model {f['name']} …")
-        install_ai_file(plan["file"], progress=lambda v: emit("progress", v))
-    emit("status", f"AI upscaling {factor}× ({plan['name']}) …")
-    emit("progress", None)
+    model_label = ai.get("model")
     with tempfile.TemporaryDirectory(prefix="ytclip_ai_") as td:
         inp = Path(td) / "in.png"
         subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), str(inp)],
                        check=True, capture_output=True, creationflags=NO_WINDOW)
         w, h = _png_size(inp)
-        out = Path(td) / "out.png"
-        run_engine(plan, inp, out)
-        ow, oh = w * factor, h * factor
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(out)]
-        if _png_size(out) != (ow, oh):
+        ow, oh = ai_target(w, h, ai)
+        need = max(ow / w, oh / h)
+        plan = ai_plan(model_label, 2 if need <= 2 else 4)
+        ensure_engine(plan["engine"], emit)
+        if plan["file"] and not ai_file_ok(plan["file"]):
+            f = AI_FILES[plan["file"]]
+            emit("log", f"Downloading the AI model {f['name']} (≈ {f['mb']} MB, only once) …")
+            emit("status", f"Downloading the AI model {f['name']} …")
+            install_ai_file(plan["file"], progress=lambda v: emit("progress", v))
+        passes = 2 if need > plan["native"] * 1.15 else 1
+        cur = inp
+        for i in range(passes):
+            emit("status", f"AI upscaling → {ow}×{oh} px ({plan['name']})" + (f" · step {i + 1}/2" if passes > 1 else "")
+                 + " …")
+            emit("progress", None)
+            nxt = Path(td) / f"out{i}.png"
+            run_engine(plan, cur, nxt)
+            cur = nxt
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(cur)]
+        if _png_size(cur) != (ow, oh):
             cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
         if Path(dst).suffix.lower() in (".jpg", ".jpeg"):
             cmd += ["-q:v", "2"]
         r = subprocess.run(cmd + [str(dst)], capture_output=True, creationflags=NO_WINDOW)
         if r.returncode != 0:
             raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+    emit("log", f"  AI upscaled: {w}×{h} → {ow}×{oh} px ({plan['name']})")
     return Path(dst)
 
 
@@ -950,8 +971,8 @@ def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, ffmpe
             subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-vf",
                             f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}", str(img)],
                            check=True, capture_output=True, creationflags=NO_WINDOW)
-        if ai and ai.get("factor"):
-            return ai_upscale_image(img, dst, int(ai["factor"]), ai.get("model"), ffmpeg=ffmpeg, emit=emit)
+        if ai and (ai.get("factor") or ai.get("px")):
+            return ai_upscale_image(img, dst, ai, ffmpeg=ffmpeg, emit=emit)
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(img)]
         if _png_size(img) != (ow, oh):
             cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]

@@ -3141,7 +3141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_still.clicked.connect(self._save_still)
         tr2.addSpacing(6)
         tr2.addWidget(self.btn_still)
-        self.ai_factor, self.ai_model = None, DEFAULT_AI_MODEL
+        self.ai_factor, self.ai_px, self.ai_model = None, None, DEFAULT_AI_MODEL
         self.btn_ai = QtWidgets.QPushButton("✦ AI upscale: off")
         self.btn_ai.setObjectName("chip")
         self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3471,14 +3471,17 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------ AI upscaling (pictures only)
     def _ai(self):
         """{'factor', 'model'} or None – for Save frame and Save thumbnail."""
-        return {"factor": self.ai_factor, "model": self.ai_model} if self.ai_factor else None
+        if self.ai_px:
+            return {"factor": None, "px": self.ai_px, "model": self.ai_model}
+        return {"factor": self.ai_factor, "px": None, "model": self.ai_model} if self.ai_factor else None
 
     def _ai_changed(self):
         b = getattr(self, "btn_ai", None)
         if b is None:
             return
         ai = self._ai()
-        b.setText(f"✦ AI {ai['factor']}× · {ai['model'].split(' –')[0]}" if ai else "✦ AI upscale: off")
+        size = f"{ai['px']} px" if ai and ai["px"] else f"{ai['factor']}×" if ai else ""
+        b.setText(f"✦ AI {size} · {ai['model'].split(' –')[0]}" if ai else "✦ AI upscale: off")
         set_state(b, "on" if ai else "")
         self._ai_tip()
 
@@ -3486,7 +3489,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ai = self._ai()
         need = []
         if ai:
-            plan = ai_plan(ai["model"], ai["factor"])
+            plan = ai_plan(ai["model"], ai["factor"] or 4)
             if not engine_exe(plan["engine"]):
                 need.append(f"{ENGINES[plan['engine']]['name']} ≈ {ENGINES[plan['engine']]['mb']} MB")
             if plan["file"] and not ai_file_ok(plan["file"]):
@@ -3505,9 +3508,26 @@ class MainWindow(QtWidgets.QMainWindow):
         for lab, f in AI_UPSCALES.items():
             a = m.addAction(lab if f else "Off (normal size)")
             a.setCheckable(True)
-            a.setChecked(f == self.ai_factor)
+            a.setChecked(f == self.ai_factor and not self.ai_px)
             a.setActionGroup(g1)
             a.triggered.connect(lambda _=False, f=f: self._set_ai(factor=f))
+        sub = m.addMenu("Size in pixels (long side)" + (f"  ·  {self.ai_px} px" if self.ai_px else ""))
+        sub.setToolTipsVisible(True)
+        known = False
+        for px, name in AI_PX_PRESETS:
+            a = sub.addAction(f"{px} px  –  {name}")
+            a.setCheckable(True)
+            a.setChecked(px == self.ai_px)
+            known |= px == self.ai_px
+            a.setActionGroup(g1)
+            a.triggered.connect(lambda _=False, px=px: self._set_ai(px=px))
+        sub.addSeparator()
+        a = sub.addAction(f"Custom: {self.ai_px} px …" if self.ai_px and not known else "Custom …")
+        a.setCheckable(True)
+        a.setChecked(bool(self.ai_px) and not known)
+        a.setActionGroup(g1)
+        a.setToolTip("Type the size of the longer side – the other side follows the picture's shape.")
+        a.triggered.connect(self._ai_px_custom)
         g2 = QtGui.QActionGroup(m)
         for i, (lab, (eng, _model, fk, hlp)) in enumerate(AI_MODELS.items()):
             if i in (0, 4):
@@ -3527,14 +3547,25 @@ class MainWindow(QtWidgets.QMainWindow):
         m.addAction("Models and updates in Settings …").triggered.connect(self._settings)
         m.exec(self.btn_ai.mapToGlobal(QtCore.QPoint(0, self.btn_ai.height() + 2)))
 
-    def _set_ai(self, factor=0, model=None):
-        if factor != 0:
-            self.ai_factor = factor
+    def _ai_px_custom(self):
+        v, ok = QtWidgets.QInputDialog.getInt(self, "AI upscaling", "Longer side of the picture in pixels:",
+                                              self.ai_px or 3840, 256, AI_PX_MAX, 64)
+        if ok:
+            self._set_ai(px=v)
+        else:
+            self._ai_changed()
+
+    def _set_ai(self, factor=0, model=None, px=None):
+        if px:
+            self.ai_px, self.ai_factor = int(px), None
+        elif factor != 0:
+            self.ai_factor, self.ai_px = factor, None
         if model:
             self.ai_model = model
-            if not self.ai_factor:
+            if not self.ai_factor and not self.ai_px:
                 self.ai_factor = 4
         self.cfg["ai_up"] = next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor)
+        self.cfg["ai_px"] = self.ai_px
         self.cfg["ai_model"] = self.ai_model
         save_cfg(self.cfg)
         self._ai_changed()
@@ -4322,7 +4353,8 @@ class MainWindow(QtWidgets.QMainWindow):
         box = self.box
         ai = self._ai()
         if ai:
-            self._on_log(f"  AI upscaling {ai['factor']}× · {ai['model']}")
+            self._on_log(f"  AI upscaling {ai['px']} px" if ai["px"] else f"  AI upscaling {ai['factor']}×"
+                         + f" · {ai['model']}")
 
         def work():
             try:
@@ -4616,6 +4648,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pick(self.cb_size, "size", SIZES, DEFAULT_SIZE)
         pick(self.cb_encoder, "encoder", ENCODERS, DEFAULT_ENCODER)
         self.ai_factor = AI_UPSCALES.get(c.get("ai_up"))
+        self.ai_px = int(c["ai_px"]) if str(c.get("ai_px") or "").isdigit() else None
         self.ai_model = c.get("ai_model") if c.get("ai_model") in AI_MODELS else DEFAULT_AI_MODEL
         self._ai_changed()
         if hasattr(self, "tabstack"):
@@ -4661,7 +4694,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.update(
             quality=self.cb_quality.currentText(), size=self.cb_size.currentText(),
             encoder=self.cb_encoder.currentText(), mp3_quality=self.cb_mp3.currentText(),
-            ai_up=next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor), ai_model=self.ai_model,
+            ai_up=next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor), ai_px=self.ai_px,
+            ai_model=self.ai_model,
             codec=self.cb_codec.currentText(), audio_format=self.cb_afmt.currentText(),
             tooltips=self.tip_filter.enabled,
             gif_width=self.cb_gif_w.currentText(), gif_fps=self.cb_gif_fps.currentText(),
@@ -6095,7 +6129,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     dst = base.parent / (unique_name(base.parent, base.stem, ".jpg") + ".jpg")
                     save_thumbnail(thumb[0], dst, ffmpeg=self.ffmpeg, info=thumb[1], at=thumb[2])
                     if len(thumb) > 3 and thumb[3]:
-                        ai_upscale_image(dst, dst, thumb[3]["factor"], thumb[3]["model"], ffmpeg=self.ffmpeg,
+                        ai_upscale_image(dst, dst, thumb[3], ffmpeg=self.ffmpeg,
                                          emit=self.emit)
                     files.append(str(dst))
                 except Exception as ex:  # noqa: BLE001
@@ -6136,7 +6170,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 save_thumbnail(url, dst, ffmpeg=self.ffmpeg, info=info, at=at)
                 if ai:
-                    ai_upscale_image(dst, dst, ai["factor"], ai["model"], ffmpeg=self.ffmpeg, emit=self.emit)
+                    ai_upscale_image(dst, dst, ai, ffmpeg=self.ffmpeg, emit=self.emit)
                 self.emit("thumb_saved", str(dst))
             except Exception as ex:  # noqa: BLE001
                 self.emit("thumb_err", clean_error(ex))

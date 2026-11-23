@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.9"
+APP_VERSION = "2.9.10"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -172,6 +172,7 @@ AI_MODELS = {
                                  "Real-ESRGAN x4plus anime: quick and clean."),
 }
 DEFAULT_AI_MODEL = "UltraSharp – photos, films"
+AI_PX_PRESETS = [(1920, "Full HD"), (2560, "QHD"), (3840, "4K"), (5120, "5K"), (7680, "8K")]
 FREE = "free"            # "Custom": a box of any shape
 ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "Custom": FREE}
 # volume curve: how the volume goes from a point to the next one
@@ -757,11 +758,29 @@ def _login_debug(url, tries):
         pass
 
 
+def _with_js_variant(o):
+    """yt-dlp ≤ 2026.11.22: YouTube's new players (05a4ffc0, b485e332, b17b74e6) break its JS challenge solving with
+    the "main" player variant -> only pictures, no video (yt-dlp issue #18123). The fix there: the "tv" variant.
+    Newer yt-dlp versions use it by themselves, so this is only added for the older ones."""
+    try:
+        import yt_dlp
+        ver = tuple(int(x) for x in yt_dlp.version.__version__.split(".")[:3])
+    except Exception:  # noqa: BLE001
+        return o
+    if ver > (2026, 11, 22):
+        return o
+    ea = {k: dict(v) for k, v in (o.get("extractor_args") or {}).items()}
+    yt = ea.setdefault("youtube", {})
+    if "player_js_variant" not in yt:
+        yt["player_js_variant"] = ["tv"]
+    return {**o, "extractor_args": ea}
+
+
 def ydl_extract(opts, url, download=True, use_login=True):
     """One yt-dlp run (the YouTube login, if any, is handed in by add_login – from memory). If YouTube offers no
     video with the login, other YouTube clients are tried with the login; only then the run is done without it."""
     from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
-    clean = {k: v for k, v in opts.items() if k != "login"}
+    clean = _with_js_variant({k: v for k, v in opts.items() if k != "login"})
     if not (use_login and logged_in()):
         with YoutubeDL(clean) as ydl:
             return ydl.extract_info(url, download=download)
@@ -2702,34 +2721,55 @@ def run_engine(plan, src, dst, on_tick=None) -> None:
         raise RuntimeError(f"AI upscaling failed.{hint}" + (f"\n{tail}" if tail else ""))
 
 
-def ai_upscale_image(src, dst, factor, model_label, *, ffmpeg, emit) -> Path:
-    """One picture -> AI upscaled to exactly `factor` × its size (PNG or JPG by the name of dst)."""
+AI_PX_MAX = 16384     # longest side we make
+
+
+def ai_target(w, h, ai) -> tuple[int, int]:
+    """Final size for a w×h picture: factor × size, or the long side set to ai['px'] (aspect kept)."""
+    if ai.get("px"):
+        s_ = min(int(ai["px"]), AI_PX_MAX) / max(w, h)
+        return max(1, round(w * s_)), max(1, round(h * s_))
+    f = int(ai.get("factor") or 1)
+    return w * f, h * f
+
+
+def ai_upscale_image(src, dst, ai, *, ffmpeg, emit) -> Path:
+    """One picture -> AI upscaled to 2× / 4× or to a pixel size (long side), PNG or JPG by the name of dst.
+    Big targets run the AI twice (e.g. a 360p thumbnail to 8K); the last step scales to the exact size."""
     import tempfile
-    plan = ai_plan(model_label, factor)
-    ensure_engine(plan["engine"], emit)
-    if plan["file"] and not ai_file_ok(plan["file"]):
-        f = AI_FILES[plan["file"]]
-        emit("log", f"Downloading the AI model {f['name']} (≈ {f['mb']} MB, only once) …")
-        emit("status", f"Downloading the AI model {f['name']} …")
-        install_ai_file(plan["file"], progress=lambda v: emit("progress", v))
-    emit("status", f"AI upscaling {factor}× ({plan['name']}) …")
-    emit("progress", None)
+    model_label = ai.get("model")
     with tempfile.TemporaryDirectory(prefix="ytclip_ai_") as td:
         inp = Path(td) / "in.png"
         subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), str(inp)],
                        check=True, capture_output=True, creationflags=NO_WINDOW)
         w, h = _png_size(inp)
-        out = Path(td) / "out.png"
-        run_engine(plan, inp, out)
-        ow, oh = w * factor, h * factor
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(out)]
-        if _png_size(out) != (ow, oh):
+        ow, oh = ai_target(w, h, ai)
+        need = max(ow / w, oh / h)
+        plan = ai_plan(model_label, 2 if need <= 2 else 4)
+        ensure_engine(plan["engine"], emit)
+        if plan["file"] and not ai_file_ok(plan["file"]):
+            f = AI_FILES[plan["file"]]
+            emit("log", f"Downloading the AI model {f['name']} (≈ {f['mb']} MB, only once) …")
+            emit("status", f"Downloading the AI model {f['name']} …")
+            install_ai_file(plan["file"], progress=lambda v: emit("progress", v))
+        passes = 2 if need > plan["native"] * 1.15 else 1
+        cur = inp
+        for i in range(passes):
+            emit("status", f"AI upscaling → {ow}×{oh} px ({plan['name']})" + (f" · step {i + 1}/2" if passes > 1 else "")
+                 + " …")
+            emit("progress", None)
+            nxt = Path(td) / f"out{i}.png"
+            run_engine(plan, cur, nxt)
+            cur = nxt
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(cur)]
+        if _png_size(cur) != (ow, oh):
             cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
         if Path(dst).suffix.lower() in (".jpg", ".jpeg"):
             cmd += ["-q:v", "2"]
         r = subprocess.run(cmd + [str(dst)], capture_output=True, creationflags=NO_WINDOW)
         if r.returncode != 0:
             raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+    emit("log", f"  AI upscaled: {w}×{h} → {ow}×{oh} px ({plan['name']})")
     return Path(dst)
 
 
@@ -2872,8 +2912,8 @@ def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, ffmpe
             subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-vf",
                             f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}", str(img)],
                            check=True, capture_output=True, creationflags=NO_WINDOW)
-        if ai and ai.get("factor"):
-            return ai_upscale_image(img, dst, int(ai["factor"]), ai.get("model"), ffmpeg=ffmpeg, emit=emit)
+        if ai and (ai.get("factor") or ai.get("px")):
+            return ai_upscale_image(img, dst, ai, ffmpeg=ffmpeg, emit=emit)
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(img)]
         if _png_size(img) != (ow, oh):
             cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
@@ -7407,7 +7447,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_still.clicked.connect(self._save_still)
         tr2.addSpacing(6)
         tr2.addWidget(self.btn_still)
-        self.ai_factor, self.ai_model = None, DEFAULT_AI_MODEL
+        self.ai_factor, self.ai_px, self.ai_model = None, None, DEFAULT_AI_MODEL
         self.btn_ai = QtWidgets.QPushButton("✦ AI upscale: off")
         self.btn_ai.setObjectName("chip")
         self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -7737,14 +7777,17 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------ AI upscaling (pictures only)
     def _ai(self):
         """{'factor', 'model'} or None – for Save frame and Save thumbnail."""
-        return {"factor": self.ai_factor, "model": self.ai_model} if self.ai_factor else None
+        if self.ai_px:
+            return {"factor": None, "px": self.ai_px, "model": self.ai_model}
+        return {"factor": self.ai_factor, "px": None, "model": self.ai_model} if self.ai_factor else None
 
     def _ai_changed(self):
         b = getattr(self, "btn_ai", None)
         if b is None:
             return
         ai = self._ai()
-        b.setText(f"✦ AI {ai['factor']}× · {ai['model'].split(' –')[0]}" if ai else "✦ AI upscale: off")
+        size = f"{ai['px']} px" if ai and ai["px"] else f"{ai['factor']}×" if ai else ""
+        b.setText(f"✦ AI {size} · {ai['model'].split(' –')[0]}" if ai else "✦ AI upscale: off")
         set_state(b, "on" if ai else "")
         self._ai_tip()
 
@@ -7752,7 +7795,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ai = self._ai()
         need = []
         if ai:
-            plan = ai_plan(ai["model"], ai["factor"])
+            plan = ai_plan(ai["model"], ai["factor"] or 4)
             if not engine_exe(plan["engine"]):
                 need.append(f"{ENGINES[plan['engine']]['name']} ≈ {ENGINES[plan['engine']]['mb']} MB")
             if plan["file"] and not ai_file_ok(plan["file"]):
@@ -7771,9 +7814,26 @@ class MainWindow(QtWidgets.QMainWindow):
         for lab, f in AI_UPSCALES.items():
             a = m.addAction(lab if f else "Off (normal size)")
             a.setCheckable(True)
-            a.setChecked(f == self.ai_factor)
+            a.setChecked(f == self.ai_factor and not self.ai_px)
             a.setActionGroup(g1)
             a.triggered.connect(lambda _=False, f=f: self._set_ai(factor=f))
+        sub = m.addMenu("Size in pixels (long side)" + (f"  ·  {self.ai_px} px" if self.ai_px else ""))
+        sub.setToolTipsVisible(True)
+        known = False
+        for px, name in AI_PX_PRESETS:
+            a = sub.addAction(f"{px} px  –  {name}")
+            a.setCheckable(True)
+            a.setChecked(px == self.ai_px)
+            known |= px == self.ai_px
+            a.setActionGroup(g1)
+            a.triggered.connect(lambda _=False, px=px: self._set_ai(px=px))
+        sub.addSeparator()
+        a = sub.addAction(f"Custom: {self.ai_px} px …" if self.ai_px and not known else "Custom …")
+        a.setCheckable(True)
+        a.setChecked(bool(self.ai_px) and not known)
+        a.setActionGroup(g1)
+        a.setToolTip("Type the size of the longer side – the other side follows the picture's shape.")
+        a.triggered.connect(self._ai_px_custom)
         g2 = QtGui.QActionGroup(m)
         for i, (lab, (eng, _model, fk, hlp)) in enumerate(AI_MODELS.items()):
             if i in (0, 4):
@@ -7793,14 +7853,25 @@ class MainWindow(QtWidgets.QMainWindow):
         m.addAction("Models and updates in Settings …").triggered.connect(self._settings)
         m.exec(self.btn_ai.mapToGlobal(QtCore.QPoint(0, self.btn_ai.height() + 2)))
 
-    def _set_ai(self, factor=0, model=None):
-        if factor != 0:
-            self.ai_factor = factor
+    def _ai_px_custom(self):
+        v, ok = QtWidgets.QInputDialog.getInt(self, "AI upscaling", "Longer side of the picture in pixels:",
+                                              self.ai_px or 3840, 256, AI_PX_MAX, 64)
+        if ok:
+            self._set_ai(px=v)
+        else:
+            self._ai_changed()
+
+    def _set_ai(self, factor=0, model=None, px=None):
+        if px:
+            self.ai_px, self.ai_factor = int(px), None
+        elif factor != 0:
+            self.ai_factor, self.ai_px = factor, None
         if model:
             self.ai_model = model
-            if not self.ai_factor:
+            if not self.ai_factor and not self.ai_px:
                 self.ai_factor = 4
         self.cfg["ai_up"] = next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor)
+        self.cfg["ai_px"] = self.ai_px
         self.cfg["ai_model"] = self.ai_model
         save_cfg(self.cfg)
         self._ai_changed()
@@ -8588,7 +8659,8 @@ class MainWindow(QtWidgets.QMainWindow):
         box = self.box
         ai = self._ai()
         if ai:
-            self._on_log(f"  AI upscaling {ai['factor']}× · {ai['model']}")
+            self._on_log(f"  AI upscaling {ai['px']} px" if ai["px"] else f"  AI upscaling {ai['factor']}×"
+                         + f" · {ai['model']}")
 
         def work():
             try:
@@ -8882,6 +8954,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pick(self.cb_size, "size", SIZES, DEFAULT_SIZE)
         pick(self.cb_encoder, "encoder", ENCODERS, DEFAULT_ENCODER)
         self.ai_factor = AI_UPSCALES.get(c.get("ai_up"))
+        self.ai_px = int(c["ai_px"]) if str(c.get("ai_px") or "").isdigit() else None
         self.ai_model = c.get("ai_model") if c.get("ai_model") in AI_MODELS else DEFAULT_AI_MODEL
         self._ai_changed()
         if hasattr(self, "tabstack"):
@@ -8927,7 +9000,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.update(
             quality=self.cb_quality.currentText(), size=self.cb_size.currentText(),
             encoder=self.cb_encoder.currentText(), mp3_quality=self.cb_mp3.currentText(),
-            ai_up=next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor), ai_model=self.ai_model,
+            ai_up=next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor), ai_px=self.ai_px,
+            ai_model=self.ai_model,
             codec=self.cb_codec.currentText(), audio_format=self.cb_afmt.currentText(),
             tooltips=self.tip_filter.enabled,
             gif_width=self.cb_gif_w.currentText(), gif_fps=self.cb_gif_fps.currentText(),
@@ -10361,7 +10435,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     dst = base.parent / (unique_name(base.parent, base.stem, ".jpg") + ".jpg")
                     save_thumbnail(thumb[0], dst, ffmpeg=self.ffmpeg, info=thumb[1], at=thumb[2])
                     if len(thumb) > 3 and thumb[3]:
-                        ai_upscale_image(dst, dst, thumb[3]["factor"], thumb[3]["model"], ffmpeg=self.ffmpeg,
+                        ai_upscale_image(dst, dst, thumb[3], ffmpeg=self.ffmpeg,
                                          emit=self.emit)
                     files.append(str(dst))
                 except Exception as ex:  # noqa: BLE001
@@ -10402,7 +10476,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 save_thumbnail(url, dst, ffmpeg=self.ffmpeg, info=info, at=at)
                 if ai:
-                    ai_upscale_image(dst, dst, ai["factor"], ai["model"], ffmpeg=self.ffmpeg, emit=self.emit)
+                    ai_upscale_image(dst, dst, ai, ffmpeg=self.ffmpeg, emit=self.emit)
                 self.emit("thumb_saved", str(dst))
             except Exception as ex:  # noqa: BLE001
                 self.emit("thumb_err", clean_error(ex))

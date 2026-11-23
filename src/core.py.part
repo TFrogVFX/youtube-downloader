@@ -544,11 +544,29 @@ def _login_debug(url, tries):
         pass
 
 
+def _with_js_variant(o):
+    """yt-dlp ≤ 2026.11.22: YouTube's new players (05a4ffc0, b485e332, b17b74e6) break its JS challenge solving with
+    the "main" player variant -> only pictures, no video (yt-dlp issue #18123). The fix there: the "tv" variant.
+    Newer yt-dlp versions use it by themselves, so this is only added for the older ones."""
+    try:
+        import yt_dlp
+        ver = tuple(int(x) for x in yt_dlp.version.__version__.split(".")[:3])
+    except Exception:  # noqa: BLE001
+        return o
+    if ver > (2026, 11, 22):
+        return o
+    ea = {k: dict(v) for k, v in (o.get("extractor_args") or {}).items()}
+    yt = ea.setdefault("youtube", {})
+    if "player_js_variant" not in yt:
+        yt["player_js_variant"] = ["tv"]
+    return {**o, "extractor_args": ea}
+
+
 def ydl_extract(opts, url, download=True, use_login=True):
     """One yt-dlp run (the YouTube login, if any, is handed in by add_login – from memory). If YouTube offers no
     video with the login, other YouTube clients are tried with the login; only then the run is done without it."""
     from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
-    clean = {k: v for k, v in opts.items() if k != "login"}
+    clean = _with_js_variant({k: v for k, v in opts.items() if k != "login"})
     if not (use_login and logged_in()):
         with YoutubeDL(clean) as ydl:
             return ydl.extract_info(url, download=download)

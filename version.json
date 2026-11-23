@@ -1,8 +1,8 @@
 {
-  "version": "2.9.9",
+  "version": "2.9.10",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "73f1f25e0c153cbe8406c25e9550ac1421e7e79be57058d0eb55534516ecd8e3",
-  "notes": "AI upscaling only for Save frame / thumbnails with big models (UltraSharp, Siax, Nomos8kSC, HFA2k, Real-CUGAN Pro); preview source + stream quality switchable in the preview; header shows only the profile when signed in",
+  "sha256": "ec9a477a4a58b227c928790a8c443ed39862bced5fbd61fc3eb04eae2e7c9b23",
+  "notes": "Fix: signed in, YouTube offered no video – yt-dlp's JS challenge broke on YouTube's new player; the 'tv' player variant is used until yt-dlp is updated. AI upscaling: size in pixels (long side, presets up to 8K or custom)",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
