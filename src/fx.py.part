@@ -6,8 +6,19 @@ def _even(x) -> int:
     return max(2, int(round(float(x) / 2.0)) * 2)
 
 
+FREE_BOX = (0.1, 0.1, 0.8, 0.8)
+
+
 def crop_rect(box, W, H, aspect):
-    """box: (x, y, w, h) as fractions of the frame -> (cw, ch, cx, cy) in pixels with exactly this aspect."""
+    """box: (x, y, w, h) as fractions of the frame -> (cw, ch, cx, cy) in pixels with exactly this aspect
+    (FREE: exactly the box, any shape)."""
+    if isinstance(aspect, str):       # FREE
+        x, y, w, h = box if box else FREE_BOX
+        cw = min(_even(max(16.0, w * W)), W - W % 2)
+        ch = min(_even(max(16.0, h * H)), H - H % 2)
+        cx = min(max(0, int(round(x * W))), W - cw)
+        cy = min(max(0, int(round(y * H))), H - ch)
+        return cw, ch, cx, cy
     aw, ah = aspect
     x, y, w, h = box if box else (0.0, 0.0, 1.0, 1.0)
     cw = max(16.0, w * W, h * H * aw / ah)   # the box was drawn on the (smaller) preview -> don't lose a pixel
@@ -26,7 +37,9 @@ def crop_rect(box, W, H, aspect):
 
 
 def center_box(aspect, W, H):
-    """Biggest centered box with this aspect, as fractions."""
+    """Biggest centered box with this aspect, as fractions (FREE: a centered box over 80 % of the picture)."""
+    if isinstance(aspect, str):       # FREE
+        return FREE_BOX
     cw, ch, cx, cy = crop_rect(None, W, H, aspect)
     return (cx / W, cy / H, cw / W, ch / H)
 
@@ -36,7 +49,7 @@ def out_dims(cw, ch, short, aspect=None):
     (with a crop format the exact ratio of the format, e.g. 1080 × 1920 for 9:16)."""
     if not short:
         return _even(cw), _even(ch)
-    if aspect:
+    if aspect and not isinstance(aspect, str):
         cw, ch = aspect
     if cw <= ch:
         return _even(short), _even(short * ch / cw)
@@ -890,6 +903,187 @@ def import_cookie_file(src) -> int:
 def sign_out() -> None:
     COOKIE_FILE.unlink(missing_ok=True)
     YDL_EXTRA.pop("cookiefile", None)
+    clear_account()
+
+
+# ---- which account is signed in (name + profile picture for the app)
+
+ACCOUNT_FILE = APP_DIR / "account.json"
+ACCOUNT_PIC = APP_DIR / "account.jpg"
+_YT = "https://www.youtube.com"
+
+
+def read_cookie_values(path=None) -> dict:
+    vals = {}
+    try:
+        for line in Path(path or COOKIE_FILE).read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#") or not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and "youtube.com" in parts[0]:
+                vals[parts[5]] = parts[6].strip()
+    except OSError:
+        pass
+    return vals
+
+
+def _sid_auth(cookies: dict, origin=_YT) -> str:
+    """The Authorization header YouTube's own page sends for signed-in requests (SAPISIDHASH …)."""
+    import hashlib
+    ts = str(int(time.time()))
+    out = []
+    for scheme, names in (("SAPISIDHASH", ("SAPISID", "__Secure-3PAPISID")),
+                          ("SAPISID1PHASH", ("__Secure-1PAPISID",)), ("SAPISID3PHASH", ("__Secure-3PAPISID",))):
+        sid = next((cookies[n] for n in names if cookies.get(n)), None)
+        if sid:
+            out.append(f"{scheme} {ts}_{hashlib.sha1(f'{ts} {sid} {origin}'.encode()).hexdigest()}")
+    return " ".join(out)
+
+
+def _web_client_version() -> str:
+    for mod in ("yt_dlp.extractor.youtube._base", "yt_dlp.extractor.youtube"):
+        try:
+            import importlib
+            v = importlib.import_module(mod).INNERTUBE_CLIENTS["web"]["INNERTUBE_CONTEXT"]["client"]["clientVersion"]
+            if v:
+                return v
+        except Exception:  # noqa: BLE001
+            continue
+    return "2.20251120.01.00"
+
+
+def _yt_text(v) -> str:
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        if "simpleText" in v:
+            return str(v["simpleText"])
+        if "runs" in v:
+            return "".join(str(r.get("text", "")) for r in v["runs"] if isinstance(r, dict))
+        if "content" in v:
+            return str(v["content"])
+    return ""
+
+
+def _find(obj, test):
+    """First dict in a nested JSON for which test(dict) is true."""
+    stack = [obj]
+    while stack:
+        o = stack.pop(0)
+        if isinstance(o, dict):
+            if test(o):
+                return o
+            stack.extend(o.values())
+        elif isinstance(o, list):
+            stack.extend(o)
+    return None
+
+
+def _best_thumb(t) -> str:
+    th = [x for x in ((t or {}).get("thumbnails") or []) if isinstance(x, dict) and x.get("url")]
+    if not th:
+        return ""
+    url = max(th, key=lambda x: x.get("width") or 0)["url"]
+    url = "https:" + url if url.startswith("//") else url
+    return re.sub(r"=s\d+-", "=s176-", url)          # sharper picture
+
+
+def parse_account_menu(data: dict) -> dict:
+    """YouTube's account menu -> {'name', 'handle', 'email', 'photo'} (empty strings if missing)."""
+    h = _find(data, lambda d: "accountName" in d and ("accountPhoto" in d or "channelHandle" in d or "email" in d))
+    if not h:
+        return {}
+    return {"name": _yt_text(h.get("accountName")).strip(), "handle": _yt_text(h.get("channelHandle")).strip(),
+            "email": _yt_text(h.get("email")).strip(), "photo": _best_thumb(h.get("accountPhoto"))}
+
+
+def parse_home_avatar(html: str) -> str:
+    """Fallback: the round picture in the top right of youtube.com."""
+    i = html.find('"topbarMenuButtonRenderer"')
+    m = re.search(r'"avatar"\s*:\s*\{\s*"thumbnails"\s*:\s*(\[[^\]]*\])', html[i:] if i >= 0 else html)
+    if not m:
+        return ""
+    try:
+        return _best_thumb({"thumbnails": json.loads(m.group(1))})
+    except ValueError:
+        return ""
+
+
+def fetch_account(timeout=20.0) -> dict:
+    """Asks YouTube with the saved login which account it is -> saved in account.json (+ the picture)."""
+    cookies = read_cookie_values()
+    if not cookies:
+        raise RuntimeError("Not signed in.")
+    ydl = _net_ydl()
+    if ydl is None:
+        raise RuntimeError("yt-dlp is missing.")
+    from yt_dlp.networking import Request
+    ver = _web_client_version()
+    headers = {"Content-Type": "application/json", "Origin": _YT, "X-Origin": _YT, "Referer": _YT + "/",
+               "X-Goog-AuthUser": "0", "X-Youtube-Client-Name": "1", "X-Youtube-Client-Version": ver,
+               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                             "Chrome/142.0.0.0 Safari/537.36"}
+    auth = _sid_auth(cookies, _YT)
+    if auth:
+        headers["Authorization"] = auth
+    body = json.dumps({"context": {"client": {"clientName": "WEB", "clientVersion": ver, "hl": "en"}}}).encode()
+    info, err = {}, ""
+    try:
+        with ydl.urlopen(Request(_YT + "/youtubei/v1/account/account_menu?prettyPrint=false", data=body,
+                                 headers=headers, extensions={"timeout": timeout})) as r:
+            info = parse_account_menu(json.loads(r.read().decode("utf-8", "replace")))
+    except Exception as ex:  # noqa: BLE001
+        err = clean_error(ex)
+    if not info.get("photo"):
+        try:
+            with ydl.urlopen(Request(_YT + "/", headers={"User-Agent": headers["User-Agent"],
+                                                         "Accept-Language": "en"},
+                                     extensions={"timeout": timeout})) as r:
+                photo = parse_home_avatar(r.read().decode("utf-8", "replace"))
+            if photo:
+                info["photo"] = photo
+        except Exception as ex:  # noqa: BLE001
+            err = err or clean_error(ex)
+    if not info:
+        raise RuntimeError(err or "YouTube didn't say which account this is.")
+    pic = ""
+    if info.get("photo"):
+        try:
+            data = fetch_bytes(info["photo"], timeout=timeout)
+            if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:4] == b"RIFF":
+                APP_DIR.mkdir(parents=True, exist_ok=True)
+                ACCOUNT_PIC.write_bytes(data)
+                pic = str(ACCOUNT_PIC)
+        except Exception:  # noqa: BLE001 - name without picture is fine
+            pass
+    out = {"name": info.get("name", ""), "handle": info.get("handle", ""), "email": info.get("email", ""),
+           "picture": pic, "checked": time.time()}
+    if not pic:
+        ACCOUNT_PIC.unlink(missing_ok=True)
+    tmp = ACCOUNT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, ACCOUNT_FILE)
+    return out
+
+
+def load_account() -> dict:
+    """The saved account (name, picture …) – {} if not signed in or not known yet."""
+    if not login_state()["signed_in"]:
+        return {}
+    try:
+        d = json.loads(ACCOUNT_FILE.read_text(encoding="utf-8"))
+        if d.get("picture") and not Path(d["picture"]).is_file():
+            d["picture"] = ""
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def clear_account() -> None:
+    ACCOUNT_FILE.unlink(missing_ok=True)
+    ACCOUNT_PIC.unlink(missing_ok=True)
 
 
 # ---- sign-in with the default browser
@@ -1134,11 +1328,28 @@ def _ver(v) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", str(v or "0"))[:4])
 
 
+def _latest_base(timeout=8.0) -> str:
+    """Raw address of the newest commit. 'main' itself comes through GitHub's cache, which can show the old
+    version for ~5 minutes after an update – the commit's own address is always right."""
+    if UPDATE_BASE != f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/":
+        return UPDATE_BASE
+    try:
+        sha = fetch_bytes(f"https://api.github.com/repos/{UPDATE_REPO}/commits/main", timeout=timeout,
+                          headers={"Accept": "application/vnd.github.sha"}).decode("ascii", "replace").strip()
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            return f"https://raw.githubusercontent.com/{UPDATE_REPO}/{sha}/"
+    except Exception:  # noqa: BLE001 - GitHub API limit / offline -> the normal address
+        pass
+    return UPDATE_BASE
+
+
 def check_app_update(timeout=15.0) -> dict:
-    """version.json of the repo -> {'version', 'newer': bool, 'notes', …}"""
-    data = fetch_bytes(UPDATE_BASE + f"version.json?t={int(time.time())}", timeout=timeout)
+    """version.json of the repo -> {'version', 'newer': bool, 'notes', 'base', …}"""
+    base = _latest_base()
+    data = fetch_bytes(base + f"version.json?t={int(time.time())}", timeout=timeout)
     info = json.loads(data.decode("utf-8-sig"))
     info["newer"] = _ver(info.get("version")) > _ver(APP_VERSION)
+    info["base"] = base
     return info
 
 
@@ -1150,8 +1361,11 @@ def install_app_update(info, script, emit) -> Path:
     name = info.get("file") or "tfrog_ytclip.pyw"
     if "/" in name or "\\" in name:
         raise RuntimeError("Invalid update file name.")
+    base = info.get("base") or UPDATE_BASE
+    if not str(base).startswith(f"https://raw.githubusercontent.com/{UPDATE_REPO}/"):
+        base = UPDATE_BASE
     emit("status", f"Downloading version {info.get('version')} …")
-    data = fetch_bytes(UPDATE_BASE + f"{name}?t={int(time.time())}", timeout=60)
+    data = fetch_bytes(base + f"{name}?t={int(time.time())}", timeout=60)
     if info.get("sha256") and hashlib.sha256(data).hexdigest() != info["sha256"]:
         raise RuntimeError("The download doesn't match the checksum – try again in a few minutes.")
     compile(data.decode("utf-8"), name, "exec")         # never install a broken file
@@ -1159,7 +1373,7 @@ def install_app_update(info, script, emit) -> Path:
     for f in info.get("extra") or []:
         if isinstance(f, str) and "/" not in f and "\\" not in f and f != name:
             try:
-                extra[f] = fetch_bytes(UPDATE_BASE + f, timeout=60)
+                extra[f] = fetch_bytes(base + f, timeout=60)
             except Exception:  # noqa: BLE001 - optional files (icon …)
                 pass
     pip = [x for x in info.get("pip") or [] if isinstance(x, str) and re.match(r"^[\w.\[\],<>=!-]+$", x)]

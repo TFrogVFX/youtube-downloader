@@ -1,8 +1,8 @@
 {
-  "version": "2.8.1",
+  "version": "2.9.0",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "3753964cff648e102535fddeac7679adef4700e03e2c37225c3c4921b37c6c4a",
-  "notes": "Upscale option removed from Output (the picture keeps its size, a crop keeps the size of the box).",
+  "sha256": "545cbeed4e68169c03f5692786de081276990a4dfc0b1397f3bec889db432efd",
+  "notes": "Update button lights up when a new version is out (checked at every start and every 2 hours, no more 5-minute delay). Signed in: your YouTube profile picture and name in the top right and in the Settings. Preview: downloading a small copy is the standard now, streaming is an option in the Settings. Frame: 4:3 instead of 3:4, plus Custom – any shape, pull corners and sides or type the size in px. Tabs that can't be used are hidden (Volume for GIFs, Frame for audio).",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

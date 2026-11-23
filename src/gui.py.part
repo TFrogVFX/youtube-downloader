@@ -121,6 +121,10 @@ QPushButton#ghost {{ background: transparent; border: none; color: {c['muted']};
 QPushButton#ghost:hover {{ color: {c['text']}; }}
 QPushButton#ghost:disabled {{ color: {c['border_hi']}; }}
 QPushButton#ghost[state="ok"] {{ color: {c['accent']}; font-weight: 700; }}
+QPushButton#ghost[state="new"] {{ background: {c['accent']}; color: {c['on_accent']}; font-weight: 700;
+    border-radius: 11px; padding: 5px 12px; }}
+QPushButton#ghost[state="new"]:hover {{ background: {c['accent_hover']}; color: {c['on_accent']}; }}
+QPushButton#ghost[state="new"]:disabled {{ background: {c['panel2']}; color: {c['muted']}; }}
 QPushButton#chip {{ background: {c['panel2']}; border: 1px solid {c['border']}; border-radius: 12px;
     padding: 4px 12px; font-size: 12px; min-height: 16px; }}
 QPushButton#chip:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
@@ -648,7 +652,7 @@ class Thumb(QtWidgets.QWidget):
 
 class VideoCanvas(QtWidgets.QWidget):
     """Shows the frames of the player (from a QVideoSink) and draws on top: the crop box (drag to move,
-    corners to resize, the format stays) and the current subtitle line."""
+    corners to resize, the format stays; "Custom": any shape, sides too) and the current subtitle line."""
     boxChanged = Signal(object)    # (x, y, w, h) as fractions of the frame
     subMoved = Signal(object)      # (x, y) bottom center of the subtitles as fractions of the picture, or None
 
@@ -661,6 +665,7 @@ class VideoCanvas(QtWidgets.QWidget):
         self.img = None
         self.aspect = None
         self.box = None
+        self.box_label = ""            # text in the corner of the box (format or the size in px)
         self.sub_text = ""
         self.sub_style = dict(SUB_STYLE)
         self.ghost = False
@@ -762,6 +767,14 @@ class VideoCanvas(QtWidgets.QWidget):
         for name, pt in (("tl", b.topLeft()), ("tr", b.topRight()), ("bl", b.bottomLeft()), ("br", b.bottomRight())):
             if abs(pos.x() - pt.x()) <= self.H and abs(pos.y() - pt.y()) <= self.H:
                 return name
+        if self.aspect == FREE:            # any shape: the sides can be pulled too
+            inx, iny = b.left() < pos.x() < b.right(), b.top() < pos.y() < b.bottom()
+            for name, near in (("l", iny and abs(pos.x() - b.left()) <= self.H * 0.75),
+                               ("r", iny and abs(pos.x() - b.right()) <= self.H * 0.75),
+                               ("t", inx and abs(pos.y() - b.top()) <= self.H * 0.75),
+                               ("b", inx and abs(pos.y() - b.bottom()) <= self.H * 0.75)):
+                if near:
+                    return name
         return "move" if b.contains(pos) else "outside"
 
     def mousePressEvent(self, e):
@@ -815,6 +828,8 @@ class VideoCanvas(QtWidgets.QWidget):
             hit = self._hit(pos)
             cur = {"tl": Qt.CursorShape.SizeFDiagCursor, "br": Qt.CursorShape.SizeFDiagCursor,
                    "tr": Qt.CursorShape.SizeBDiagCursor, "bl": Qt.CursorShape.SizeBDiagCursor,
+                   "l": Qt.CursorShape.SizeHorCursor, "r": Qt.CursorShape.SizeHorCursor,
+                   "t": Qt.CursorShape.SizeVerCursor, "b": Qt.CursorShape.SizeVerCursor,
                    "move": Qt.CursorShape.SizeAllCursor, "outside": Qt.CursorShape.PointingHandCursor}.get(hit)
             self.setCursor(cur or Qt.CursorShape.ArrowCursor)
             return
@@ -822,6 +837,20 @@ class VideoCanvas(QtWidgets.QWidget):
         p0, b0 = self._grab
         if self._drag == "move":
             nb = b0.translated(pos - p0)
+        elif self.aspect == FREE:          # free: every side follows the mouse on its own
+            d = self._drag
+            mn = min(f.width(), f.height()) * 0.05
+            le, to, ri, bo = b0.left(), b0.top(), b0.right(), b0.bottom()
+            dx, dy = pos.x() - p0.x(), pos.y() - p0.y()
+            if d in ("tl", "bl", "l"):
+                le = min(max(le + dx, f.left()), ri - mn)
+            if d in ("tr", "br", "r"):
+                ri = max(min(ri + dx, f.right()), le + mn)
+            if d in ("tl", "tr", "t"):
+                to = min(max(to + dy, f.top()), bo - mn)
+            if d in ("bl", "br", "b"):
+                bo = max(min(bo + dy, f.bottom()), to + mn)
+            nb = QtCore.QRectF(QtCore.QPointF(le, to), QtCore.QPointF(ri, bo))
         else:
             aw, ah = self.aspect
             anchor = {"tl": b0.bottomRight(), "tr": b0.bottomLeft(), "bl": b0.topRight(), "br": b0.topLeft()}[self._drag]
@@ -893,7 +922,12 @@ class VideoCanvas(QtWidgets.QWidget):
             p.setBrush(QtGui.QColor(c["accent"]))
             for pt in (b.topLeft(), b.topRight(), b.bottomLeft(), b.bottomRight()):
                 p.drawRoundedRect(QtCore.QRectF(pt.x() - 5, pt.y() - 5, 10, 10), 2.5, 2.5)
-            lab = f"{self.aspect[0]}:{self.aspect[1]}"
+            if self.aspect == FREE:        # grips in the middle of the sides
+                cx, cy = b.center().x(), b.center().y()
+                for rr in (QtCore.QRectF(cx - 9, b.top() - 3, 18, 6), QtCore.QRectF(cx - 9, b.bottom() - 3, 18, 6),
+                           QtCore.QRectF(b.left() - 3, cy - 9, 6, 18), QtCore.QRectF(b.right() - 3, cy - 9, 6, 18)):
+                    p.drawRoundedRect(rr, 3, 3)
+            lab = self.box_label or ("Custom" if self.aspect == FREE else f"{self.aspect[0]}:{self.aspect[1]}")
             fn = self.font()
             fn.setBold(True)
             fn.setPointSizeF(max(7.5, fn.pointSizeF() - 1))
@@ -1025,6 +1059,19 @@ class TabBar(QtWidgets.QWidget):
 
     def set_badge(self, key, on):
         self.btns[key].setText(self.names[key] + ("  •" if on else ""))
+
+    def set_shown(self, key, on):
+        """Hides a tab that can't be used right now (e.g. Volume for GIFs); if it was open, Output opens."""
+        b = self.btns.get(key)
+        if b is None:
+            return
+        b.setVisible(bool(on))
+        if not on and self._val == key:
+            first = next(k for k, x in self.btns.items() if not x.isHidden())
+            self.set_value(first, emit=True)
+
+    def shown(self, key):
+        return not self.btns[key].isHidden()
 
     def set_tips(self, tips):
         for k, (t, x) in tips.items():
@@ -1748,6 +1795,138 @@ class PathLabel(QtWidgets.QLabel):
         self.setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideMiddle, max(40, self.width())))
 
 
+def round_pixmap(path, size, dpr=1.0):
+    """Picture file -> round QPixmap (None if it can't be read)."""
+    img = QtGui.QImage(str(path)) if path else QtGui.QImage()
+    if img.isNull():
+        return None
+    px = int(round(size * dpr))
+    img = img.scaled(px, px, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+    out = QtGui.QPixmap(px, px)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QtGui.QPainter(out)
+    p.setRenderHint(AA)
+    path_ = QtGui.QPainterPath()
+    path_.addEllipse(0, 0, px, px)
+    p.setClipPath(path_)
+    p.drawImage(QtCore.QRectF(0, 0, px, px), img,
+                QtCore.QRectF((img.width() - px) / 2, (img.height() - px) / 2, px, px))
+    p.end()
+    out.setDevicePixelRatio(dpr)
+    return out
+
+
+class AccountChip(QtWidgets.QAbstractButton):
+    """Profile picture + name of the signed-in YouTube account. Small in the window header, big in the Settings."""
+    def __init__(self, big=False):
+        super().__init__()
+        self.big = big
+        self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
+        self.acc = {}
+        self._pix = None
+        self.av = 40 if big else 26
+        self.setCursor(Qt.CursorShape.ArrowCursor if big else Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setVisible(False)
+
+    def set_colors(self, c):
+        self.c = c
+        self.update()
+
+    def set_account(self, acc):
+        """acc: {} = not signed in (hidden); {'signed_in': True, 'name', 'handle', 'email', 'picture'}"""
+        self.acc = dict(acc or {})
+        self._pix = round_pixmap(self.acc.get("picture"), self.av, self.devicePixelRatioF()) if self.acc else None
+        self.setVisible(bool(self.acc))
+        name, sub = self._lines()
+        tipt = f"Signed in to YouTube as {name}" + (f" ({sub})" if sub else "") if self.acc.get("name") else \
+            "Signed in to YouTube"
+        self.setToolTip(tip_html("YouTube account", tipt + ("" if self.big else " – click for the Settings.")))
+        self.updateGeometry()
+        self.update()
+
+    def _lines(self):
+        a = self.acc
+        name = a.get("name") or "Signed in"
+        sub = "  ·  ".join(x for x in (a.get("handle"), a.get("email")) if x)
+        if not a.get("name") and not sub:
+            sub = "YouTube account" if self.big else ""
+        return name, sub
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        name, sub = self._lines()
+        if self.big:
+            bf = QtGui.QFont(self.font())
+            bf.setBold(True)
+            w = max(QtGui.QFontMetrics(bf).horizontalAdvance(name), fm.horizontalAdvance(sub))
+            return QtCore.QSize(min(self.av + 12 + w + 4, 380), self.av + 4)
+        return QtCore.QSize(3 + self.av + 8 + min(fm.horizontalAdvance(name), 170) + 10 + 4, 32)
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.update()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self.update()
+
+    def paintEvent(self, _e):
+        c = self.c
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        p.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
+        hover = self.underMouse() and not self.big
+        if hover:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(c["panel2"]))
+            p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
+        x0 = 2 if self.big else 3
+        y0 = (self.height() - self.av) / 2
+        r = QtCore.QRectF(x0, y0, self.av, self.av)
+        name, sub = self._lines()
+        if self._pix is not None:
+            p.drawPixmap(r.topLeft(), self._pix)
+        else:                                   # no picture: first letter on the accent color, like Google does
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(c["accent"]))
+            p.drawEllipse(r)
+            f = QtGui.QFont(self.font())
+            f.setBold(True)
+            f.setPixelSize(int(self.av * 0.46))
+            p.setFont(f)
+            p.setPen(QtGui.QColor(c["on_accent"]))
+            letter = (self.acc.get("name") or "").strip()[:1].upper() or "✓"
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, letter)
+        p.setPen(Qt.PenStyle.NoPen)                 # small "signed in" dot
+        if not self.big:
+            p.setBrush(QtGui.QColor(c["panel"]))
+            p.drawEllipse(QtCore.QPointF(r.right() - 3, r.bottom() - 3), 5, 5)
+            p.setBrush(QtGui.QColor("#3ddc84"))
+            p.drawEllipse(QtCore.QPointF(r.right() - 3, r.bottom() - 3), 3.2, 3.2)
+        tx = r.right() + (12 if self.big else 8)
+        tw = self.width() - tx - (2 if self.big else 10)
+        fm = self.fontMetrics()
+        if self.big:
+            bf = QtGui.QFont(self.font())
+            bf.setBold(True)
+            p.setFont(bf)
+            p.setPen(QtGui.QColor(c["text"]))
+            p.drawText(QtCore.QRectF(tx, y0, tw, self.av / 2), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       QtGui.QFontMetrics(bf).elidedText(name, Qt.TextElideMode.ElideRight, int(tw)))
+            p.setFont(self.font())
+            p.setPen(QtGui.QColor(c["muted"]))
+            p.drawText(QtCore.QRectF(tx, y0 + self.av / 2, tw, self.av / 2),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       fm.elidedText(sub, Qt.TextElideMode.ElideRight, int(tw)))
+        else:
+            p.setFont(self.font())
+            p.setPen(QtGui.QColor(c["text"] if hover else c["muted"]))
+            p.drawText(QtCore.QRectF(tx, 0, tw, self.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       fm.elidedText(name, Qt.TextElideMode.ElideRight, int(tw)))
+        p.end()
+
+
 class MuteButton(QtWidgets.QAbstractButton):
     """Speaker next to the preview volume: 0, 1 or 2 sound waves for the level, crossed out when silent."""
     def __init__(self):
@@ -1827,7 +2006,7 @@ def _dir_buttons(on_open, on_change, on_default):
 
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent, theme, accent, tips_on, apply, apply_tips, auto_pv=True, apply_pv=None,
-                 pv_mode="stream", apply_mode=None):
+                 pv_mode="download", apply_mode=None):
         super().__init__(parent)
         self.main = parent
         self.setWindowTitle("Settings")
@@ -1917,14 +2096,15 @@ class SettingsDialog(QtWidgets.QDialog):
         lay.addStretch(1)
 
         right.addWidget(section("Video preview"))
-        self.seg_pv = Segmented([("stream", "Stream from YouTube"), ("download", "Download small copy")])
+        self.seg_pv = Segmented([("download", "Download small copy"), ("stream", "Stream from YouTube")])
         self.seg_pv.set_tips({
-            "stream": ("Stream from YouTube", "Plays the video straight from YouTube in the app's player – starts at "
-                                              "once, nothing is saved, no ads (no Premium needed). Needs internet while "
-                                              "you work. If streaming doesn't work, a small copy is downloaded instead."),
-            "download": ("Download small copy", "Downloads a 360p copy first. Jumping and frame steps are a bit "
-                                                "snappier and it works offline once loaded.")})
-        self.seg_pv.set_value(pv_mode if pv_mode in ("stream", "download") else "stream")
+            "download": ("Download small copy (standard)", "Downloads a small copy first (360p, less for long videos) "
+                                                           "and plays that – the most reliable way. Jumping and frame "
+                                                           "steps are snappy and it works offline once loaded."),
+            "stream": ("Stream from YouTube", "Plays the video straight from YouTube – starts at once, nothing is "
+                                              "saved, no ads. Needs internet while you work. If YouTube refuses the "
+                                              "stream on your PC, a small copy is downloaded instead.")})
+        self.seg_pv.set_value(pv_mode if pv_mode in ("stream", "download") else "download")
         if apply_mode:
             self.seg_pv.changed.connect(apply_mode)
         right.addWidget(self.seg_pv)
@@ -1967,6 +2147,9 @@ class SettingsDialog(QtWidgets.QDialog):
             self.cb_pv.setText("Video preview not available (run the setup again)")
         right.addSpacing(4)
         right.addWidget(section("YouTube login"))
+        self.acc_card = AccountChip(big=True)
+        self.acc_card.set_colors(theme_colors(self.main.theme, self.main.accent))
+        right.addWidget(self.acc_card)
         self.lbl_login = label("", "muted")
         self.lbl_login.setWordWrap(True)
         right.addWidget(self.lbl_login)
@@ -2014,9 +2197,11 @@ class SettingsDialog(QtWidgets.QDialog):
             self.btn_login.setText("Cancel sign-in")
             tip(self.btn_login, "Cancel sign-in", f"Closes the {si.b['name']} sign-in window.")
             return
+        self.acc_card.set_account(self.main.account if st["signed_in"] else {})
         if st["signed_in"]:
             when = time.strftime("%d.%m.%Y", time.localtime(st["since"])) if st["since"] else ""
-            self.lbl_login.setText(f"✓ Signed in to YouTube{' (since ' + when + ')' if when else ''}. Used for every "
+            who = "" if self.main.account.get("name") else " to YouTube"
+            self.lbl_login.setText(f"✓ Signed in{who}{' since ' + when if when else ''}. Used for every "
                                    "download – needed for age-restricted or members-only videos.")
             self.btn_login.setText("Sign out")
             self.btn_login.setEnabled(True)
@@ -2054,6 +2239,7 @@ class SettingsDialog(QtWidgets.QDialog):
             return
         apply_login()
         self.main._on_log("✓ YouTube login loaded from a cookies file.")
+        self.main._refresh_account(force=True)
         self.show_login_state()
 
     def _hist_toggled(self, on):
@@ -2212,6 +2398,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._font_files: dict[str, str] = {}
         self._load_app_fonts()
         self._app_update = None
+        self.account = {}
 
         refresh_path()
         self.ffmpeg = find_tool("ffmpeg")
@@ -2232,6 +2419,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.cfg.get("accent_v28") and str(self.cfg.get("accent", "")).lower() == "#c4f240":
             self.cfg["accent"] = DEFAULT_ACCENT          # the old default (lime) -> the new one (red)
         self.cfg["accent_v28"] = True
+        if not self.cfg.get("preview_v29"):
+            self.cfg["preview_mode"] = "download"       # new standard: small copy; streaming is an option
+        self.cfg["preview_v29"] = True
         self.accent = self.cfg.get("accent") or DEFAULT_ACCENT
         self.apply_theme(self.theme, self.accent, save=False)
         self._load_settings()
@@ -2250,8 +2440,13 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(400, self._grab_clipboard)
         self._check_tools()
         self._maybe_update()
-        if time.time() - float(self.cfg.get("last_app_check", 0)) > UPDATE_INTERVAL:
-            QtCore.QTimer.singleShot(3000, lambda: self._check_app_update(manual=False))
+        QtCore.QTimer.singleShot(1200, self._refresh_account)
+        # new app version: look on every start and every 2 hours – the Update button lights up when there is one
+        QtCore.QTimer.singleShot(3000, lambda: self._check_app_update(manual=False))
+        self._app_upd_timer = QtCore.QTimer(self)
+        self._app_upd_timer.setInterval(2 * 3600 * 1000)
+        self._app_upd_timer.timeout.connect(lambda: self._check_app_update(manual=False))
+        self._app_upd_timer.start()
 
     # ------------------------------------------------------------------ layout
     def _build(self):
@@ -2274,6 +2469,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_settings.setObjectName("ghost")
         self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_settings.clicked.connect(self._settings)
+        self.chip_account = AccountChip()
+        self.chip_account.clicked.connect(self._settings)
+        head.addWidget(self.chip_account, 0, Qt.AlignmentFlag.AlignTop)
+        head.addSpacing(4)
         head.addWidget(self.btn_settings, 0, Qt.AlignmentFlag.AlignTop)
         v.addLayout(head)
 
@@ -2751,13 +2950,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _page_frame(self):
         w, g = self._grid()
         h_fmt = ("Crops the picture to this format. A box appears in the preview: drag it to move, drag a corner to "
-                 "resize. With several clips every clip keeps its own box.")
+                 "resize. Custom: any shape – pull the corners and sides, or type the size. With several clips every "
+                 "clip keeps its own box.")
         self.seg_aspect = Segmented([(k, k) for k in ASPECTS])
         self.seg_aspect.set_tips({"Off": ("Off", "Keep the whole picture."),
                                   "16:9": ("16:9", "Landscape – YouTube, TV."),
                                   "9:16": ("9:16", "Vertical – Shorts, Reels, TikTok."),
                                   "1:1": ("1:1", "Square."),
-                                  "3:4": ("3:4", "Portrait.")})
+                                  "4:3": ("4:3", "Classic TV / old camcorder format."),
+                                  "Custom": ("Custom", "Any shape: pull the corners and the sides of the box in the "
+                                                       "preview as you like, or type the exact size in pixels.")})
         self.seg_aspect.changed.connect(self._aspect_changed)
         g.addWidget(self._field("Format", "Format", h_fmt), 0, 0)
         g.addWidget(self.seg_aspect, 0, 1, 1, 2)
@@ -2770,8 +2972,28 @@ class MainWindow(QtWidgets.QMainWindow):
                               "Puts the box in the middle again, as big as possible.")
         self.btn_center.setObjectName("chip")
         self.btn_center.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_center.clicked.connect(lambda: self.canvas.reset_box() if self.canvas is not None else None)
+        self.btn_center.clicked.connect(self._center_box)
         row.addWidget(self.btn_center)
+        # Custom: exact size in pixels
+        self.free_row = QtWidgets.QWidget()
+        fr = QtWidgets.QHBoxLayout(self.free_row)
+        fr.setContentsMargins(8, 0, 0, 0)
+        fr.setSpacing(6)
+        self.ed_cw, self.ed_ch = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
+        for ed, what in ((self.ed_cw, "Width"), (self.ed_ch, "Height")):
+            ed.setValidator(QtGui.QIntValidator(16, 16384, ed))
+            ed.setFixedWidth(64)
+            ed.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            tip(ed, f"{what} in pixels", "Size of the crop in pixels of the video (even numbers – odd ones are "
+                                         "rounded). Enter keeps the middle of the box where it is.")
+            ed.editingFinished.connect(self._free_size_typed)
+        fr.addWidget(label("Size", "muted"))
+        fr.addWidget(self.ed_cw)
+        fr.addWidget(label("×", "muted"))
+        fr.addWidget(self.ed_ch)
+        fr.addWidget(label("px", "muted"))
+        self.free_row.setVisible(False)
+        row.addWidget(self.free_row)
         row.addStretch(1)
         g.addLayout(row, 2, 1, 1, 2)
         g.setRowStretch(3, 1)
@@ -3039,6 +3261,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._thumb_clicked()          # the box needs the picture
         self._frame_info()
 
+    def _center_box(self):
+        if self.canvas is not None and self.canvas.frame_size():
+            self.canvas.reset_box()
+        elif self._aspect():
+            self._box_changed(None)
+
+    def _free_size_typed(self):
+        """Custom: the typed size (px) -> box, the middle of the box stays where it is."""
+        d = self._src_dims()
+        if self._aspect() != FREE or not d:
+            return
+        W, H = d
+        try:
+            w, h = int(self.ed_cw.text()), int(self.ed_ch.text())
+        except ValueError:
+            self._frame_info()
+            return
+        w, h = min(max(16, w), W), min(max(16, h), H)
+        x, y, bw, bh = self.box or center_box(FREE, W, H)
+        mx, my = x + bw / 2, y + bh / 2
+        nw, nh = w / W, h / H
+        box = (min(max(mx - nw / 2, 0.0), 1.0 - nw), min(max(my - nh / 2, 0.0), 1.0 - nh), nw, nh)
+        if self.canvas is not None:
+            self.canvas.set_box(box)
+        self._box_changed(box)
+
     def _box_changed(self, box):
         self.box = box
         if self._multi() and self.clips and self.cur < len(self.clips):
@@ -3082,18 +3330,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seg_aspect.setEnabled(mode in ("mp4", "gif"))
         self.btn_center.setVisible(bool(self._aspect()) and self.canvas is not None)
         aspect = self._aspect()
+        self.free_row.setVisible(aspect == FREE)
         dims = self._frame_dims() if mode != "mp3" else None
         if mode == "mp3":
             ftxt = "Audio has no picture – switch to Video or GIF to crop."
         elif dims:
             cw, ch, ow, oh = dims
             ftxt = f"Crop {ow} × {oh}" if aspect else f"Picture {cw} × {ch}"
+            if aspect == FREE:
+                for ed, v in ((self.ed_cw, ow), (self.ed_ch, oh)):
+                    if not ed.hasFocus():
+                        ed.setText(str(v))
+                W, H = self._src_dims()
+                ftxt = f"Crop {ow} × {oh} of {W} × {H}"
             if not is_mp4:
                 ftxt += "  ·  the GIF width is set in Output"
-            if aspect and self.canvas is not None:
+            if aspect == FREE and self.canvas is not None:
+                ftxt += ".  Pull the corners or sides of the box in the preview."
+            elif aspect and self.canvas is not None:
                 ftxt += ".  Drag the box in the preview."
         else:
             ftxt = "Paste a link or open a file – the sizes appear here." if aspect else ""
+        if self.canvas is not None:
+            lab = f"{dims[2]} × {dims[3]}" if aspect == FREE and dims else ""
+            if lab != self.canvas.box_label:
+                self.canvas.box_label = lab
+                self.canvas.update()
         self.frame_hint.setText(ftxt)
         self._badges()
 
@@ -3486,6 +3748,7 @@ class MainWindow(QtWidgets.QMainWindow):
             LOGIN_NOTE.clear()
             self._login_noted = False
             self._on_log(f"✓ Signed in to YouTube (via {name}) – the login is used for every download.")
+            self._refresh_account(force=True)
             self._on_status("✓  Signed in to YouTube.")
             set_state(self.status, "ok")
             self.raise_()
@@ -3511,7 +3774,48 @@ class MainWindow(QtWidgets.QMainWindow):
             self._default_browser = default_browser()
         return self._default_browser
 
+    def _refresh_account(self, force=False):
+        """Which account is signed in (name + picture): from the saved file, looked up again in the background
+        after a sign-in or when it's older than half a day."""
+        if not login_state()["signed_in"]:
+            self.account = {}
+            self.chip_account.set_account({})
+            return
+        acc = load_account()
+        self.account = {"signed_in": True, **acc}
+        self.chip_account.set_account(self.account)
+        if not force and acc and time.time() - float(acc.get("checked") or 0) < 12 * 3600:
+            return
+        if getattr(self, "_acc_busy", False):
+            return
+        self._acc_busy = True
+
+        def work():
+            try:
+                self.emit("account", ("ok", fetch_account()))
+            except Exception as ex:  # noqa: BLE001
+                self.emit("account", ("err", clean_error(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_account(self, val):
+        kind, v = val
+        self._acc_busy = False
+        if not login_state()["signed_in"]:          # signed out meanwhile
+            clear_account()
+            self.account = {}
+        elif kind == "ok":
+            self.account = {"signed_in": True, **v}
+            if v.get("name"):
+                self._on_log(f"YouTube account: {v['name']}" + (f" ({v['handle']})" if v.get("handle") else ""))
+        else:
+            self._on_log(f"Couldn't read the name of the YouTube account ({v}) – the login itself works.")
+        self.chip_account.set_account(self.account)
+        self._login_state_changed()
+
     def _login_state_changed(self):
+        if not login_state()["signed_in"] and self.account:
+            self.account = {}
+            self.chip_account.set_account({})
         dlg = getattr(self, "settings_dlg", None)
         if dlg is not None:
             dlg.show_login_state()
@@ -3616,6 +3920,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thumb.set_colors(c)
         self.lane.set_colors(c)
         self.btn_mute.set_colors(c)
+        self.chip_account.set_colors(c)
+        dlg = getattr(self, "settings_dlg", None)
+        if dlg is not None and hasattr(dlg, "acc_card"):
+            dlg.acc_card.set_colors(c)
         if self.canvas is not None:
             self.canvas.set_colors(c)
         set_dark_titlebar(self, c["dark"])
@@ -3677,7 +3985,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _settings(self):
         dlg = SettingsDialog(self, self.theme, self.accent, self.tip_filter.enabled,
                              self.apply_theme, self.set_tooltips, bool(self.cfg.get("auto_preview", True)),
-                             self._set_auto_preview, self.cfg.get("preview_mode", "stream"), self._set_preview_mode)
+                             self._set_auto_preview, self.cfg.get("preview_mode", "download"), self._set_preview_mode)
         self.settings_dlg = dlg
         dlg.exec()
         self.settings_dlg = None
@@ -3716,6 +4024,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _mode_changed(self, mode):
         self.stack.setCurrentIndex(["mp4", "mp3", "gif"].index(mode))
+        self.tabs.set_shown("frame", mode != "mp3")      # audio has no picture
+        self.tabs.set_shown("volume", mode != "gif")     # GIFs have no sound
         self._fit_stack(self.stack)
         self._fit_stack(self.tabstack)
         self._refresh_ext()
@@ -4115,7 +4425,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.player.pause()
 
     def _pv_mode(self):
-        return self.cfg.get("preview_mode", "stream")
+        return self.cfg.get("preview_mode", "download")
 
     def _can_stream(self, url=None):
         url = url or self.info_url
@@ -5090,10 +5400,12 @@ class MainWindow(QtWidgets.QMainWindow):
             save_cfg(self.cfg)
             self.btn_app_upd.setEnabled(not self.busy)
             if info.get("newer"):
+                first = (self._app_update or {}).get("version") != info.get("version")
                 self._app_update = info
-                self.btn_app_upd.setText(f"Update app → {info.get('version')}")
-                set_state(self.btn_app_upd, "ok")
-                self._on_log(f"New app version {info.get('version')} available (you have {APP_VERSION}).")
+                self._show_app_update(info)
+                if first:
+                    self._on_log(f"New app version {info.get('version')} available (you have {APP_VERSION}) – "
+                                 "click “Update app” at the bottom.")
                 if not manual:
                     return
                 notes = str(info.get("notes") or "").strip()
@@ -5119,6 +5431,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._restart()
         elif kind == "install_err":
             self._on_error("App update failed: " + v)
+
+    def _show_app_update(self, info):
+        """Update button lit up in the accent color with a dot and the new version number."""
+        notes = str(info.get("notes") or "").strip()
+        self.btn_app_upd.setText(f"●  Update to {info.get('version')}")
+        set_state(self.btn_app_upd, "new")
+        self.btn_app_upd.updateGeometry()
+        tip(self.btn_app_upd, f"Version {info.get('version')} is ready",
+            f"You have {APP_VERSION}. Click to update – the app restarts afterwards."
+            + (f"\n\nNew: {notes[:400]}" if notes else ""))
 
     def _install_app_update(self, info):
         if self.busy:
