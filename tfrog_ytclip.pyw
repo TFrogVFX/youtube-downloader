@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -142,24 +142,13 @@ ITEM_HELP = {
     "Best (256 colors)": "Best-looking gradients and skin tones.",
     "Smaller (128 colors)": "Smaller file, slight banding in gradients.",
     "Smallest (64 colors)": "Smallest file, visible banding.",
-    # upscaling
-    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",  # enlarging: Lanczos
-    "2×": "Twice as wide and high.",
-    "3×": "Three times as wide and high.",
-    "4×": "Four times as wide and high.",
-    "To 1080p": "Short side 1080 px: 1920 × 1080, or 1080 × 1920 for a 9:16 crop (Reels / Shorts / TikTok).",
-    "To 1440p": "Short side 1440 px: 2560 × 1440, or 1440 × 2560 for 9:16.",
-    "To 4K (2160p)": "Short side 2160 px: 3840 × 2160, or 2160 × 3840 for 9:16.",
     # theme
     "Dark": "Neutral dark grey.",
     "Midnight": "Dark blue.",
     "Light": "Bright theme for daylight.",
 }
-# ---- frame (crop / output size / upscaling)
+# ---- frame (crop)
 ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "3:4": (3, 4)}
-# upscaling (Output tab): target of the result -> ("x", factor) or ("short", short side in px)
-UPSCALES = {"Off": None, "2×": ("x", 2), "3×": ("x", 3), "4×": ("x", 4), "To 1080p": ("short", 1080),
-            "To 1440p": ("short", 1440), "To 4K (2160p)": ("short", 2160)}
 # volume curve: how the volume goes from a point to the next one
 EASES = {"Linear": "linear", "Easy ease": "ease", "Ease in": "in", "Ease out": "out", "Hold": "hold"}
 FONTS_DIR = APP_DIR / "fonts"
@@ -5338,7 +5327,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tr2.addWidget(b_)
         self.btn_still = tip(QtWidgets.QPushButton("↓ Save frame"), "Save frame",
                              "Saves the frame you see as a PNG in full quality (not the preview quality) – with the "
-                             "crop from the Frame tab and the size from Output → Upscale.")
+                             "crop from the Frame tab.")
         self.btn_still.setObjectName("chip")
         self.btn_still.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_still.clicked.connect(self._save_still)
@@ -5659,15 +5648,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.size_hint = label("", "hint")
         self.size_hint.setWordWrap(True)
         g.addWidget(self.size_hint, 4, 1, 1, 3)
-        h_up = ("Makes the picture bigger (or sets the size of a 9:16 / 1:1 crop). 'To 1080p' = short side 1080 px, "
-                "e.g. 1080 × 1920 for Reels / Shorts.")
-        self.cb_up = self._combo(UPSCALES, "Upscale", h_up)
-        self.cb_up.currentTextChanged.connect(lambda _t: self._frame_info())
-        g.addWidget(self._field("Upscale", "Upscale", h_up), 5, 0)
-        g.addWidget(self.cb_up, 5, 1, 1, 3)
-        self.up_hint = label("", "hint")
-        self.up_hint.setWordWrap(True)
-        g.addWidget(self.up_hint, 6, 1, 1, 3)
         return w
 
     def _page_audio(self):
@@ -5708,8 +5688,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _page_frame(self):
         w, g = self._grid()
         h_fmt = ("Crops the picture to this format. A box appears in the preview: drag it to move, drag a corner to "
-                 "resize. With several clips every clip keeps its own box. The size of the result is set under "
-                 "Output → Upscale.")
+                 "resize. With several clips every clip keeps its own box.")
         self.seg_aspect = Segmented([(k, k) for k in ASPECTS])
         self.seg_aspect.set_tips({"Off": ("Off", "Keep the whole picture."),
                                   "16:9": ("16:9", "Landscape – YouTube, TV."),
@@ -6031,8 +6010,7 @@ class MainWindow(QtWidgets.QMainWindow):
         W, H = d
         aspect = self._aspect()
         cw, ch = (crop_rect(self.box, W, H, aspect)[:2]) if aspect else (W, H)
-        up = UPSCALES.get(self.cb_up.currentText()) if self.seg.value() == "mp4" else None
-        ow, oh = target_dims(cw, ch, up, aspect)
+        ow, oh = target_dims(cw, ch, None, aspect)
         return cw, ch, ow, oh
 
     def _frame_info(self):
@@ -6044,25 +6022,16 @@ class MainWindow(QtWidgets.QMainWindow):
         dims = self._frame_dims() if mode != "mp3" else None
         if mode == "mp3":
             ftxt = "Audio has no picture – switch to Video or GIF to crop."
-            utxt = ""
         elif dims:
             cw, ch, ow, oh = dims
-            ftxt = f"Crop {cw} × {ch}" if aspect else f"Picture {cw} × {ch}"
-            utxt = ""
-            if is_mp4 and (ow, oh) != (cw, ch):
-                f = ow / cw
-                utxt = f"{cw} × {ch}  →  {ow} × {oh}" + (f"  ·  {f:.1f}×" if f > 1.02 else "  ·  scaled down")
-                ftxt += f"  →  result {ow} × {oh} (Output → Upscale)"
-            elif not is_mp4:
+            ftxt = f"Crop {ow} × {oh}" if aspect else f"Picture {cw} × {ch}"
+            if not is_mp4:
                 ftxt += "  ·  the GIF width is set in Output"
             if aspect and self.canvas is not None:
                 ftxt += ".  Drag the box in the preview."
         else:
             ftxt = "Paste a link or open a file – the sizes appear here." if aspect else ""
-            utxt = ""
         self.frame_hint.setText(ftxt)
-        self.up_hint.setText(utxt)
-        self.up_hint.setVisible(bool(utxt))
         self._badges()
 
     def _badges(self):
@@ -6393,7 +6362,6 @@ class MainWindow(QtWidgets.QMainWindow):
         src = self.info["local"] if local else self.url.text().strip()
         fps = float(self.info.get("fps") or 0) or self._fps()
         aspect = self._aspect() if self.seg.value() != "mp3" else None
-        up = UPSCALES.get(self.cb_up.currentText()) if self.seg.value() == "mp4" else None
         height = QUALITIES.get(self.cb_quality.currentText())
         self._on_log(f"\n— Frame at {fmt_tc(t)} → {dst.name}")
         self._set_busy(True)
@@ -6405,7 +6373,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 if not local:
                     self.update_done.wait()
-                f = export_still(src, t, fps, dst, local=local, height=height, aspect=aspect, box=box, up=up,
+                f = export_still(src, t, fps, dst, local=local, height=height, aspect=aspect, box=box,
                                  ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, emit=self.emit)
                 self.emit("done", [str(f)])
             except Exception as ex:  # noqa: BLE001
@@ -6499,7 +6467,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sub_mode = self.seg_submode.value()
         fx = {
             "aspect": aspect, "boxes": boxes,
-            "up": UPSCALES.get(self.cb_up.currentText()) if mode == "mp4" else None,
             "vol": [tuple(q) for q in self.vol_pts] if mode in ("mp4", "mp3") else [],
             "subs": {"cues": self.sub_cues, "mode": None if sub_mode == "none" else sub_mode,
                      "lang": self.sub_lang, "style": dict(self.sub_style)} if self.sub_cues else None,
@@ -6536,7 +6503,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._vol_settle.stop()
         self.btn_mute.set_level(self.vol.value())
         self.seg_join.set_value("separate" if c.get("join") == "separate" else "join")
-        pick(self.cb_up, "upscale", UPSCALES, "Off")
         self.seg_aspect.set_value(c.get("aspect") if c.get("aspect") in ASPECTS else "Off")
         self.seg_submode.set_value(c.get("sub_mode") if c.get("sub_mode") in ("none", "burn", "track") else "none")
         self.cb_srt.setChecked(bool(c.get("save_srt", False)))
@@ -6570,7 +6536,7 @@ class MainWindow(QtWidgets.QMainWindow):
             gif_colors=self.cb_gif_col.currentText(), outdir=self.outdir.text().strip(),
             mode=self.seg.value(), theme=self.theme, accent=self.accent, save_thumb=self.cb_thumb.isChecked(),
             volume=self.vol.value(), vol_restore=self._vol_restore, join=self.seg_join.value(),
-            aspect=self.seg_aspect.value(), upscale=self.cb_up.currentText(),
+            aspect=self.seg_aspect.value(),
             sub_mode=self.seg_submode.value(), save_srt=self.cb_srt.isChecked(),
             geometry=bytes(self.saveGeometry().toBase64()).decode())
         try:

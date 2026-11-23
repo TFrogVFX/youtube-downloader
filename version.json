@@ -1,8 +1,8 @@
 {
-  "version": "2.8.0",
+  "version": "2.8.1",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "4f58a188c7db01b30de02e36344da537c1da600359b93d7cd7eb141ebfeab422",
-  "notes": "Save frame fixed: reads the frame through yt-dlp, else a short piece, else the picture-only file. Settings show the folders of the history and the small preview copies – change them, keep copies, delete them. Mute button next to the preview volume (key M). AI upscaler removed. Red is the default color.",
+  "sha256": "3753964cff648e102535fddeac7679adef4700e03e2c37225c3c4921b37c6c4a",
+  "notes": "Upscale option removed from Output (the picture keeps its size, a crop keeps the size of the box).",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

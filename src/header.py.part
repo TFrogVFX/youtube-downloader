@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -142,24 +142,13 @@ ITEM_HELP = {
     "Best (256 colors)": "Best-looking gradients and skin tones.",
     "Smaller (128 colors)": "Smaller file, slight banding in gradients.",
     "Smallest (64 colors)": "Smallest file, visible banding.",
-    # upscaling
-    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",  # enlarging: Lanczos
-    "2×": "Twice as wide and high.",
-    "3×": "Three times as wide and high.",
-    "4×": "Four times as wide and high.",
-    "To 1080p": "Short side 1080 px: 1920 × 1080, or 1080 × 1920 for a 9:16 crop (Reels / Shorts / TikTok).",
-    "To 1440p": "Short side 1440 px: 2560 × 1440, or 1440 × 2560 for 9:16.",
-    "To 4K (2160p)": "Short side 2160 px: 3840 × 2160, or 2160 × 3840 for 9:16.",
     # theme
     "Dark": "Neutral dark grey.",
     "Midnight": "Dark blue.",
     "Light": "Bright theme for daylight.",
 }
-# ---- frame (crop / output size / upscaling)
+# ---- frame (crop)
 ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "3:4": (3, 4)}
-# upscaling (Output tab): target of the result -> ("x", factor) or ("short", short side in px)
-UPSCALES = {"Off": None, "2×": ("x", 2), "3×": ("x", 3), "4×": ("x", 4), "To 1080p": ("short", 1080),
-            "To 1440p": ("short", 1440), "To 4K (2160p)": ("short", 2160)}
 # volume curve: how the volume goes from a point to the next one
 EASES = {"Linear": "linear", "Easy ease": "ease", "Ease in": "in", "Ease out": "out", "Hold": "hold"}
 FONTS_DIR = APP_DIR / "fonts"
