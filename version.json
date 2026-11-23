@@ -1,8 +1,8 @@
 {
-  "version": "2.9.10",
+  "version": "2.9.11",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "ec9a477a4a58b227c928790a8c443ed39862bced5fbd61fc3eb04eae2e7c9b23",
-  "notes": "Fix: signed in, YouTube offered no video – yt-dlp's JS challenge broke on YouTube's new player; the 'tv' player variant is used until yt-dlp is updated. AI upscaling: size in pixels (long side, presets up to 8K or custom)",
+  "sha256": "61422f445e95f002eb4a729195130a9b17a3268c83e9d41a3e8a513cde067cb7",
+  "notes": "Speed (0.25×–4×) for the saved file – the preview plays at that speed too; switching the preview quality keeps the position (also while streaming); Enter no longer starts the download",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

@@ -140,6 +140,8 @@ def fx_needed(kind, fx) -> bool:
         return False
     if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
         return True
+    if abs(float(fx.get("speed") or 1.0) - 1.0) > 1e-6:
+        return True
     if kind in ("mp4", "mp3") and any(abs(float(p[1]) - 1.0) > 1e-4 for p in fx.get("vol") or []):
         return True
     subs = fx.get("subs") or {}
@@ -460,6 +462,7 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
     elif kind == "gif" and mode == "track":
         mode = "burn"
     vol = fx.get("vol") or []
+    speed = float(fx.get("speed") or 1.0)
     steps = n + len(groups)
     step = [0]
 
@@ -493,7 +496,7 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                         cover = None
                 results.append(join_audio(ps, dst, afmt=params["afmt"], kbps=params["kbps"], ffmpeg=ffmpeg,
                                           ffprobe=ffprobe, emit=gemit, title=dst.stem, cover=cover, afx=afx,
-                                          label="Saving"))
+                                          label="Saving", speed=speed))
                 continue
             # picture: crop per clip, one output size for the file
             crops = []
@@ -506,6 +509,8 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                 segs.append((clips[k][0], clips[k][1], off))
                 off += inf["vdur"]
             mapped = map_cues(cues, segs) if mode else []
+            if mode == "track" and speed != 1.0:     # a subtitle track runs on the sped-up timeline
+                mapped = [(a / speed, b / speed, t) for a, b, t in mapped]
             post_vf, track = "", None
             if mode == "burn" and mapped:
                 style = subs.get("style") or {}
@@ -518,17 +523,18 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
             if kind == "mp4":
                 codec, profile = params["codec"], params["profile"]
                 enc = check_encoder(params["encoder"], ffmpeg, emit, codec)
-                total = sum(inf["vdur"] for inf in infos)
+                total = sum(inf["vdur"] for inf in infos) / speed
                 vargs, aargs = encode_args(enc, params["size"], params["target_mb"], total, codec, profile)
                 results.append(join_video(ps, dst, vargs=vargs, aargs=aargs, ffmpeg=ffmpeg, ffprobe=ffprobe,
                                           emit=gemit, crops=crops, size=(W, H), afx=afx, post_vf=post_vf,
                                           sub_track=track, sub_lang=subs.get("lang"), cwd=str(tmp),
-                                          label="Saving", infos=infos))
+                                          label="Saving", infos=infos, speed=speed))
             else:  # GIF: clean intermediate with crop + subtitles, then the usual palette
                 mid = tmp / f"gif{gi}.mp4"
                 join_video(ps, mid, vargs=["-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-pix_fmt",
                                            "yuv420p"], aargs=[], ffmpeg=ffmpeg, ffprobe=ffprobe, emit=gemit,
-                           audio=False, crops=crops, size=(W, H), post_vf=post_vf, cwd=str(tmp), infos=infos)
+                           audio=False, crops=crops, size=(W, H), post_vf=post_vf, cwd=str(tmp), infos=infos,
+                           speed=speed)
                 dur = media_info(mid, ffprobe)["duration"]
                 results.append(gif_encode(mid, dst, None, None, dur, params["width"], params["fps"], params["colors"],
                                           ffmpeg, gemit))

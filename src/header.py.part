@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.10"
+APP_VERSION = "2.9.11"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -151,6 +151,9 @@ ITEM_HELP = {
 # ---- frame (crop)
 # AI upscaling for pictures (Save frame / Save thumbnail) – label -> (engine, model, file key or None, help)
 AI_UPSCALES = {"Off": None, "2×": 2, "4×": 4}
+SPEEDS = {"0.25×": 0.25, "0.5×": 0.5, "0.75×": 0.75, "Normal (1×)": 1.0, "1.25×": 1.25, "1.5×": 1.5, "2×": 2.0,
+          "3×": 3.0, "4×": 4.0}
+DEFAULT_SPEED = "Normal (1×)"
 AI_MODELS = {
     "UltraSharp – photos, films": ("esrgan", "ultrasharp-4x", "ultrasharp",
                                    "4x-UltraSharp (Kim2091): very sharp, lots of detail – the favourite for real "

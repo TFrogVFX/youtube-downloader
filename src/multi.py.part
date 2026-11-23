@@ -192,9 +192,19 @@ def _audio_chain(i, dur, sr, exact=False, extra=""):
             f"{fit}{ex}afade=t=in:d=0.01,afade=t=out:st={fo:.3f}:d=0.01[a{i}]")
 
 
+def atempo(speed) -> str:
+    """Audio speed filter (keeps the pitch); atempo takes 0.5 … 100 per step."""
+    sp, parts = float(speed), []
+    while sp < 0.5:
+        parts.append("atempo=0.5")
+        sp /= 0.5
+    parts.append(f"atempo={sp:.6g}")
+    return ",".join(parts)
+
+
 def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, label="Joining clips",
                crops=None, size=None, afx=None, post_vf="", sub_track=None, sub_lang=None, cwd=None,
-               infos=None) -> Path:
+               infos=None, speed=1.0) -> Path:
     """Puts the pieces one after another (frame-accurate, one encode). All pieces get the size and
     frame rate of the first one.
     crops: per piece None or (w, h, x, y) in pixels · size: (w, h) of the result · afx: per piece extra audio
@@ -219,10 +229,17 @@ def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, 
         if has_a:
             parts.append(_audio_chain(i, inf["vdur"], first["sr"], exact=True, extra=(afx or [""] * len(infos))[i]))
         labels += f"[v{i}]" + (f"[a{i}]" if has_a else "")
-    vout = "[vc]" if post_vf else "[v]"
-    graph = ";".join(parts) + f";{labels}concat=n={len(pieces)}:v=1:a={1 if has_a else 0}{vout}" + ("[a]" if has_a else "")
-    if post_vf:
-        graph += f";[vc]{post_vf}[v]"
+    fast = abs(float(speed or 1.0) - 1.0) > 1e-6
+    vout = "[vc]" if (post_vf or fast) else "[v]"
+    aout = "[ac]" if fast else "[a]"
+    graph = ";".join(parts) + f";{labels}concat=n={len(pieces)}:v=1:a={1 if has_a else 0}{vout}" + (aout if has_a else "")
+    if post_vf or fast:     # burned-in subtitles first (source timing), then the speed
+        chain = ",".join(x for x in (post_vf, f"setpts=PTS/{float(speed):.6g},fps={rate}" if fast else "") if x)
+        graph += f";[vc]{chain}[v]"
+    if fast and has_a:
+        graph += f";[ac]{atempo(speed)}[a]"
+    if fast:
+        total /= float(speed)
     tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     for p in pieces:
@@ -247,13 +264,17 @@ def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, 
 
 
 def join_audio(pieces, dst, *, afmt, kbps, ffmpeg, ffprobe, emit, title=None, cover=None, afx=None,
-               label="Joining clips") -> Path:
+               label="Joining clips", speed=1.0) -> Path:
     infos = [media_info(p, ffprobe) for p in pieces]
     sr = infos[0]["sr"]
     total = sum(i["duration"] for i in infos)
     graph = ";".join(_audio_chain(i, inf["adur"], sr, extra=(afx or [""] * len(infos))[i])
                      for i, inf in enumerate(infos))
-    graph += ";" + "".join(f"[a{i}]" for i in range(len(pieces))) + f"concat=n={len(pieces)}:v=0:a=1[a]"
+    fast = abs(float(speed or 1.0) - 1.0) > 1e-6
+    graph += ";" + "".join(f"[a{i}]" for i in range(len(pieces))) + \
+        f"concat=n={len(pieces)}:v=0:a=1" + (f"[ac];[ac]{atempo(speed)}[a]" if fast else "[a]")
+    if fast:
+        total /= float(speed)
     tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     for p in pieces:

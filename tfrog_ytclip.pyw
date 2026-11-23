@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.10"
+APP_VERSION = "2.9.11"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -151,6 +151,9 @@ ITEM_HELP = {
 # ---- frame (crop)
 # AI upscaling for pictures (Save frame / Save thumbnail) – label -> (engine, model, file key or None, help)
 AI_UPSCALES = {"Off": None, "2×": 2, "4×": 4}
+SPEEDS = {"0.25×": 0.25, "0.5×": 0.5, "0.75×": 0.75, "Normal (1×)": 1.0, "1.25×": 1.25, "1.5×": 1.5, "2×": 2.0,
+          "3×": 3.0, "4×": 4.0}
+DEFAULT_SPEED = "Normal (1×)"
 AI_MODELS = {
     "UltraSharp – photos, films": ("esrgan", "ultrasharp-4x", "ultrasharp",
                                    "4x-UltraSharp (Kim2091): very sharp, lots of detail – the favourite for real "
@@ -1544,9 +1547,19 @@ def _audio_chain(i, dur, sr, exact=False, extra=""):
             f"{fit}{ex}afade=t=in:d=0.01,afade=t=out:st={fo:.3f}:d=0.01[a{i}]")
 
 
+def atempo(speed) -> str:
+    """Audio speed filter (keeps the pitch); atempo takes 0.5 … 100 per step."""
+    sp, parts = float(speed), []
+    while sp < 0.5:
+        parts.append("atempo=0.5")
+        sp /= 0.5
+    parts.append(f"atempo={sp:.6g}")
+    return ",".join(parts)
+
+
 def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, label="Joining clips",
                crops=None, size=None, afx=None, post_vf="", sub_track=None, sub_lang=None, cwd=None,
-               infos=None) -> Path:
+               infos=None, speed=1.0) -> Path:
     """Puts the pieces one after another (frame-accurate, one encode). All pieces get the size and
     frame rate of the first one.
     crops: per piece None or (w, h, x, y) in pixels · size: (w, h) of the result · afx: per piece extra audio
@@ -1571,10 +1584,17 @@ def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, 
         if has_a:
             parts.append(_audio_chain(i, inf["vdur"], first["sr"], exact=True, extra=(afx or [""] * len(infos))[i]))
         labels += f"[v{i}]" + (f"[a{i}]" if has_a else "")
-    vout = "[vc]" if post_vf else "[v]"
-    graph = ";".join(parts) + f";{labels}concat=n={len(pieces)}:v=1:a={1 if has_a else 0}{vout}" + ("[a]" if has_a else "")
-    if post_vf:
-        graph += f";[vc]{post_vf}[v]"
+    fast = abs(float(speed or 1.0) - 1.0) > 1e-6
+    vout = "[vc]" if (post_vf or fast) else "[v]"
+    aout = "[ac]" if fast else "[a]"
+    graph = ";".join(parts) + f";{labels}concat=n={len(pieces)}:v=1:a={1 if has_a else 0}{vout}" + (aout if has_a else "")
+    if post_vf or fast:     # burned-in subtitles first (source timing), then the speed
+        chain = ",".join(x for x in (post_vf, f"setpts=PTS/{float(speed):.6g},fps={rate}" if fast else "") if x)
+        graph += f";[vc]{chain}[v]"
+    if fast and has_a:
+        graph += f";[ac]{atempo(speed)}[a]"
+    if fast:
+        total /= float(speed)
     tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     for p in pieces:
@@ -1599,13 +1619,17 @@ def join_video(pieces, dst, *, vargs, aargs, ffmpeg, ffprobe, emit, audio=True, 
 
 
 def join_audio(pieces, dst, *, afmt, kbps, ffmpeg, ffprobe, emit, title=None, cover=None, afx=None,
-               label="Joining clips") -> Path:
+               label="Joining clips", speed=1.0) -> Path:
     infos = [media_info(p, ffprobe) for p in pieces]
     sr = infos[0]["sr"]
     total = sum(i["duration"] for i in infos)
     graph = ";".join(_audio_chain(i, inf["adur"], sr, extra=(afx or [""] * len(infos))[i])
                      for i, inf in enumerate(infos))
-    graph += ";" + "".join(f"[a{i}]" for i in range(len(pieces))) + f"concat=n={len(pieces)}:v=0:a=1[a]"
+    fast = abs(float(speed or 1.0) - 1.0) > 1e-6
+    graph += ";" + "".join(f"[a{i}]" for i in range(len(pieces))) + \
+        f"concat=n={len(pieces)}:v=0:a=1" + (f"[ac];[ac]{atempo(speed)}[a]" if fast else "[a]")
+    if fast:
+        total /= float(speed)
     tmp = dst.with_name(dst.stem + ".part" + dst.suffix)
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     for p in pieces:
@@ -2081,6 +2105,8 @@ def fx_needed(kind, fx) -> bool:
         return False
     if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
         return True
+    if abs(float(fx.get("speed") or 1.0) - 1.0) > 1e-6:
+        return True
     if kind in ("mp4", "mp3") and any(abs(float(p[1]) - 1.0) > 1e-4 for p in fx.get("vol") or []):
         return True
     subs = fx.get("subs") or {}
@@ -2401,6 +2427,7 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
     elif kind == "gif" and mode == "track":
         mode = "burn"
     vol = fx.get("vol") or []
+    speed = float(fx.get("speed") or 1.0)
     steps = n + len(groups)
     step = [0]
 
@@ -2434,7 +2461,7 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                         cover = None
                 results.append(join_audio(ps, dst, afmt=params["afmt"], kbps=params["kbps"], ffmpeg=ffmpeg,
                                           ffprobe=ffprobe, emit=gemit, title=dst.stem, cover=cover, afx=afx,
-                                          label="Saving"))
+                                          label="Saving", speed=speed))
                 continue
             # picture: crop per clip, one output size for the file
             crops = []
@@ -2447,6 +2474,8 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                 segs.append((clips[k][0], clips[k][1], off))
                 off += inf["vdur"]
             mapped = map_cues(cues, segs) if mode else []
+            if mode == "track" and speed != 1.0:     # a subtitle track runs on the sped-up timeline
+                mapped = [(a / speed, b / speed, t) for a, b, t in mapped]
             post_vf, track = "", None
             if mode == "burn" and mapped:
                 style = subs.get("style") or {}
@@ -2459,17 +2488,18 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
             if kind == "mp4":
                 codec, profile = params["codec"], params["profile"]
                 enc = check_encoder(params["encoder"], ffmpeg, emit, codec)
-                total = sum(inf["vdur"] for inf in infos)
+                total = sum(inf["vdur"] for inf in infos) / speed
                 vargs, aargs = encode_args(enc, params["size"], params["target_mb"], total, codec, profile)
                 results.append(join_video(ps, dst, vargs=vargs, aargs=aargs, ffmpeg=ffmpeg, ffprobe=ffprobe,
                                           emit=gemit, crops=crops, size=(W, H), afx=afx, post_vf=post_vf,
                                           sub_track=track, sub_lang=subs.get("lang"), cwd=str(tmp),
-                                          label="Saving", infos=infos))
+                                          label="Saving", infos=infos, speed=speed))
             else:  # GIF: clean intermediate with crop + subtitles, then the usual palette
                 mid = tmp / f"gif{gi}.mp4"
                 join_video(ps, mid, vargs=["-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-pix_fmt",
                                            "yuv420p"], aargs=[], ffmpeg=ffmpeg, ffprobe=ffprobe, emit=gemit,
-                           audio=False, crops=crops, size=(W, H), post_vf=post_vf, cwd=str(tmp), infos=infos)
+                           audio=False, crops=crops, size=(W, H), post_vf=post_vf, cwd=str(tmp), infos=infos,
+                           speed=speed)
                 dur = media_info(mid, ffprobe)["duration"]
                 results.append(gif_encode(mid, dst, None, None, dur, params["width"], params["fps"], params["colors"],
                                           ffmpeg, gemit))
@@ -7281,6 +7311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fetch_timer.setSingleShot(True)
         self._fetch_timer.setInterval(600)
         self._fetch_timer.timeout.connect(self._start_fetch)
+        self._resume_check = None
         self._seek_timer = QtCore.QTimer(self)
         self._seek_timer.setSingleShot(True)
         self._seek_timer.setInterval(35)
@@ -7341,7 +7372,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url.setPlaceholderText("Paste a YouTube link … or drop a video file here")
         self.url.setClearButtonEnabled(True)
         self.url.textChanged.connect(self._url_changed)
-        self.url.returnPressed.connect(self.start)
         tip(self.url, "Source", "A YouTube link (videos, Shorts, music) or the path of a file on your PC. "
                                 "You can also drop a file or link onto the window.")
         self.btn_paste = tip(QtWidgets.QPushButton("Paste"), "Paste",
@@ -7524,7 +7554,6 @@ class MainWindow(QtWidgets.QMainWindow):
             w.setAlignment(Qt.AlignmentFlag.AlignCenter)
             w.textEdited.connect(self._times_edited)
             w.editingFinished.connect(self._times_committed)
-            w.returnPressed.connect(self.start)
         tr.addWidget(label("from", "field"))
         tr.addWidget(self.t_from)
         tr.addWidget(label("to", "field"))
@@ -7608,7 +7637,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.changed.connect(self._tab_changed)
         R.addWidget(self.tabs)
         self.tabstack = QtWidgets.QStackedWidget()
-        self.tabstack.addWidget(self.stack)
+        outw = QtWidgets.QWidget()
+        ov = QtWidgets.QVBoxLayout(outw)
+        ov.setContentsMargins(0, 0, 0, 0)
+        ov.setSpacing(10)
+        ov.addWidget(self.stack)
+        sr = QtWidgets.QHBoxLayout()
+        sr.setSpacing(12)
+        h_speed = ("Makes the saved file faster or slower (picture and sound; the voice keeps its pitch). The preview "
+                   "plays at this speed too.")
+        self.lbl_speed = self._field("Speed", "Speed", h_speed)
+        self.cb_speed = self._combo(SPEEDS, "Speed", h_speed)
+        self.cb_speed.setCurrentText(DEFAULT_SPEED)
+        self.cb_speed.currentTextChanged.connect(self._speed_changed)
+        sr.addWidget(self.lbl_speed)
+        sr.addWidget(self.cb_speed, 1)
+        ov.addLayout(sr)
+        self.tabstack.addWidget(outw)
+        # one label column for the format pages and the Speed row (so the boxes line up)
+        grids = [self.stack.widget(i).layout() for i in range(self.stack.count())]
+        col = self.lbl_speed.sizeHint().width()
+        for g_ in grids:
+            if isinstance(g_, QtWidgets.QGridLayout):
+                for r_ in range(g_.rowCount()):
+                    it = g_.itemAtPosition(r_, 0)
+                    if it is not None and it.widget() is not None and g_.getItemPosition(g_.indexOf(it.widget()))[3] == 1:
+                        col = max(col, it.widget().sizeHint().width())
+        for g_ in grids:
+            if isinstance(g_, QtWidgets.QGridLayout):
+                g_.setColumnMinimumWidth(0, col)
+        self.lbl_speed.setFixedWidth(col)
         self.tabstack.addWidget(self._page_frame())
         self.tabstack.addWidget(self._page_volume())
         self.tabstack.addWidget(self._page_subs())
@@ -7620,7 +7678,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.name.setClearButtonEnabled(True)
         tip(self.name, "File name", "Leave empty to use the video title. An existing file is never "
                                     "overwritten – a number is added instead.")
-        self.name.returnPressed.connect(self.start)
         self.lbl_ext = tip(label(".mp4", "ext"), "File type", "Set by the format you picked.")
         nr.addWidget(self.name, 1)
         nr.addWidget(self.lbl_ext)
@@ -7775,6 +7832,18 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     # ------------------------------------------------------------------ AI upscaling (pictures only)
+    def _speed(self) -> float:
+        return SPEEDS.get(self.cb_speed.currentText(), 1.0)
+
+    def _speed_changed(self, _t=None):
+        sp = self._speed()
+        set_state(self.cb_speed, "on" if sp != 1.0 else "")
+        for pl in (getattr(self, "player", None), getattr(self, "aplayer", None)):
+            if pl is not None:
+                pl.setPlaybackRate(sp)
+        if hasattr(self, "_update_clip_info"):
+            self._update_clip_info()
+
     def _ai(self):
         """{'factor', 'model'} or None – for Save frame and Save thumbnail."""
         if self.ai_px:
@@ -8933,6 +9002,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "vol": [tuple(q) for q in self.vol_pts] if mode in ("mp4", "mp3") else [],
             "subs": {"cues": self.sub_cues, "mode": None if sub_mode == "none" else sub_mode,
                      "lang": self.sub_lang, "style": dict(self.sub_style)} if self.sub_cues else None,
+            "speed": self._speed(),
         }
         return fx
 
@@ -8953,6 +9023,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pick(self.cb_quality, "quality", QUALITIES, DEFAULT_QUALITY)
         pick(self.cb_size, "size", SIZES, DEFAULT_SIZE)
         pick(self.cb_encoder, "encoder", ENCODERS, DEFAULT_ENCODER)
+        pick(self.cb_speed, "speed", SPEEDS, DEFAULT_SPEED)
         self.ai_factor = AI_UPSCALES.get(c.get("ai_up"))
         self.ai_px = int(c["ai_px"]) if str(c.get("ai_px") or "").isdigit() else None
         self.ai_model = c.get("ai_model") if c.get("ai_model") in AI_MODELS else DEFAULT_AI_MODEL
@@ -9001,6 +9072,7 @@ class MainWindow(QtWidgets.QMainWindow):
             quality=self.cb_quality.currentText(), size=self.cb_size.currentText(),
             encoder=self.cb_encoder.currentText(), mp3_quality=self.cb_mp3.currentText(),
             ai_up=next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor), ai_px=self.ai_px,
+            speed=self.cb_speed.currentText(),
             ai_model=self.ai_model,
             codec=self.cb_codec.currentText(), audio_format=self.cb_afmt.currentText(),
             tooltips=self.tip_filter.enabled,
@@ -9478,6 +9550,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.player.durationChanged.connect(self._on_pdur)
                 self.player.playbackStateChanged.connect(self._on_pstate)
                 self.player.mediaStatusChanged.connect(self._on_mstatus)
+                self.player.seekableChanged.connect(lambda ok: ok and self._seek_target is not None
+                                                    and self._seek_timer.start())
                 self.player.errorOccurred.connect(self._on_perror)
             except Exception as ex:  # noqa: BLE001
                 self.player = None
@@ -9583,6 +9657,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.settings_dlg.seg_pv.set_value(mode)
             except Exception:  # noqa: BLE001 - dialog closed / no such control
                 pass
+        self._resume_play = self.player is not None and \
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         self._stop_playback()
         self._resume_at = pos
         url = self.info_url
@@ -9728,6 +9804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.aplayer is not None:
             self.aplayer.setSource(QtCore.QUrl())
         self.player.pause()      # shows the first frame
+        self._speed_changed()
         self.transport.show()
         self.vview.show_video(has_video)
         site = "YouTube"
@@ -9746,7 +9823,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._resume_at = None
         rng = self._cur_range()
         if resume:
+            self._resume_check = (max(0.0, resume), 0)
             self._seek_to(resume)
+            if getattr(self, "_resume_play", False):
+                self._resume_play = False
+                QtCore.QTimer.singleShot(700, lambda: self._has_media() and self.player.play())
         elif rng and rng[0] > 0:
             self._seek_to(rng[0])
 
@@ -9886,9 +9967,33 @@ class MainWindow(QtWidgets.QMainWindow):
             self._seek_timer.start()
 
     def _do_seek(self):
-        if self._seek_target is not None and self._has_media():
-            self._set_pos(self._seek_target)
+        if self._seek_target is None or not self._has_media():
+            return
+        st = self.player.mediaStatus()
+        ready = st in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia,
+                       QMediaPlayer.MediaStatus.BufferingMedia, QMediaPlayer.MediaStatus.EndOfMedia)
+        if not ready or not self.player.isSeekable():
+            return          # mediaStatusChanged / seekableChanged try again
+        t = self._seek_target
+        self._set_pos(t)
+        if self._resume_check is not None and self._resume_check[0] == t:
+            QtCore.QTimer.singleShot(450, self._check_resume)
+        else:
             self._seek_target = None
+
+    def _check_resume(self):
+        """After switching the preview: did the jump really happen? (Streams sometimes ignore the first one.)"""
+        chk = self._resume_check
+        if chk is None or not self._has_media():
+            self._seek_target = None
+            return
+        t, tries = chk
+        if abs(self.player.position() / 1000 - t) < 1.0 or tries >= 6:
+            self._resume_check, self._seek_target = None, None
+            return
+        self._resume_check = (t, tries + 1)
+        self._seek_target = t
+        self._seek_timer.start()
 
     def _on_handle_dragged(self, _which, t):
         if self._has_media() and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
