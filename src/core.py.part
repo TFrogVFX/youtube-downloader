@@ -1061,6 +1061,23 @@ class _Silent:
     def error(self, msg): pass
 
 
+def _vformats(info) -> list:
+    """The picture sizes the video has: [{'w', 'h', 'fps', 'tbr', 'size'}] – the best format per height."""
+    best = {}
+    for f in info.get("formats") or []:
+        if f.get("vcodec") in (None, "none") or not f.get("height") or not f.get("width"):
+            continue
+        if str(f.get("protocol") or "").startswith(("m3u8", "http_dash_segments")) and f.get("format_note") == "storyboard":
+            continue
+        key = (f["height"], f["width"])
+        cur = best.get(key)
+        rank = (f.get("fps") or 0, f.get("tbr") or 0)
+        if cur is None or rank > (cur["fps"] or 0, cur["tbr"] or 0):
+            best[key] = {"w": f["width"], "h": f["height"], "fps": f.get("fps"), "tbr": f.get("tbr"),
+                         "size": f.get("filesize") or f.get("filesize_approx"), "vcodec": f.get("vcodec")}
+    return sorted(best.values(), key=lambda x: (min(x["w"], x["h"]), x["fps"] or 0))
+
+
 def fetch_info(url: str) -> dict:
     """Title, channel, duration and thumbnail URL for the preview card."""
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
@@ -1084,6 +1101,9 @@ def fetch_info(url: str) -> dict:
         "thumbs": [t["url"] for t in reversed(info.get("thumbnails") or []) if t.get("url")],
         "playlist": len(list(entries)) if entries is not None else 0,
         "fps": info.get("fps") or max((f.get("fps") or 0 for f in info.get("formats") or []), default=0) or None,
+        "vformats": _vformats(info) if entries is None else [],
+        "abr": max((f.get("abr") or 0 for f in info.get("formats") or []
+                    if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")), default=0) or None,
         "stream": pick_streams(info) if entries is None else None,
         "streams": stream_choices(info) if entries is None else {},
     }

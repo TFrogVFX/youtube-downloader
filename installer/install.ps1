@@ -2,21 +2,24 @@
 # Installs: Python 3.12 (if missing), FFmpeg, Deno and an own Python environment with yt-dlp + PySide6,
 # and creates shortcuts on the desktop and in the Start menu. Run again to update the app.
 
-param([switch]$Exe)   # -Exe: started by YouTube-Downloader.exe (keep window open on errors)
+# -Exe: started in a console by the exe (keep the window open on errors)
+# -Gui: started hidden by the setup window of YouTube-Downloader.exe, one -Step at a time (its output is shown there)
+param([switch]$Exe, [switch]$Gui, [ValidateSet('all', 'check', 'python', 'ffmpeg', 'deno', 'venv', 'app')][string]$Step = 'all')
 
 $ErrorActionPreference = 'Continue'
 $AppName = 'YouTube Downloader'
-$AppVersion = '2.9.11'
+$AppVersion = '2.9.12'
 $OldNames = @('tfrog YT Clip')
 $AppDir  = Join-Path $env:LOCALAPPDATA 'tfrog_ytclip'
 $Script  = 'tfrog_ytclip.pyw'
 
-function Step($t) { Write-Host ''; Write-Host "== $t" -ForegroundColor Green }
+function Step($t) { if (-not $Gui) { Write-Host '' }; Write-Host "== $t" -ForegroundColor Green }
+function Run($s) { return ($Step -eq 'all' -or $Step -eq $s) }
 function Info($t) { Write-Host "   $t" -ForegroundColor DarkGray }
 function Warn($t) { Write-Host "   $t" -ForegroundColor Yellow }
 function Fail($t) {
     Write-Host ''; Write-Host "ERROR: $t" -ForegroundColor Red
-    if ($Exe) { Read-Host 'Press Enter to close' | Out-Null }
+    if ($Exe -and -not $Gui) { Read-Host 'Press Enter to close' | Out-Null }
     exit 1
 }
 function Has($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
@@ -123,7 +126,12 @@ function Refresh-Path {
 
 function Winget-Install($id) {
     Info "winget install $id"
-    winget install -e --id $id --silent --accept-source-agreements --accept-package-agreements
+    if ($Gui) {
+        winget install -e --id $id --silent --accept-source-agreements --accept-package-agreements --disable-interactivity 2>&1 |
+            ForEach-Object { $l = "$_".Trim(); if ($l -and $l -notmatch '^[\-\\|/ ]+$' -and $l -notmatch '[\u2580-\u259F]') { Info $l } }
+    } else {
+        winget install -e --id $id --silent --accept-source-agreements --accept-package-agreements
+    }
     Refresh-Path
 }
 
@@ -148,43 +156,59 @@ function Find-Python312 {
     return $null
 }
 
-Write-Host "$AppName (by tfrog) - Setup" -ForegroundColor Cyan
+Refresh-Path
+$Venv = Join-Path $AppDir 'venv'
+$vpy = Join-Path $Venv 'Scripts\python.exe'
+$pip = @('--upgrade', '--disable-pip-version-check')
+if ($Gui) { $pip += @('--progress-bar', 'off') }
+
+if (Run 'check') {
+Write-Host "$AppName (by tfrog) - Setup $AppVersion" -ForegroundColor Cyan
 if (-not (Test-Path (Join-Path $PSScriptRoot $Script))) { Fail "$Script not found. Please extract the whole ZIP first." }
 if (-not (Has 'winget')) { Fail 'winget is missing. Install "App Installer" from the Microsoft Store and run this again.' }
-Refresh-Path
 if (Test-AppRunning $Script) { Fail 'The YouTube Downloader is still running - please close it and start the setup again.' }
+}
 
+if (Run 'python') {
 Step '1/5  Python 3.12'
 $py = Find-Python312
 if (-not $py) { Winget-Install 'Python.Python.3.12'; $py = Find-Python312 }
 if (-not $py) { Fail 'Python 3.12 not found. Close this window and start the setup again.' }
 Info $py
+}
 
+if (Run 'ffmpeg') {
 Step '2/5  FFmpeg'
 if (Has 'ffmpeg') { Info 'already installed' } else { Winget-Install 'Gyan.FFmpeg' }
 if (-not (Has 'ffmpeg')) { Warn 'ffmpeg is not on PATH yet - it should work after restarting Windows.' }
+}
 
+if (Run 'deno') {
 Step '3/5  Deno (JavaScript runtime that yt-dlp needs for YouTube)'
 if (Has 'deno') { Info 'already installed' } else { Winget-Install 'DenoLand.Deno' }
 if (-not (Has 'deno')) { Warn 'deno is not on PATH yet - it should work after restarting Windows.' }
+}
 
+if (Run 'venv') {
 Step '4/5  Python environment (yt-dlp, PySide6)'
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-$Venv = Join-Path $AppDir 'venv'
-$vpy = Join-Path $Venv 'Scripts\python.exe'
 if (-not (Test-Path $vpy)) {
+    if (-not $py) { $py = Find-Python312 }
+    if (-not $py) { Fail 'Python 3.12 not found. Start the setup again.' }
     & $py -m venv $Venv
     if (-not (Test-Path $vpy)) { Fail 'Could not create the Python environment.' }
 } else { Info 'already there' }
-& $vpy -m pip install --upgrade --disable-pip-version-check -q pip
+& $vpy -m pip install @pip -q pip
 # PySide6-Addons brings QtMultimedia (the built-in video preview)
-& $vpy -m pip install --upgrade --disable-pip-version-check "yt-dlp[default]" PySide6-Essentials PySide6-Addons
+& $vpy -m pip install @pip "yt-dlp[default]" PySide6-Essentials PySide6-Addons
 if ($LASTEXITCODE -ne 0) { Fail 'Packages could not be installed (check your internet connection and start the setup again).' }
 & $vpy -c "import yt_dlp, PySide6.QtWidgets" 2>$null
 if ($LASTEXITCODE -ne 0) { Fail 'yt-dlp / PySide6 are installed but cannot be imported.' }
 & $vpy -c "import PySide6.QtMultimedia, PySide6.QtMultimediaWidgets" 2>$null
 if ($LASTEXITCODE -ne 0) { Warn 'The video preview module could not be loaded - the app works, just without the player.' }
+}
 
+if (Run 'app') {
 Step '5/5  App + shortcuts'
 Copy-Item -Force (Join-Path $PSScriptRoot $Script) (Join-Path $AppDir $Script)
 $icon = Join-Path $AppDir 'icon.ico'
@@ -215,5 +239,9 @@ Register-Uninstall 'tfrog_YTClip' 'YouTube Downloader' $icon
 
 Write-Host ''
 Write-Host "Done! '$AppName' is on your desktop and in the Start menu." -ForegroundColor Cyan
-Start-Process -FilePath $pyw -ArgumentList "`"$target`"" -WorkingDirectory $AppDir
-if ($Exe) { Start-Sleep -Seconds 3 }
+if (-not $Gui) {
+    Start-Process -FilePath $pyw -ArgumentList "`"$target`"" -WorkingDirectory $AppDir
+    if ($Exe) { Start-Sleep -Seconds 3 }
+}
+}
+exit 0

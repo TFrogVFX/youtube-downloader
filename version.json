@@ -1,8 +1,8 @@
 {
-  "version": "2.9.11",
+  "version": "2.9.12",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "61422f445e95f002eb4a729195130a9b17a3268c83e9d41a3e8a513cde067cb7",
-  "notes": "Speed (0.25×–4×) for the saved file – the preview plays at that speed too; switching the preview quality keeps the position (also while streaming); Enter no longer starts the download",
+  "sha256": "bb4e08796b4ce218dd8f6d597ae3c6487dd5b8f7d1c024ca4ac964e7fede01a2",
+  "notes": "Live YouTube button in the preview (pick the stream quality); the Output line always shows what you get (size, fps, format, length, \u2248 MB); setup opens its own window instead of PowerShell",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
@@ -10,5 +10,6 @@
   ],
   "extra": [
     "icon.ico"
-  ]
+  ],
+  "setup_sha256": "d425aa5b517ede6193988e0a632f88dccfcdc441ea2988eef015e466ec25b636"
 }

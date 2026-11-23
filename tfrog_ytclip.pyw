@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.11"
+APP_VERSION = "2.9.12"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -1278,6 +1278,23 @@ class _Silent:
     def error(self, msg): pass
 
 
+def _vformats(info) -> list:
+    """The picture sizes the video has: [{'w', 'h', 'fps', 'tbr', 'size'}] – the best format per height."""
+    best = {}
+    for f in info.get("formats") or []:
+        if f.get("vcodec") in (None, "none") or not f.get("height") or not f.get("width"):
+            continue
+        if str(f.get("protocol") or "").startswith(("m3u8", "http_dash_segments")) and f.get("format_note") == "storyboard":
+            continue
+        key = (f["height"], f["width"])
+        cur = best.get(key)
+        rank = (f.get("fps") or 0, f.get("tbr") or 0)
+        if cur is None or rank > (cur["fps"] or 0, cur["tbr"] or 0):
+            best[key] = {"w": f["width"], "h": f["height"], "fps": f.get("fps"), "tbr": f.get("tbr"),
+                         "size": f.get("filesize") or f.get("filesize_approx"), "vcodec": f.get("vcodec")}
+    return sorted(best.values(), key=lambda x: (min(x["w"], x["h"]), x["fps"] or 0))
+
+
 def fetch_info(url: str) -> dict:
     """Title, channel, duration and thumbnail URL for the preview card."""
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
@@ -1301,6 +1318,9 @@ def fetch_info(url: str) -> dict:
         "thumbs": [t["url"] for t in reversed(info.get("thumbnails") or []) if t.get("url")],
         "playlist": len(list(entries)) if entries is not None else 0,
         "fps": info.get("fps") or max((f.get("fps") or 0 for f in info.get("formats") or []), default=0) or None,
+        "vformats": _vformats(info) if entries is None else [],
+        "abr": max((f.get("abr") or 0 for f in info.get("formats") or []
+                    if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")), default=0) or None,
         "stream": pick_streams(info) if entries is None else None,
         "streams": stream_choices(info) if entries is None else {},
     }
@@ -4424,6 +4444,8 @@ QLabel#dragchip {{ background: {c['panel2']}; border: 1px dashed {c['accent']}; 
     padding: 6px 10px; font-weight: 600; }}
 QLabel#stepnum {{ background: {c['accent']}; color: {c['on_accent']}; border-radius: 12px; font-weight: 700; }}
 QLabel#hint {{ color: {c['muted']}; font-size: 12px; }}
+QLabel#outinfo {{ color: {c['text']}; font-size: 12px; background: {c['panel2']}; border: 1px solid {c['border']};
+    border-radius: 9px; padding: 7px 10px; }}
 QLabel#hint[state="warn"] {{ color: {c['warn']}; }}
 QLabel#hint[state="error"] {{ color: {c['err']}; }}
 QLabel#vtitle {{ font-size: 15px; font-weight: 600; }}
@@ -7484,6 +7506,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_ai.clicked.connect(self._ai_menu)
         tr2.addWidget(self.btn_ai)
         tr2.addStretch(1)
+        self.btn_live = QtWidgets.QPushButton("●  Live YouTube")
+        self.btn_live.setObjectName("chip")
+        self.btn_live.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_live.clicked.connect(self._toggle_live)
+        self.btn_live.hide()
+        tr2.addWidget(self.btn_live)
         self.lbl_pv_src = QtWidgets.QPushButton("")
         self.lbl_pv_src.setObjectName("srcChip")
         self.lbl_pv_src.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -7697,6 +7725,15 @@ class MainWindow(QtWidgets.QMainWindow):
                                                "For your own videos: the frame at the clip start.")
         R.addWidget(self.cb_thumb)
         R.addStretch(1)
+        self.lbl_out = label("", "outinfo")
+        self.lbl_out.setWordWrap(True)
+        tip(self.lbl_out, "What you get", "Size, frame rate and format of the file with the current settings – "
+                                          "the size in MB is an estimate.")
+        R.addWidget(self.lbl_out)
+        self._out_timer = QtCore.QTimer(self)
+        self._out_timer.setInterval(400)
+        self._out_timer.timeout.connect(self._update_out_info)
+        self._out_timer.start()
         self.btn = QtWidgets.QPushButton("Download MP4")
         self.btn.setObjectName("primary")
         self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -7832,6 +7869,97 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     # ------------------------------------------------------------------ AI upscaling (pictures only)
+    def _sel_len(self):
+        """Seconds of picture/sound that go into the file (before the speed)."""
+        dur = float(self.info.get("duration") or 0) if self._is_info_current() else 0.0
+        if self._multi():
+            return sum(max(0.0, b - a) for a, b in self.clips) or None
+        try:
+            s_, e_ = self._range()
+        except ValueError:
+            return None
+        e_ = dur if e_ is None else e_
+        return max(0.0, e_ - (s_ or 0.0)) if e_ else None
+
+    def _out_text(self):
+        if not self._is_info_current():
+            return ""
+        mode = self.seg.value()
+        sp = self._speed()
+        ln = self._sel_len()
+        out_len = ln / sp if ln else None
+        bits = []
+        mb = None
+        if mode == "mp3":
+            afmt = AUDIO_FORMATS.get(self.cb_afmt.currentText(), "mp3")
+            if afmt == "wav":
+                bits.append("WAV · uncompressed")
+                mb = out_len * 48000 * 2 * 2 / 1e6 if out_len else None
+            else:
+                kb = MP3_QUALITIES.get(self.cb_mp3.currentText(), 192)
+                bits.append(f"{afmt.upper()} · {kb} kbps")
+                mb = out_len * kb / 8 / 1000 if out_len else None
+        else:
+            local = bool(self.info.get("local"))
+            vf = self.info.get("vformats") or []
+            q = QUALITIES.get(self.cb_quality.currentText()) if mode == "mp4" else None
+            fps = self.info.get("fps")
+            tbr = None
+            if vf and not local:
+                ok = [f for f in vf if not q or min(f["w"], f["h"]) <= q] or vf[:1]
+                f = ok[-1]
+                w, h, fps, tbr = f["w"], f["h"], f.get("fps") or fps, f.get("tbr")
+            else:
+                d = self._src_dims()
+                if not d:
+                    return ""
+                w, h = d
+            aspect = self._aspect()
+            if aspect:
+                cw, ch = crop_rect(self.box, w, h, aspect)[:2]
+                w, h = target_dims(cw, ch, None, aspect)
+            if mode == "gif":
+                gw = GIF_WIDTHS.get(self.cb_gif_w.currentText(), 480)
+                if w > gw:
+                    w, h = gw, max(2, round(h * gw / w))
+                gfps = GIF_FPS.get(self.cb_gif_fps.currentText(), 15)
+                bits.append(f"{w}×{h} · {gfps} fps · GIF")
+            else:
+                codec, profile = self._codec()
+                cname = {"h264": "H.264", "hevc": "H.265"}.get(codec) or \
+                    ("ProRes 422 HQ" if profile == 3 else "ProRes 422")
+                short = min(w, h)
+                pl = f" ({short}p)" if short in (2160, 1440, 1080, 720, 480, 360, 240, 144) else ""
+                bits.append(f"{w}×{h}{pl}" + (f" · {fps:g} fps" if fps else "") + f" · {cname}")
+                size = self.cb_size.currentText()
+                if SIZES.get(size) == "mb" and codec != "prores":
+                    try:
+                        mb = float(self.target_mb.text().replace(",", "."))
+                    except ValueError:
+                        mb = None
+                elif SIZES.get(size) is None and codec == "h264" and tbr and out_len:
+                    mb = out_len * (tbr + (self.info.get("abr") or 128)) / 8 / 1000
+                if q and vf and not local and max(min(f["w"], f["h"]) for f in vf) < q:
+                    bits.append(f"video has max {max(min(f['w'], f['h']) for f in vf)}p")
+        if sp != 1.0:
+            bits.append(f"{sp:g}× speed")
+        if out_len:
+            bits.append(fmt_t(out_len) if out_len >= 60 else f"{out_len:.1f} s")
+        if mb:
+            bits.append(f"≈ {mb:.0f} MB" if mb >= 10 else f"≈ {mb:.1f} MB")
+        return "Output:  " + "  ·  ".join(bits)
+
+    def _update_out_info(self):
+        if not self.isVisible():
+            return
+        try:
+            t = self._out_text()
+        except Exception:  # noqa: BLE001 - only a hint
+            t = ""
+        if t != self.lbl_out.text():
+            self.lbl_out.setText(t)
+        self.lbl_out.setVisible(bool(t))
+
     def _speed(self) -> float:
         return SPEEDS.get(self.cb_speed.currentText(), 1.0)
 
@@ -9245,8 +9373,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 txt = f"{verb} {ext}"
             self.btn.setText(txt)
-            tip(self.btn, self.btn.text(), "Starts – the file is saved to the output folder. "
-                                           "Enter in any field does the same.")
+            tip(self.btn, self.btn.text(), "Starts – the file is saved to the output folder.")
 
     def _size_changed(self, name):
         codec, profile = self._codec()
@@ -9276,6 +9403,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info, self.info_url = {}, ""
         self.slider.hide()
         self.btn_thumb.hide()
+        self.btn_live.hide()
         self.vol_pts.clear()            # new video = new volume curve (before the player is touched)
         self.lane.select(None)
         self._reset_player()
@@ -9645,6 +9773,30 @@ class MainWindow(QtWidgets.QMainWindow):
         a.triggered.connect(lambda: self._switch_preview("download"))
         m.exec(self.lbl_pv_src.mapToGlobal(QtCore.QPoint(0, self.lbl_pv_src.height() + 2)))
 
+    def _toggle_live(self):
+        """Preview: downloaded small copy <-> played live from YouTube (then the quality can be picked)."""
+        if self._pv_kind == "stream":
+            self._switch_preview("download")
+        elif self._can_stream():
+            self._switch_preview("stream")
+
+    def _live_btn(self, kind):
+        b = self.btn_live
+        yt = kind in ("stream", "copy") and not self.info.get("local")
+        b.setVisible(yt)
+        if not yt:
+            return
+        live = kind == "stream"
+        can = live or self._can_stream()
+        b.setEnabled(can)
+        b.setText("●  Live YouTube" if live else "○  Live YouTube")
+        set_state(b, "on" if live else "")
+        tip(b, "Live YouTube preview",
+            ("Playing live from YouTube – pick the quality on the right (▾). Click to go back to the downloaded "
+             "small copy." if live else "Play the preview live from YouTube instead of the small copy – then you "
+                                        "can pick its quality (up to 1080p).") if can else
+            "This video can't be played live – the small copy is used.")
+
     def _switch_preview(self, mode, q=None):
         """Changes the preview source and quality, stays at the same spot."""
         pos = self._player_pos() or 0.0
@@ -9810,9 +9962,10 @@ class MainWindow(QtWidgets.QMainWindow):
         site = "YouTube"
         sh = ((self._cur_stream() or {}).get("video") or {}).get("height") if kind == "stream" else None
         ch = preview_height(self.info.get("duration")) if kind == "copy" else None
-        self.lbl_pv_src.setText({"stream": f"streaming from {site}" + (f" · {sh}p" if sh else "") + "  ▾",
-                                 "copy": f"preview copy ({ch}p)  ▾", "file": "your file"}.get(kind, ""))
+        self.lbl_pv_src.setText({"stream": (f"{sh}p" if sh else "quality") + "  ▾",
+                                 "copy": f"copy {ch}p  ▾", "file": "your file"}.get(kind, ""))
         self.lbl_pv_src.setEnabled(kind != "file")
+        self._live_btn(kind)
         tip(self.lbl_pv_src, "Preview source", {
             "stream": f"Played straight from {site} through the app – nothing is downloaded for the preview. "
                       "Click to pick the quality or switch to a downloaded copy.",

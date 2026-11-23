@@ -4,8 +4,8 @@
 # Start -> type "PowerShell" -> Enter, then paste this line and press Enter:
 #   irm https://raw.githubusercontent.com/TFrogVFX/youtube-downloader/main/installer/web-install.ps1 | iex
 #
-# It loads the app files of the newest version from this repository into a temporary folder, checks the app
-# file against its checksum and runs the normal installer (installer/install.ps1).
+# It loads the setup (setup/YouTube-Downloader.exe) of the newest version from this repository, checks it against
+# its checksum and opens its setup window. If that doesn't work: the app files + the PowerShell installer.
 
 & {
     $ErrorActionPreference = 'Stop'
@@ -24,6 +24,27 @@
         $sha = "$sha".Trim()
         if ($sha -match '^[0-9a-f]{40}$') { $base = "https://raw.githubusercontent.com/$repo/$sha/" }
     } catch { }
+
+    # the setup window (YouTube-Downloader.exe from this repository) - loaded here, so Windows shows no warning
+    try {
+        $info = Invoke-RestMethod -UseBasicParsing -Uri ($base + 'version.json')
+        if ($info.setup_sha256) {
+            $exe = Join-Path $env:TEMP 'YouTube-Downloader-Setup.exe'
+            Invoke-WebRequest -UseBasicParsing -Uri ($base + 'setup/YouTube-Downloader.exe') -OutFile $exe
+            $h = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+            if ($h -eq $info.setup_sha256) {
+                Write-Host "   version $($info.version) loaded, checksum OK - the setup window opens now." -ForegroundColor DarkGray
+                Start-Process -FilePath $exe -ArgumentList '/repair'
+                Write-Host ''
+                Write-Host 'You can close this PowerShell window.' -ForegroundColor Green
+                return
+            }
+            Remove-Item -Force $exe -ErrorAction SilentlyContinue
+            Write-Host '   setup file damaged - using the PowerShell setup instead.' -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host '   setup window not available - using the PowerShell setup instead.' -ForegroundColor Yellow
+    }
 
     $tmp = Join-Path $env:TEMP ('ytd-setup-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $tmp | Out-Null
