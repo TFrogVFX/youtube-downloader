@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -179,8 +179,8 @@ CUSTOM_MODELS_DIR = APP_DIR / "models"
 FONTS_DIR = APP_DIR / "fonts"
 SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
              "bold": True, "pos": None}
-COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies) from the app's own sign-in window
-WEB_PROFILE_DIR = APP_DIR / "login_browser"
+COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies), taken from the sign-in in your browser
+SIGNIN_DIR = APP_DIR / "signin"                 # own browser profile for the sign-in (your normal one stays untouched)
 LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&hl=en"
              "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3D%252F")
 UPSCALER_DIR = APP_DIR / "upscaler"
@@ -2667,6 +2667,174 @@ def sign_out() -> None:
     YDL_EXTRA.pop("cookiefile", None)
 
 
+# ---- sign-in with the default browser
+
+_CHROMIUM = {"chrome": "Chrome", "msedge": "Edge", "brave": "Brave", "vivaldi": "Vivaldi", "opera": "Opera",
+             "launcher": "Opera", "chromium": "Chromium", "google-chrome": "Chrome", "google-chrome-stable": "Chrome",
+             "microsoft-edge": "Edge", "brave-browser": "Brave", "thorium": "Thorium", "yandex": "Yandex"}
+_FIREFOX = {"firefox": "Firefox", "librewolf": "LibreWolf", "waterfox": "Waterfox", "floorp": "Floorp",
+            "zen": "Zen"}
+
+
+def _browser_from_exe(exe) -> dict | None:
+    stem = Path(exe).stem.lower()
+    if stem in _CHROMIUM:
+        return {"name": _CHROMIUM[stem], "kind": "chromium", "exe": str(exe)}
+    if stem in _FIREFOX:
+        return {"name": _FIREFOX[stem], "kind": "firefox", "exe": str(exe)}
+    return None
+
+
+def default_browser() -> dict | None:
+    """The browser Windows opens links with -> {'name', 'kind': 'chromium' | 'firefox', 'exe'} or None."""
+    over = os.environ.get("YTD_BROWSER")
+    if over:
+        return _browser_from_exe(over)
+    if WIN:
+        import shlex
+        import winreg
+        for proto in ("https", "http"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Software\Microsoft\Windows\Shell\Associations"
+                                                               rf"\UrlAssociations\{proto}\UserChoice") as k:
+                    progid = winreg.QueryValueEx(k, "ProgId")[0]
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{progid}\shell\open\command") as k:
+                    cmd = winreg.QueryValueEx(k, "")[0]
+            except OSError:
+                continue
+            exe = cmd.split('"')[1] if cmd.startswith('"') else shlex.split(cmd, posix=False)[0]
+            b = _browser_from_exe(exe)
+            if b and Path(b["exe"]).exists():
+                return b
+        return None
+    try:   # Linux / macOS (for testing)
+        desk = subprocess.run(["xdg-settings", "get", "default-web-browser"], capture_output=True, text=True,
+                              timeout=5).stdout.strip().replace(".desktop", "")
+    except (OSError, subprocess.SubprocessError):
+        desk = ""
+    for name in ([desk] if desk else []) + ["google-chrome", "chromium", "microsoft-edge", "brave-browser", "firefox"]:
+        exe = shutil.which(name)
+        if exe:
+            return _browser_from_exe(exe) or _browser_from_exe(name) and {**_browser_from_exe(name), "exe": exe}
+    return None
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        return so.getsockname()[1]
+
+
+def _has_login(rows) -> bool:
+    names = {r[4] for r in rows if "youtube.com" in r[0]}
+    return "LOGIN_INFO" in names and bool(names & {"SAPISID", "__Secure-3PAPISID", "SID", "__Secure-1PSID"})
+
+
+class BrowserSignIn:
+    """Opens the default browser with its own profile (your normal browser stays untouched) on the YouTube
+    sign-in page. As soon as YouTube shows you as signed in, the login is saved for yt-dlp and the window closes.
+    Chrome, Edge, Brave, Opera, Vivaldi: read through the browser's local debug connection (only while the
+    window is open). Firefox: read from its profile."""
+
+    def __init__(self, browser):
+        self.b = browser
+        self.proc = None
+        self.port = None
+        self.profile = SIGNIN_DIR / ("firefox" if browser["kind"] == "firefox" else "chromium")
+        self.seen = False          # the browser answered at least once
+        self.t0 = 0.0
+
+    def start(self):
+        self.profile.mkdir(parents=True, exist_ok=True)
+        if self.b["kind"] == "firefox":
+            cmd = [self.b["exe"], "-profile", str(self.profile), "-no-remote", "-new-instance", LOGIN_URL]
+        else:
+            self.port = _free_port()
+            cmd = [self.b["exe"], f"--user-data-dir={self.profile}", f"--remote-debugging-port={self.port}",
+                   "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
+                   "--new-window", *os.environ.get("YTD_BROWSER_ARGS", "").split(), LOGIN_URL]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.t0 = time.time()
+
+    # chromium: DevTools protocol over a local websocket
+    def _cdp(self, method, params=None, timeout=8.0):
+        from websockets.sync.client import connect
+        info = json.loads(fetch_bytes(f"http://127.0.0.1:{self.port}/json/version", timeout=3).decode("utf-8"))
+        with connect(info["webSocketDebuggerUrl"], open_timeout=timeout, max_size=None,
+                     additional_headers=None) as ws:
+            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+            end = time.time() + timeout
+            while time.time() < end:
+                msg = json.loads(ws.recv(timeout=max(0.5, end - time.time())))
+                if msg.get("id") == 1:
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"].get("message", "DevTools error"))
+                    return msg.get("result") or {}
+        raise TimeoutError(method)
+
+    def _chromium_rows(self):
+        res = self._cdp("Storage.getCookies")
+        return [(c.get("domain", ""), c.get("path", "/"), bool(c.get("secure")),
+                 0 if c.get("session") or (c.get("expires") or -1) < 0 else int(c["expires"]),
+                 c.get("name", ""), c.get("value", ""), bool(c.get("httpOnly"))) for c in res.get("cookies", [])]
+
+    def _firefox_rows(self):
+        import sqlite3
+        import tempfile
+        db = self.profile / "cookies.sqlite"
+        if not db.exists():
+            return []
+        with tempfile.TemporaryDirectory(prefix="ytd_ff_") as td:
+            for suf in ("", "-wal", "-shm"):
+                f = Path(str(db) + suf)
+                if f.exists():
+                    try:
+                        shutil.copyfile(f, Path(td) / ("cookies.sqlite" + suf))
+                    except OSError:
+                        pass
+            con = sqlite3.connect(str(Path(td) / "cookies.sqlite"))
+            try:
+                rows = con.execute("SELECT host, path, isSecure, expiry, name, value, isHttpOnly FROM moz_cookies "
+                                   "WHERE host LIKE '%youtube.com'").fetchall()
+            finally:
+                con.close()
+        return [(h, p, bool(sec), int(exp // 1000 if exp > 10 ** 11 else exp), n, v, bool(ho))
+                for h, p, sec, exp, n, v, ho in rows]
+
+    def poll(self) -> str:
+        """-> 'waiting' | 'done' | 'closed'"""
+        running = self.proc is not None and self.proc.poll() is None
+        try:
+            rows = self._firefox_rows() if self.b["kind"] == "firefox" else self._chromium_rows()
+            self.seen = True
+            self.misses = 0
+        except Exception:  # noqa: BLE001 - not reachable (yet / any more)
+            rows = None
+            self.misses = getattr(self, "misses", 0) + 1
+        if rows and _has_login(rows):
+            write_cookie_file(rows)
+            self.close()
+            return "done"
+        if self.b["kind"] == "firefox":
+            return "waiting" if running else "closed"
+        if rows is None and ((self.seen and self.misses >= 3) or (not self.seen and time.time() - self.t0 > 45)):
+            return "closed"      # window closed (or the browser never opened)
+        return "waiting"
+
+    def close(self):
+        if self.b["kind"] != "firefox" and self.port:
+            try:
+                self._cdp("Browser.close", timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
 def login_hint(msg) -> str:
     """Extra hint when YouTube wants a login (age-restricted or members-only videos) or the login expired."""
     if not re.search(r"log ?in|sign in|cookies|members[- ]only|age[- ]restricted|confirm your age|inappropriate",
@@ -2794,7 +2962,6 @@ def install_app_update(info, script, emit) -> Path:
 # ----------------------------------------------------------------------------- GUI (PySide6)
 
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
-from PySide6.QtNetwork import QNetworkCookie as QtNetworkCookie  # noqa: E402
 from PySide6.QtCore import Qt, Signal  # noqa: E402
 
 try:   # video player (PySide6-Addons); the app works without it
@@ -4403,128 +4570,6 @@ class SubsEditor(QtWidgets.QDialog):
             write_srt([tuple(c) for c in self.cues], path)
 
 
-def login_profile(create=True):
-    """The app's own little browser profile for the YouTube sign-in (kept on disk, separate from your browsers)."""
-    app = QtWidgets.QApplication.instance()
-    prof = getattr(app, "_yt_login_profile", None)
-    if prof is None and create:
-        from PySide6.QtWebEngineCore import QWebEngineProfile, qWebEngineChromiumVersion
-        prof = QWebEngineProfile("tfrog_youtube_login", app)
-        WEB_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        prof.setPersistentStoragePath(str(WEB_PROFILE_DIR / "storage"))
-        prof.setCachePath(str(WEB_PROFILE_DIR / "cache"))
-        prof.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-        major = (qWebEngineChromiumVersion() or "140").split(".")[0]
-        # a normal Chrome user agent – Google refuses sign-ins from browsers that call themselves "QtWebEngine"
-        prof.setHttpUserAgent(f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                              f"Chrome/{major}.0.0.0 Safari/537.36")
-        app._yt_login_profile = prof
-    return prof
-
-
-class LoginDialog(QtWidgets.QDialog):
-    """Sign in to YouTube inside the app. When YouTube shows you as signed in, the YouTube cookies are saved for
-    yt-dlp (cookies.txt in the app folder) and the window closes."""
-
-    def __init__(self, parent):
-        from PySide6.QtWebEngineCore import QWebEnginePage
-        from PySide6.QtWebEngineWidgets import QWebEngineView
-        super().__init__(parent)
-        self.setWindowTitle("Sign in to YouTube")
-        self.resize(560, 760)
-        self.saved = False
-        self.cookies: dict = {}
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(10)
-        top = QtWidgets.QHBoxLayout()
-        top.addWidget(label("Sign in to YouTube", "vtitle"))
-        top.addStretch(1)
-        self.state = label("Sign in with your Google account …", "muted")
-        top.addWidget(self.state)
-        lay.addLayout(top)
-        self.profile = login_profile()
-        self.page = QWebEnginePage(self.profile, self)
-        self.view = QWebEngineView()
-        self.view.setPage(self.page)
-        lay.addWidget(self.view, 1)
-        lay.addWidget(label("The login stays on this PC (in the app folder) and is only sent to YouTube. If Google says "
-                            "this browser isn't supported, use Settings → Load cookies.txt instead.", "hint"))
-        bot = QtWidgets.QHBoxLayout()
-        bot.addStretch(1)
-        cancel = QtWidgets.QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        self.btn_done = QtWidgets.QPushButton("Done")
-        self.btn_done.setObjectName("primary")
-        self.btn_done.setEnabled(False)
-        self.btn_done.clicked.connect(self._finish)
-        bot.addWidget(cancel)
-        bot.addWidget(self.btn_done)
-        lay.addLayout(bot)
-        store = self.profile.cookieStore()
-        store.cookieAdded.connect(self._added)
-        store.cookieRemoved.connect(self._removed)
-        store.loadAllCookies()
-        self.page.urlChanged.connect(lambda _u: self._check())
-        self.page.loadFinished.connect(lambda _ok: self._check())
-        self.view.load(QtCore.QUrl(LOGIN_URL))
-
-    @staticmethod
-    def _key(c):
-        return bytes(c.name()).decode("utf-8", "replace"), c.domain(), c.path()
-
-    def _added(self, c):
-        if "youtube.com" in c.domain():
-            self.cookies[self._key(c)] = QtNetworkCookie(c)
-            self._check()
-
-    def _removed(self, c):
-        self.cookies.pop(self._key(c), None)
-
-    def signed_in(self):
-        return any(k[0] in LOGIN_COOKIES for k in self.cookies)
-
-    def _check(self):
-        on_yt = self.page.url().host().endswith("youtube.com")
-        if self.signed_in():
-            self.btn_done.setEnabled(True)
-            self.state.setText("✓ Signed in")
-            if on_yt and not self.saved:
-                QtCore.QTimer.singleShot(1500, self._finish)
-
-    def _rows(self):
-        out = []
-        for c in self.cookies.values():
-            exp = c.expirationDate()
-            out.append((c.domain(), c.path() or "/", c.isSecure(),
-                        int(exp.toSecsSinceEpoch()) if exp.isValid() else 0,
-                        bytes(c.name()).decode("utf-8", "replace"), bytes(c.value()).decode("utf-8", "replace"),
-                        c.isHttpOnly()))
-        return out
-
-    def _finish(self):
-        if self.saved or not self.signed_in():
-            return
-        try:
-            write_cookie_file(self._rows())
-        except OSError as ex:
-            self.state.setText(f"✕ Could not save the login: {ex}")
-            return
-        self.saved = True
-        self.accept()
-
-    def done(self, r):
-        try:
-            store = self.profile.cookieStore()
-            store.cookieAdded.disconnect(self._added)
-            store.cookieRemoved.disconnect(self._removed)
-        except (RuntimeError, TypeError):
-            pass
-        self.view.setPage(None)
-        self.page.deleteLater()
-        super().done(r)
-
-
 class ChaptersDialog(QtWidgets.QDialog):
     """Pick chapters -> they become clips."""
 
@@ -4815,29 +4860,37 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def show_login_state(self):
         st = login_state()
-        waiting = getattr(self.main, "_login_proc", None) is not None
-        self.btn_login.setEnabled(not waiting)
-        self.btn_cookies.setEnabled(not waiting)
-        if waiting:
-            self.lbl_login.setText("The sign-in window is open – sign in with your Google account there.")
-            self.btn_login.setText("Signing in …")
+        si = self.main._signin
+        self.btn_cookies.setEnabled(si is None)
+        if si is not None:
+            self.lbl_login.setText(f"Sign in to YouTube in the {si.b['name']} window that opened. As soon as YouTube "
+                                   "shows you as signed in, the app takes the login and closes that window.")
+            self.btn_login.setText("Cancel sign-in")
+            tip(self.btn_login, "Cancel sign-in", f"Closes the {si.b['name']} sign-in window.")
             return
         if st["signed_in"]:
             when = time.strftime("%d.%m.%Y", time.localtime(st["since"])) if st["since"] else ""
             self.lbl_login.setText(f"✓ Signed in to YouTube{' (since ' + when + ')' if when else ''}. Used for every "
                                    "download – needed for age-restricted or members-only videos.")
             self.btn_login.setText("Sign out")
+            self.btn_login.setEnabled(True)
             tip(self.btn_login, "Sign out", "Removes the YouTube login from this app.")
         else:
             self.lbl_login.setText("Not signed in. Only needed for age-restricted or members-only videos – "
                                    "your login stays on this PC.")
-            self.btn_login.setText("Sign in to YouTube …")
-            tip(self.btn_login, "Sign in", "Opens a small browser window: sign in with your Google account, the app "
-                                           "keeps the login for YouTube. Note: YouTube can limit accounts that are "
-                                           "used with download tools – a second account is the safe choice.")
+            b = self.main._browser_info()
+            self.btn_login.setText(f"Sign in with {b['name']} …" if b else "Sign in to YouTube …")
+            self.btn_login.setEnabled(b is not None)
+            tip(self.btn_login, "Sign in", f"Opens {b['name'] if b else 'your default browser'} with its own profile "
+                                           "(your normal browser data stays untouched) on the YouTube sign-in. The app "
+                                           "takes the login by itself and closes the window. Note: YouTube can limit "
+                                           "accounts that are used with download tools – a second account is the "
+                                           "safe choice.")
 
     def _login_clicked(self):
-        if login_state()["signed_in"]:
+        if self.main._signin is not None:
+            self.main._cancel_sign_in()
+        elif login_state()["signed_in"]:
             self.main._sign_out()
         else:
             self.main._sign_in()
@@ -4996,6 +5049,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lines_dlg = None
         self._esr_job = None
         self._login_noted = False
+        self._signin = None
+        self._resetting = False
+        self._out_vol = None
         apply_login()
         self.cfg.pop("browser", None)
         st = self.cfg.get("sub_style") if isinstance(self.cfg.get("sub_style"), dict) else {}
@@ -6106,13 +6162,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lane.update()
         self._vol_changed()
 
-    def _apply_gain(self, t=None):
-        if t is None:
+    def _apply_gain(self, t=None, force=False):
+        """Slider volume × volume curve on the audio output – only when the value really changes (setting the
+        volume on every frame can lock up the audio output on Windows while a video is loading)."""
+        if self._resetting:
+            return
+        if t is None and self.vol_pts:
             t = self._player_pos()
-        gain = vol_at(self.vol_pts, t) if (t is not None and self.seg.value() != "gif") else 1.0
+        gain = vol_at(self.vol_pts, t) if (self.vol_pts and t is not None and self.seg.value() != "gif") else 1.0
+        v = round(min(1.0, max(0.0, self.vol.value() / 100 * gain)), 3)
+        if not force and self._out_vol is not None and abs(v - self._out_vol) < 0.005:
+            return
+        self._out_vol = v
         for out in (self.audio_out, self.a_out2):
             if out is not None:
-                out.setVolume(min(1.0, self.vol.value() / 100 * gain))
+                out.setVolume(v)
 
     # ------------------------------------------------------------------ subtitles tab
     def _fill_subs(self, items):
@@ -6367,46 +6431,73 @@ class MainWindow(QtWidgets.QMainWindow):
         if job:
             job()
 
-    def _login_cmd(self):
-        return [sys.executable, str(Path(__file__).resolve()), "--yt-login"]
-
     def _sign_in(self):
-        """Opens the sign-in window as its own little process and waits for it (the app stays usable)."""
-        if getattr(self, "_login_proc", None) is not None:
+        """Opens the default browser (own profile) on the YouTube sign-in; the login is picked up by itself."""
+        if self._signin is not None:
             return
-        proc = QtCore.QProcess(self)
-        cmd = self._login_cmd()
-        proc.setProgram(cmd[0])
-        proc.setArguments(cmd[1:])
-        proc.setWorkingDirectory(str(Path(__file__).resolve().parent))
-        proc.finished.connect(lambda code, _st: self._login_finished(code))
-        proc.errorOccurred.connect(lambda _e: self._login_finished(-1) if proc.state() ==
-                                   QtCore.QProcess.ProcessState.NotRunning else None)
-        self._login_proc = proc
-        self._on_status("Sign-in window open – sign in with your Google account …")
-        proc.start()
+        b = default_browser()
+        if not b:
+            return self._on_error("No default browser found that the app can use (Chrome, Edge, Brave, Opera, "
+                                  "Vivaldi or Firefox). Use Settings → YouTube login → Load cookies.txt instead.")
+        si = BrowserSignIn(b)
+        try:
+            si.start()
+        except OSError as ex:
+            return self._on_error(f"Could not open {b['name']}: {ex}")
+        self._signin = si
+        self._on_log(f"Sign-in: opened {b['name']} with its own profile – waiting for the YouTube login …")
+        self._on_status(f"Sign in to YouTube in the {b['name']} window that just opened – it closes by itself.")
+        set_state(self.status, "")
         self._login_state_changed()
 
-    def _login_finished(self, code):
-        proc, self._login_proc = getattr(self, "_login_proc", None), None
-        if proc is None:
-            return
-        err = bytes(proc.readAllStandardError()).decode("utf-8", "replace").strip()
-        proc.deleteLater()
-        if code == 0 and apply_login():
+        def work():
+            end = time.time() + 15 * 60
+            state = "waiting"
+            while state == "waiting" and time.time() < end and self._signin is si:
+                time.sleep(1.5)
+                try:
+                    state = si.poll()
+                except Exception as ex:  # noqa: BLE001
+                    state = "error:" + clean_error(ex)
+            if self._signin is not si:
+                return                      # cancelled
+            if state == "waiting":
+                si.close()
+                state = "timeout"
+            self.emit("signin", state)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_signin(self, state):
+        si, self._signin = self._signin, None
+        name = si.b["name"] if si else "the browser"
+        if state == "done" and apply_login():
             LOGIN_NOTE.clear()
             self._login_noted = False
-            self._on_log("✓ Signed in to YouTube – the login is used for every download.")
+            self._on_log(f"✓ Signed in to YouTube (via {name}) – the login is used for every download.")
             self._on_status("✓  Signed in to YouTube.")
             set_state(self.status, "ok")
-        elif code == 1:
-            self._on_status("Sign-in cancelled.")
+            self.raise_()
+            self.activateWindow()
+        elif state == "closed":
+            self._on_status(f"The {name} window was closed before YouTube showed you as signed in – not signed in.")
+        elif state == "timeout":
+            self._on_status("Sign-in took too long – try again.")
         else:
-            if err:
-                self._on_log("Sign-in window: " + err[-600:])
-            self._on_error("The sign-in window didn't work on this PC. Use Settings → YouTube login → "
-                           "Load cookies.txt instead.")
+            self._on_error(f"Sign-in with {name} didn't work: {state.split(':', 1)[-1]}\n"
+                           "You can use Settings → YouTube login → Load cookies.txt instead.")
         self._login_state_changed()
+
+    def _cancel_sign_in(self):
+        si, self._signin = self._signin, None
+        if si is not None:
+            threading.Thread(target=si.close, daemon=True).start()
+        self._on_status("Sign-in cancelled.")
+        self._login_state_changed()
+
+    def _browser_info(self):
+        if not hasattr(self, "_default_browser"):
+            self._default_browser = default_browser()
+        return self._default_browser
 
     def _login_state_changed(self):
         dlg = getattr(self, "settings_dlg", None)
@@ -6415,7 +6506,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _sign_out(self):
         sign_out()
-        shutil.rmtree(WEB_PROFILE_DIR, ignore_errors=True)     # next sign-in starts fresh (another account possible)
+        shutil.rmtree(SIGNIN_DIR, ignore_errors=True)     # next sign-in starts fresh (another account possible)
         self._on_log("Signed out of YouTube.")
         self._on_status("Signed out of YouTube.")
         self._login_state_changed()
@@ -6651,14 +6742,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info, self.info_url = {}, ""
         self.slider.hide()
         self.btn_thumb.hide()
+        self.vol_pts.clear()            # new video = new volume curve (before the player is touched)
+        self.lane.select(None)
         self._reset_player()
+        self._apply_gain(force=True)    # back to the plain volume of the slider
         self.clips, self.cur = [], 0
         self._refresh_clip_list()
         self._clear_times()
         self._set_button_text()
         self.btn_chapters.hide()
-        self.vol_pts.clear()
-        self.lane.select(None)
         self._sub_req += 1
         self._fill_subs([])
         self.box = None
@@ -6907,6 +6999,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             a = QAudioOutput(self)
             a.setVolume(self.vol.value() / 100)
+            self._out_vol = None          # next _apply_gain sets every output again
             return a
         except Exception:  # noqa: BLE001
             return None
@@ -6949,10 +7042,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _reset_player(self):
         self._stop_playback()
-        if self.player is not None:
-            self.player.setSource(QtCore.QUrl())
-        if self.aplayer is not None:
-            self.aplayer.setSource(QtCore.QUrl())
+        self._resetting = True          # setSource() sends position updates – don't react to them
+        try:
+            if self.player is not None:
+                self.player.setSource(QtCore.QUrl())
+            if self.aplayer is not None:
+                self.aplayer.setSource(QtCore.QUrl())
+        finally:
+            self._resetting = False
         self._pv_state = ""
         self._pv_kind = ""
         self.thumb.set_overlay("")
@@ -7137,6 +7234,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_ptime.setText(f"/ {fmt_ts(ms / 1000)}")
 
     def _on_ppos(self, ms):
+        if self._resetting:
+            return
         t = ms / 1000
         if not self.seek.isSliderDown():
             self.seek.setValue(ms)
@@ -7146,9 +7245,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.set_playhead(t)
         self.lane.set_playhead(t)
         self._update_sub_overlay(t)
-        if self.vol_pts:
-            self._apply_gain(t)
         playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if self.vol_pts and playing:
+            self._apply_gain(t)
         if playing and self._audio_follows() and abs(self.aplayer.position() - ms) > 250:
             self.aplayer.setPosition(ms)
         if self._clip_stop is not None and t >= self._clip_stop - 0.02:
@@ -7158,6 +7257,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_pstate(self, state):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.btn_play.setText("❚❚" if playing else "▶")
+        if playing and self.vol_pts:
+            self._apply_gain(force=True)
         if self._audio_follows():
             if playing:
                 self.aplayer.setPosition(self.player.position())
@@ -7166,7 +7267,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.aplayer.pause()
 
     def _on_volume(self, v):
-        self._apply_gain()
+        self._apply_gain(force=True)
 
     def _toggle_play(self):
         if not self._has_media():
@@ -8015,6 +8116,12 @@ class MainWindow(QtWidgets.QMainWindow):
             e.ignore()
             return
         self._save_settings()
+        si, self._signin = self._signin, None
+        if si is not None and si.proc is not None and si.proc.poll() is None:
+            try:
+                si.proc.kill()           # the sign-in window of an unfinished sign-in
+            except OSError:
+                pass
         for pl in (self.player, self.aplayer):
             if pl is not None:
                 pl.stop()
@@ -8026,42 +8133,11 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, lambda: os._exit(0))
 
 
-def run_login_window() -> int:
-    """`tfrog_ytclip.pyw --yt-login`: only the sign-in window, in its own process (the browser engine and the
-    video player don't share one process well). Exit code 0 = signed in and saved."""
-    QtCore.QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
-    app = QtWidgets.QApplication(sys.argv[:1])
-    app.setApplicationName(APP + " – sign in")
-    app.setStyle("Fusion")
-    font = QtGui.QFont()
-    font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter", "Helvetica Neue", "Arial"])
-    font.setPointSize(10)
-    app.setFont(font)
-    icon = Path(__file__).with_name("icon.ico")
-    if icon.exists():
-        app.setWindowIcon(QtGui.QIcon(str(icon)))
-    cfg = load_cfg()
-    theme = cfg.get("theme") if cfg.get("theme") in THEMES else DEFAULT_THEME
-    app.setStyleSheet(build_qss(theme_colors(theme, cfg.get("accent") or DEFAULT_ACCENT)))
-    try:
-        dlg = LoginDialog(None)
-    except Exception as ex:  # noqa: BLE001
-        print(f"Sign-in window not available: {ex}", file=sys.stderr)
-        return 3
-    dlg.show()
-    set_dark_titlebar(dlg, THEMES[theme]["dark"])
-    dlg.raise_()
-    dlg.activateWindow()
-    return 0 if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and dlg.saved else 1
-
-
 def main():
-    login_mode = "--yt-login" in sys.argv[1:]
     if sys.stdout is None or sys.stderr is None:  # pythonw has no console -> write to a log file
         try:
             APP_DIR.mkdir(parents=True, exist_ok=True)
-            sink = open(APP_DIR / ("login_run.log" if login_mode else "last_run.log"), "w", encoding="utf-8",
-                        buffering=1)
+            sink = open(APP_DIR / "last_run.log", "w", encoding="utf-8", buffering=1)
         except OSError:
             sink = open(os.devnull, "w")
         sys.stdout = sys.stdout or sink
@@ -8072,8 +8148,6 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
-    if login_mode:
-        sys.exit(run_login_window())
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setOrganizationName("tfrog")

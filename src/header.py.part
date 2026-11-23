@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -179,8 +179,8 @@ CUSTOM_MODELS_DIR = APP_DIR / "models"
 FONTS_DIR = APP_DIR / "fonts"
 SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
              "bold": True, "pos": None}
-COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies) from the app's own sign-in window
-WEB_PROFILE_DIR = APP_DIR / "login_browser"
+COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies), taken from the sign-in in your browser
+SIGNIN_DIR = APP_DIR / "signin"                 # own browser profile for the sign-in (your normal one stays untouched)
 LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&hl=en"
              "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3D%252F")
 UPSCALER_DIR = APP_DIR / "upscaler"

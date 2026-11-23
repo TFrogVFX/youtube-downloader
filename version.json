@@ -1,8 +1,8 @@
 {
-  "version": "2.7.0",
+  "version": "2.7.1",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "25bbc9bef8e760bca838a17ce72978e948f09cdbc3423ed6191a6ff24ce8b060",
-  "notes": "YouTube login inside the app (Settings → YouTube login → Sign in) instead of reading Chrome/Firefox. Volume curve: click a point to type its exact time and value and choose its curve (Easy ease, Ease in/out, Hold).",
+  "sha256": "57c8f05021c0ea41d93a22faa18189495b27168b04764ecec7d8590ea1c2b753",
+  "notes": "YouTube sign-in now opens your default browser (Chrome, Edge, Brave, Opera, Vivaldi or Firefox) with its own profile and takes the login by itself. Volume curve is reset for every new video (also from the history); fixed the hang when loading a new video after changing the volume.",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

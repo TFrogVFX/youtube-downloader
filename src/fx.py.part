@@ -991,6 +991,174 @@ def sign_out() -> None:
     YDL_EXTRA.pop("cookiefile", None)
 
 
+# ---- sign-in with the default browser
+
+_CHROMIUM = {"chrome": "Chrome", "msedge": "Edge", "brave": "Brave", "vivaldi": "Vivaldi", "opera": "Opera",
+             "launcher": "Opera", "chromium": "Chromium", "google-chrome": "Chrome", "google-chrome-stable": "Chrome",
+             "microsoft-edge": "Edge", "brave-browser": "Brave", "thorium": "Thorium", "yandex": "Yandex"}
+_FIREFOX = {"firefox": "Firefox", "librewolf": "LibreWolf", "waterfox": "Waterfox", "floorp": "Floorp",
+            "zen": "Zen"}
+
+
+def _browser_from_exe(exe) -> dict | None:
+    stem = Path(exe).stem.lower()
+    if stem in _CHROMIUM:
+        return {"name": _CHROMIUM[stem], "kind": "chromium", "exe": str(exe)}
+    if stem in _FIREFOX:
+        return {"name": _FIREFOX[stem], "kind": "firefox", "exe": str(exe)}
+    return None
+
+
+def default_browser() -> dict | None:
+    """The browser Windows opens links with -> {'name', 'kind': 'chromium' | 'firefox', 'exe'} or None."""
+    over = os.environ.get("YTD_BROWSER")
+    if over:
+        return _browser_from_exe(over)
+    if WIN:
+        import shlex
+        import winreg
+        for proto in ("https", "http"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Software\Microsoft\Windows\Shell\Associations"
+                                                               rf"\UrlAssociations\{proto}\UserChoice") as k:
+                    progid = winreg.QueryValueEx(k, "ProgId")[0]
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{progid}\shell\open\command") as k:
+                    cmd = winreg.QueryValueEx(k, "")[0]
+            except OSError:
+                continue
+            exe = cmd.split('"')[1] if cmd.startswith('"') else shlex.split(cmd, posix=False)[0]
+            b = _browser_from_exe(exe)
+            if b and Path(b["exe"]).exists():
+                return b
+        return None
+    try:   # Linux / macOS (for testing)
+        desk = subprocess.run(["xdg-settings", "get", "default-web-browser"], capture_output=True, text=True,
+                              timeout=5).stdout.strip().replace(".desktop", "")
+    except (OSError, subprocess.SubprocessError):
+        desk = ""
+    for name in ([desk] if desk else []) + ["google-chrome", "chromium", "microsoft-edge", "brave-browser", "firefox"]:
+        exe = shutil.which(name)
+        if exe:
+            return _browser_from_exe(exe) or _browser_from_exe(name) and {**_browser_from_exe(name), "exe": exe}
+    return None
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        return so.getsockname()[1]
+
+
+def _has_login(rows) -> bool:
+    names = {r[4] for r in rows if "youtube.com" in r[0]}
+    return "LOGIN_INFO" in names and bool(names & {"SAPISID", "__Secure-3PAPISID", "SID", "__Secure-1PSID"})
+
+
+class BrowserSignIn:
+    """Opens the default browser with its own profile (your normal browser stays untouched) on the YouTube
+    sign-in page. As soon as YouTube shows you as signed in, the login is saved for yt-dlp and the window closes.
+    Chrome, Edge, Brave, Opera, Vivaldi: read through the browser's local debug connection (only while the
+    window is open). Firefox: read from its profile."""
+
+    def __init__(self, browser):
+        self.b = browser
+        self.proc = None
+        self.port = None
+        self.profile = SIGNIN_DIR / ("firefox" if browser["kind"] == "firefox" else "chromium")
+        self.seen = False          # the browser answered at least once
+        self.t0 = 0.0
+
+    def start(self):
+        self.profile.mkdir(parents=True, exist_ok=True)
+        if self.b["kind"] == "firefox":
+            cmd = [self.b["exe"], "-profile", str(self.profile), "-no-remote", "-new-instance", LOGIN_URL]
+        else:
+            self.port = _free_port()
+            cmd = [self.b["exe"], f"--user-data-dir={self.profile}", f"--remote-debugging-port={self.port}",
+                   "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
+                   "--new-window", *os.environ.get("YTD_BROWSER_ARGS", "").split(), LOGIN_URL]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.t0 = time.time()
+
+    # chromium: DevTools protocol over a local websocket
+    def _cdp(self, method, params=None, timeout=8.0):
+        from websockets.sync.client import connect
+        info = json.loads(fetch_bytes(f"http://127.0.0.1:{self.port}/json/version", timeout=3).decode("utf-8"))
+        with connect(info["webSocketDebuggerUrl"], open_timeout=timeout, max_size=None,
+                     additional_headers=None) as ws:
+            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+            end = time.time() + timeout
+            while time.time() < end:
+                msg = json.loads(ws.recv(timeout=max(0.5, end - time.time())))
+                if msg.get("id") == 1:
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"].get("message", "DevTools error"))
+                    return msg.get("result") or {}
+        raise TimeoutError(method)
+
+    def _chromium_rows(self):
+        res = self._cdp("Storage.getCookies")
+        return [(c.get("domain", ""), c.get("path", "/"), bool(c.get("secure")),
+                 0 if c.get("session") or (c.get("expires") or -1) < 0 else int(c["expires"]),
+                 c.get("name", ""), c.get("value", ""), bool(c.get("httpOnly"))) for c in res.get("cookies", [])]
+
+    def _firefox_rows(self):
+        import sqlite3
+        import tempfile
+        db = self.profile / "cookies.sqlite"
+        if not db.exists():
+            return []
+        with tempfile.TemporaryDirectory(prefix="ytd_ff_") as td:
+            for suf in ("", "-wal", "-shm"):
+                f = Path(str(db) + suf)
+                if f.exists():
+                    try:
+                        shutil.copyfile(f, Path(td) / ("cookies.sqlite" + suf))
+                    except OSError:
+                        pass
+            con = sqlite3.connect(str(Path(td) / "cookies.sqlite"))
+            try:
+                rows = con.execute("SELECT host, path, isSecure, expiry, name, value, isHttpOnly FROM moz_cookies "
+                                   "WHERE host LIKE '%youtube.com'").fetchall()
+            finally:
+                con.close()
+        return [(h, p, bool(sec), int(exp // 1000 if exp > 10 ** 11 else exp), n, v, bool(ho))
+                for h, p, sec, exp, n, v, ho in rows]
+
+    def poll(self) -> str:
+        """-> 'waiting' | 'done' | 'closed'"""
+        running = self.proc is not None and self.proc.poll() is None
+        try:
+            rows = self._firefox_rows() if self.b["kind"] == "firefox" else self._chromium_rows()
+            self.seen = True
+            self.misses = 0
+        except Exception:  # noqa: BLE001 - not reachable (yet / any more)
+            rows = None
+            self.misses = getattr(self, "misses", 0) + 1
+        if rows and _has_login(rows):
+            write_cookie_file(rows)
+            self.close()
+            return "done"
+        if self.b["kind"] == "firefox":
+            return "waiting" if running else "closed"
+        if rows is None and ((self.seen and self.misses >= 3) or (not self.seen and time.time() - self.t0 > 45)):
+            return "closed"      # window closed (or the browser never opened)
+        return "waiting"
+
+    def close(self):
+        if self.b["kind"] != "firefox" and self.port:
+            try:
+                self._cdp("Browser.close", timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
 def login_hint(msg) -> str:
     """Extra hint when YouTube wants a login (age-restricted or members-only videos) or the login expired."""
     if not re.search(r"log ?in|sign in|cookies|members[- ]only|age[- ]restricted|confirm your age|inappropriate",
