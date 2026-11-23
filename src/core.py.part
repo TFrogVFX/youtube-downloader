@@ -491,13 +491,28 @@ def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
     }
 
 
-def ydl_extract(opts, url, download=True):
-    """One yt-dlp run (the YouTube login, if any, is handed in by add_login – from memory)."""
+_NO_FORMATS = re.compile(r"Requested format is not available|Only images are available|No video formats found", re.I)
+
+
+def ydl_extract(opts, url, download=True, use_login=True):
+    """One yt-dlp run (the YouTube login, if any, is handed in by add_login – from memory). If YouTube offers no
+    video at all with the login, the same run is done once more without it."""
     from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
-    opts = {k: v for k, v in opts.items() if k != "login"}
-    with YoutubeDL(opts) as ydl:
-        add_login(ydl)
-        return ydl.extract_info(url, download=download)
+    clean = {k: v for k, v in opts.items() if k != "login"}
+    try:
+        with YoutubeDL(clean) as ydl:
+            if use_login:
+                add_login(ydl)
+            return ydl.extract_info(url, download=download)
+    except Exception as ex:  # noqa: BLE001
+        if not (use_login and logged_in() and _NO_FORMATS.search(str(ex))):
+            raise
+        log = opts.get("logger")
+        if log is not None and hasattr(log, "warning"):
+            log.warning("With your YouTube login YouTube offered no video – trying without the login …")
+        LOGIN_NOTE[:] = ["With your YouTube login, YouTube offered no video for this link, so it was loaded without "
+                         "the login. If that keeps happening: Settings → YouTube login → Sign out and sign in again."]
+        return ydl_extract(opts, url, download, use_login=False)
 
 
 def _suffix(start, end) -> str:
