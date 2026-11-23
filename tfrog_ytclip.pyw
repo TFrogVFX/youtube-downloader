@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.3"
+APP_VERSION = "2.9.4"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -1179,11 +1179,16 @@ def fetch_bytes(url: str, timeout: float = 15.0, headers=None) -> bytes:
         return r.read()
 
 
-def update_ytdlp(emit) -> bool:
+def update_ytdlp(emit, force=False) -> bool:
+    """yt-dlp to the newest version (force: put its files in again even if it is up to date – repair)."""
     py = Path(sys.executable)
     if py.name.lower() == "pythonw.exe" and py.with_name("python.exe").exists():
         py = py.with_name("python.exe")
-    emit("log", "Checking for yt-dlp update …")
+    emit("log", "Reinstalling yt-dlp …" if force else "Checking for yt-dlp update …")
+    if force:
+        subprocess.run([str(py), "-m", "pip", "install", "-U", "-q", "--disable-pip-version-check", "--force-reinstall",
+                        "--no-deps", "yt-dlp"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       creationflags=NO_WINDOW)
     base = [str(py), "-m", "pip", "install", "-U", "-q", "--disable-pip-version-check", "yt-dlp[default]"]
     r = None
     for extra in ([], ["--user"]):
@@ -3124,14 +3129,72 @@ def chromium_browsers() -> list:
     return out
 
 
-def open_in_browser(b, url) -> bool:
-    """Opens url as a new tab in the browser that is already running (or starts it)."""
+def open_in_browser(b, url, profile=None) -> bool:
+    """Opens url as a new tab in the browser that is already running (or starts it) – in the given profile, so
+    Chrome's "Who's using Chrome?" picker doesn't come in between. url None: a new window (new tab page).
+    Note: Chrome ignores chrome:// addresses given this way (security)."""
     try:
-        subprocess.Popen([b["exe"], url], creationflags=NO_WINDOW, close_fds=True,
+        cmd = [b["exe"], *([f"--profile-directory={profile}"] if profile else []), *([url] if url else [])]
+        subprocess.Popen(cmd, creationflags=NO_WINDOW, close_fds=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except (OSError, KeyError, TypeError):
         return False
+
+
+_USER_DATA_WIN = {"Chrome": r"Google\Chrome\User Data", "Edge": r"Microsoft\Edge\User Data",
+                  "Brave": r"BraveSoftware\Brave-Browser\User Data", "Vivaldi": r"Vivaldi\User Data",
+                  "Chromium": r"Chromium\User Data", "Thorium": r"Thorium\User Data"}
+_USER_DATA_NIX = {"Chrome": ".config/google-chrome", "Chromium": ".config/chromium", "Edge": ".config/microsoft-edge",
+                  "Brave": ".config/BraveSoftware/Brave-Browser"}
+
+
+def browser_user_data(b):
+    """The folder with the browser's profiles ("User Data") or None."""
+    over = os.environ.get("YTD_BROWSER_USER_DATA")
+    if over:
+        return Path(over)
+    if not b:
+        return None
+    if WIN:
+        rel = _USER_DATA_WIN.get(b["name"])
+        p = Path(os.environ.get("LOCALAPPDATA", "")) / rel if rel else None
+    else:
+        rel = _USER_DATA_NIX.get(b["name"])
+        p = Path.home() / rel if rel else None
+    return p if p and (p / "Local State").exists() else None
+
+
+def _has_ext(profile_dir: Path) -> bool:
+    for fn in ("Secure Preferences", "Preferences"):
+        try:
+            d = json.loads((profile_dir / fn).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if EXT_ID in (((d.get("extensions") or {}).get("settings")) or {}):
+            return True
+    return False
+
+
+def browser_profiles(b) -> list:
+    """The browser's profiles in its own order -> [{'dir', 'name', 'who', 'ext': extension added, 'last'}]."""
+    ud = browser_user_data(b)
+    if not ud:
+        return []
+    try:
+        prof = json.loads((ud / "Local State").read_text(encoding="utf-8", errors="replace")).get("profile") or {}
+    except (OSError, ValueError):
+        return []
+    cache = prof.get("info_cache") or {}
+    order = [d for d in (prof.get("profiles_order") or []) if d in cache]
+    order += [d for d in cache if d not in order]
+    last = prof.get("last_used") or (order[0] if order else "")
+    out = []
+    for d in order:
+        v = cache.get(d) or {}
+        out.append({"dir": d, "name": v.get("name") or d, "who": v.get("gaia_name") or v.get("user_name") or "",
+                    "ext": _has_ext(ud / d), "last": d == last})
+    return out
 
 
 # ---- the sign-in extension: a small helper in your own Chrome hands the YouTube login to this app
@@ -3510,6 +3573,113 @@ def login_hint(msg) -> str:
     return "\nTip: this video needs a YouTube login – Settings → YouTube login → Sign in."
 
 
+# ----------------------------------------------------------------------------- repair
+
+def _sha256_file(path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def repair_app_file(script, emit):
+    """The app file against the repo: newer there or damaged here -> loaded again. -> (state, text, restart)"""
+    try:
+        info = check_app_update()
+    except Exception as ex:  # noqa: BLE001
+        return "warn", f"GitHub not reachable – not checked ({clean_error(ex)[:80]})", False
+    same = _ver(info.get("version")) == _ver(APP_VERSION)
+    try:
+        intact = bool(info.get("sha256")) and _sha256_file(script) == info["sha256"]
+    except OSError:
+        intact = False
+    if same and intact:
+        return "ok", f"version {APP_VERSION} is complete", False
+    if not info.get("newer") and not same:
+        return "ok", f"version {APP_VERSION} (newer than the one on GitHub)", False
+    install_app_update(info, script, emit)
+    if info.get("newer"):
+        return "fixed", f"updated to {info.get('version')} – restart the app", True
+    return "fixed", "the app file was damaged or changed – loaded again from GitHub, restart the app", True
+
+
+def repair_tools(ffmpeg, ffprobe):
+    bad = []
+    for name, exe in (("FFmpeg", ffmpeg), ("FFprobe", ffprobe)):
+        try:
+            r = subprocess.run([exe, "-hide_banner", "-version"], capture_output=True, text=True, timeout=20,
+                               creationflags=NO_WINDOW) if exe else None
+            if r is None or r.returncode != 0:
+                bad.append(name)
+        except (OSError, subprocess.SubprocessError):
+            bad.append(name)
+    if bad:
+        return "error", (" and ".join(bad) + " missing or broken – start the setup (YouTube-Downloader.exe) again, "
+                         "it repairs the installation"), False
+    return "ok", "FFmpeg and FFprobe work", False
+
+
+def repair_extension():
+    """Puts the extension's files back (same key – the pairing stays)."""
+    before = {}
+    for f in EXT_DIR.glob("*") if EXT_DIR.exists() else []:
+        try:
+            before[f.name] = f.read_bytes()
+        except OSError:
+            pass
+    write_extension()
+    changed = [f.name for f in EXT_DIR.glob("*") if before.get(f.name) != f.read_bytes()]
+    if changed:
+        return "fixed", ("files restored (" + ", ".join(changed) + ") – if you added it in Chrome: click ↻ at "
+                         "“YouTube Downloader – Login” on the extensions page"), False
+    return "ok", "files complete", False
+
+
+def repair_login():
+    _LOGIN["text"] = None
+    if LOGIN_DAT.exists() and login_text() is None:
+        sign_out()
+        return "fixed", "the saved login couldn't be read (other PC / Windows user?) – removed, please sign in again", False
+    if COOKIE_FILE.exists() and can_protect():
+        login_text()                                   # turns the plain file into the encrypted one
+        return "fixed", "the login is stored encrypted now", False
+    apply_login()
+    return "ok", "signed in" if login_state()["signed_in"] else "not signed in (nothing to check)", False
+
+
+def repair_settings():
+    try:
+        raw = CFG_FILE.read_text(encoding="utf-8")
+        json.loads(raw) if raw.strip() else {}
+        return "ok", "settings file is fine", False
+    except FileNotFoundError:
+        return "ok", "no settings file yet", False
+    except (OSError, ValueError):
+        try:
+            os.replace(CFG_FILE, CFG_FILE.with_name("config.broken.json"))
+        except OSError:
+            pass
+        return "fixed", "the settings file was damaged – set aside (config.broken.json), saved again", False
+
+
+def repair_leftovers(signing_in=False):
+    n = 0
+    for pat in ("*.tmp", "*.new"):
+        for f in APP_DIR.glob(pat):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:
+                pass
+    if not signing_in and SIGNIN_DIR.exists():
+        shutil.rmtree(SIGNIN_DIR, ignore_errors=True)
+        n += 1
+    return ("fixed", f"{n} leftover file{'s' if n != 1 else ''} removed", False) if n else \
+        ("ok", "nothing left over", False)
+
+
 # ----------------------------------------------------------------------------- fonts for burned-in subtitles
 
 def system_font_files(family) -> list:
@@ -3729,6 +3899,8 @@ QLabel#sub {{ color: {c['muted']}; }}
 QLabel#section {{ color: {c['muted']}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
 QLabel#muted, QLabel#field {{ color: {c['muted']}; }}
 QLabel#muted[state="ok"] {{ color: {c['accent']}; font-weight: 600; }}
+QLabel#dragchip {{ background: {c['panel2']}; border: 1px dashed {c['accent']}; border-radius: 8px;
+    padding: 6px 10px; font-weight: 600; }}
 QLabel#stepnum {{ background: {c['accent']}; color: {c['on_accent']}; border-radius: 12px; font-weight: 700; }}
 QLabel#hint {{ color: {c['muted']}; font-size: 12px; }}
 QLabel#hint[state="warn"] {{ color: {c['warn']}; }}
@@ -5655,28 +5827,60 @@ def _dir_buttons(on_open, on_change, on_default):
     return row, b_def
 
 
+class FolderDragChip(QtWidgets.QLabel):
+    """A folder you can drag (e.g. onto Chrome's extensions page in developer mode = loads it)."""
+    def __init__(self, path):
+        super().__init__()
+        self.path = Path(path)
+        self.setText(f"📁  {self.path.name}")
+        self.setObjectName("dragchip")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._p0 = None
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._p0 = e.position().toPoint()
+
+    def mouseMoveEvent(self, e):
+        if self._p0 is None or (e.position().toPoint() - self._p0).manhattanLength() < 6:
+            return
+        self._p0 = None
+        md = QtCore.QMimeData()
+        md.setUrls([QtCore.QUrl.fromLocalFile(str(self.path))])
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(md)
+        drag.setPixmap(self.grab())
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.LinkAction)
+
+    def mouseReleaseEvent(self, e):
+        self._p0 = None
+
+
 class ExtSetupDialog(QtWidgets.QDialog):
-    """Once per PC: add the app's sign-in extension to Chrome (developer mode -> Load unpacked). Closes by itself
-    as soon as the extension reports in."""
+    """Once per PC: add the app's sign-in extension to Chrome (developer mode -> Load unpacked or drag the folder
+    onto the page). Closes by itself as soon as the extension reports in."""
+    WITHOUT = 2                     # result: sign in without the extension (own window) instead
     def __init__(self, main, b):
         super().__init__(main)
         self.main, self.b = main, b
         self.setWindowTitle("Sign-in extension")
         self.setModal(True)
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(720)
         lay = QtWidgets.QVBoxLayout(self)
+        lay.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
         lay.setContentsMargins(24, 20, 24, 18)
-        lay.setSpacing(10)
+        lay.setSpacing(12)
         name = b["name"]
-        t = label(f"Add the sign-in extension to {name} – once", "h1")
-        lay.addWidget(t)
-        intro = label(f"With it, “Sign in” opens a normal tab in your {name} with your Google accounts. The extension "
-                      "hands only the YouTube login to this app on this PC – nowhere else – and keeps it up to date. "
-                      "Tip: a second Google account is the safest choice – YouTube can limit accounts that are used "
-                      "with download tools.", "muted")
+        lay.addWidget(label(f"Add the sign-in extension to {name} – once", "h1"))
+        intro = label(f"With it, “Sign in” opens a normal tab in your {name} with your Google accounts. It hands only "
+                      "the YouTube login to this app on this PC and keeps it up to date. "
+                      f"{name} doesn't let programs add extensions themselves – so it's three steps, once.", "muted")
         intro.setWordWrap(True)
         lay.addWidget(intro)
-        page = extensions_page(b)
+        tipl = label("Tip: a second Google account is the safest choice – YouTube can limit accounts that are used "
+                     "with download tools.", "hint")
+        tipl.setWordWrap(True)
+        lay.addWidget(tipl)
 
         def step(n, text, *widgets):
             row = QtWidgets.QHBoxLayout()
@@ -5701,23 +5905,43 @@ class ExtSetupDialog(QtWidgets.QDialog):
             row.addLayout(col, 1)
             lay.addLayout(row)
 
-        b_open = QtWidgets.QPushButton(f"Open {page.rstrip('/')}")
+        # which profile (Chrome's "Who's using Chrome?")
+        self.profiles = browser_profiles(b)
+        self.cb_prof = QtWidgets.QComboBox()
+        pick = self.main._login_profile()
+        for i, pr in enumerate(self.profiles):
+            self.cb_prof.addItem(pr["name"] + (f"  –  {pr['who']}" if pr["who"] and pr["who"] != pr["name"] else "")
+                                 + ("  (extension added)" if pr["ext"] else ""), pr["dir"])
+            if pr["dir"] == pick:
+                self.cb_prof.setCurrentIndex(i)
+        page = extensions_page(b)
+        b_open = QtWidgets.QPushButton(f"Open {name}")
         b_open.clicked.connect(self._open_page)
-        step(1, f"Open the extensions page of {name} (in the profile you use YouTube with).", b_open)
+        how = f"then press <b>Ctrl+V</b> and <b>Enter</b> in the address bar (<b>{page.rstrip('/')}</b> is copied)."
+        if len(self.profiles) > 1:
+            step(1, f"Pick your YouTube profile and open {name}, {how}", self.cb_prof, b_open)
+        else:
+            step(1, f"Open {name}, {how}", b_open)
         step(2, "Switch on <b>Developer mode</b> (top right on that page).")
         self.path = QtWidgets.QLineEdit(str(EXT_DIR))
         self.path.setReadOnly(True)
-        self.path.setMinimumWidth(340)
-        b_copy = QtWidgets.QPushButton("Copy")
+        self.path.setMinimumWidth(300)
+        b_copy = QtWidgets.QPushButton("Copy path")
         b_copy.clicked.connect(self._copy)
-        b_folder = QtWidgets.QPushButton("Open folder")
-        b_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(EXT_DIR))))
-        step(3, "Click <b>Load unpacked</b> and pick this folder (paste the path into the folder field):",
-             self.path, b_copy, b_folder)
+        step(3, "Drag this folder onto the extensions page – or <b>Load unpacked</b> → paste the path → "
+                "<b>Select folder</b>:",
+             FolderDragChip(EXT_DIR), self.path, b_copy)
         self.state = label("Waiting for the extension …", "muted")
+        self.state.setWordWrap(True)
         lay.addSpacing(4)
         lay.addWidget(self.state)
         bot = QtWidgets.QHBoxLayout()
+        nox = tip(QtWidgets.QPushButton("Sign in without the extension instead …"), "Without the extension",
+                  f"Opens {name} in an own, empty window – sign in there with e-mail and password. Nothing to add, "
+                  "but your accounts aren't there and the login isn't kept up to date.")
+        nox.setObjectName("ghost")
+        nox.clicked.connect(lambda: self.done(self.WITHOUT))
+        bot.addWidget(nox)
         bot.addStretch(1)
         cancel = QtWidgets.QPushButton("Cancel")
         cancel.setObjectName("ghost")
@@ -5730,11 +5954,18 @@ class ExtSetupDialog(QtWidgets.QDialog):
         self.timer.timeout.connect(self._check)
         self.timer.start()
 
+    def profile(self):
+        return self.cb_prof.currentData() if self.cb_prof.count() else None
+
     def _open_page(self):
-        page = extensions_page(self.b)
-        if not open_in_browser(self.b, page):
-            QtWidgets.QApplication.clipboard().setText(page)
-            self.state.setText(f"Couldn't open it – “{page}” is copied, paste it into the address bar.")
+        page = extensions_page(self.b).rstrip("/")
+        QtWidgets.QApplication.clipboard().setText(page)
+        prof = self.profile()
+        if prof:
+            self.main.cfg["chrome_profile"] = prof
+        ok = open_in_browser(self.b, None, prof)
+        self.state.setText((f"{self.b['name']} opened – " if ok else "") + f"“{page}” is copied: Ctrl+V and Enter in "
+                           "the address bar. Waiting for the extension …")
 
     def _copy(self):
         QtWidgets.QApplication.clipboard().setText(str(EXT_DIR))
@@ -5747,10 +5978,123 @@ class ExtSetupDialog(QtWidgets.QDialog):
             set_state(self.state, "")
         if self.main.login_bridge.seen >= self._t0 - 1 or self.main._ext_connected(20):
             self.timer.stop()
+            prof = self.profile()
+            if prof:
+                self.main.cfg["chrome_profile"] = prof
             signed = not self.main._pending_signin
             self.state.setText("✓ Extension added – " + ("signed in." if signed else "opening the YouTube sign-in …"))
             set_state(self.state, "ok")
             QtCore.QTimer.singleShot(900, self.accept)
+
+
+class RepairDialog(QtWidgets.QDialog):
+    """Checks the app and puts right what is broken. Settings, history and login stay."""
+    class _Sig(QtCore.QObject):
+        step = QtCore.Signal(str, str, str, bool)
+        done = QtCore.Signal()
+
+    ITEMS = [("app", "App file"), ("ytdlp", "yt-dlp"), ("tools", "FFmpeg"), ("ext", "Sign-in extension"),
+             ("login", "YouTube login"), ("settings", "Settings"), ("left", "Leftover files")]
+    ICON = {"ok": "✓", "fixed": "✓", "warn": "⚠", "error": "✕", "run": "…"}
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self.setWindowTitle("Repair")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(10)
+        lay.addWidget(label("Repair", "h1"))
+        intro = label("Checks the app and puts right what is broken: loads the app file again if it's damaged, puts "
+                      "yt-dlp in again, checks FFmpeg, restores the sign-in extension and the files. Your settings, "
+                      "history and YouTube login stay.", "muted")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+        self.rows = {}
+        for i, (key, name) in enumerate(self.ITEMS):
+            grid.addWidget(label(name, "field"), i, 0, Qt.AlignmentFlag.AlignTop)
+            st = label("–", "muted")
+            st.setWordWrap(True)
+            grid.addWidget(st, i, 1)
+            self.rows[key] = st
+        grid.setColumnStretch(1, 1)
+        lay.addLayout(grid)
+        lay.addSpacing(6)
+        bot = QtWidgets.QHBoxLayout()
+        self.btn_restart = QtWidgets.QPushButton("Restart app")
+        self.btn_restart.setObjectName("primary")
+        self.btn_restart.setVisible(False)
+        self.btn_restart.clicked.connect(self.main._restart)
+        self.btn_go = QtWidgets.QPushButton("Repair now")
+        self.btn_go.setObjectName("primary")
+        self.btn_go.setMinimumWidth(130)
+        self.btn_go.clicked.connect(self._go)
+        close = QtWidgets.QPushButton("Close")
+        close.setObjectName("ghost")
+        close.clicked.connect(self.reject)
+        bot.addWidget(close)
+        bot.addStretch(1)
+        bot.addWidget(self.btn_restart)
+        bot.addWidget(self.btn_go)
+        lay.addLayout(bot)
+        self.sig = self._Sig()
+        self.sig.step.connect(self._show)
+        self.sig.done.connect(self._finished)
+        self.restart = False
+
+    def _show(self, key, state, text, restart):
+        lab = self.rows[key]
+        lab.setText(f"{self.ICON.get(state, '')}  {text}")
+        c = self.main.c if hasattr(self.main, "c") else theme_colors(self.main.theme, self.main.accent)
+        col = {"fixed": "#3ddc84", "warn": c["warn"], "error": c["err"]}.get(state)
+        lab.setStyleSheet(f"color: {col}; font-weight: 600;" if col else "")
+        self.restart = self.restart or restart
+
+    def _finished(self):
+        self.main._save_settings()                 # (a set-aside settings file is written again right away)
+        self.btn_go.setText("Repair again")
+        self.btn_go.setEnabled(True)
+        self.btn_restart.setVisible(self.restart)
+        self.main._login_state_changed()
+
+    def _go(self):
+        if self.main.busy:
+            QtWidgets.QMessageBox.information(self, "Repair", "Wait until the download is finished.")
+            return
+        self.btn_go.setEnabled(False)
+        self.btn_restart.setVisible(False)
+        self.restart = False
+        for key, _ in self.ITEMS:
+            self._show(key, "", "–", False)
+        m = self.main
+        script = Path(__file__).resolve()
+        steps = [
+            ("app", lambda: repair_app_file(script, m.emit)),
+            ("ytdlp", lambda: ("fixed", "put in again (newest version)", True) if update_ytdlp(m.emit, force=True)
+             else ("error", "couldn't put it in again – see Details at the bottom of the window", False)),
+            ("tools", lambda: repair_tools(m.ffmpeg, m.ffprobe)),
+            ("ext", repair_extension),
+            ("login", repair_login),
+            ("settings", repair_settings),
+            ("left", lambda: repair_leftovers(signing_in=m._signin is not None)),
+        ]
+
+        def work():
+            for key, fn in steps:
+                self.sig.step.emit(key, "run", "checking …", False)
+                try:
+                    state, text, restart = fn()
+                except Exception as ex:  # noqa: BLE001
+                    state, text, restart = "error", clean_error(ex)[:200], False
+                self.sig.step.emit(key, state, text, restart)
+            m.emit("log", "Repair finished.")
+            self.sig.done.emit()
+        threading.Thread(target=work, daemon=True).start()
 
 
 class SettingsDialog(QtWidgets.QDialog):
@@ -5914,7 +6258,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.btn_cookies.setObjectName("ghost")
         self.btn_cookies.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_cookies.clicked.connect(self._load_cookies)
-        self.btn_login2 = QtWidgets.QPushButton("Without extension …")
+        self.btn_login2 = QtWidgets.QPushButton("Sign in without extension …")
         self.btn_login2.setObjectName("ghost")
         self.btn_login2.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_login2.clicked.connect(lambda: (self.main._sign_in_window(), self.show_login_state()))
@@ -5940,11 +6284,17 @@ class SettingsDialog(QtWidgets.QDialog):
                     "Dark theme, red accent and hover help on.")
         reset.setObjectName("ghost")
         reset.clicked.connect(self._reset)
+        repair = tip(QtWidgets.QPushButton("Repair …"), "Repair",
+                     "Checks the app and puts right what is broken (app file, yt-dlp, FFmpeg, sign-in extension, "
+                     "login, settings). Your settings, history and login stay.")
+        repair.setObjectName("ghost")
+        repair.clicked.connect(lambda: RepairDialog(self.main).exec())
         done = QtWidgets.QPushButton("Done")
         done.setObjectName("primary")
         done.setMinimumWidth(110)
         done.clicked.connect(self.accept)
         bot.addWidget(reset)
+        bot.addWidget(repair)
         bot.addStretch(1)
         bot.addWidget(done)
         outer.addLayout(bot)
@@ -7559,6 +7909,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         dlg = ExtSetupDialog(self, b)
         res = dlg.exec()
+        if res == ExtSetupDialog.WITHOUT:
+            self._pending_signin = 0.0
+            self._sign_in_window()
+            return
         if res != QtWidgets.QDialog.DialogCode.Accepted:
             if self._pending_signin:
                 self._cancel_sign_in()
@@ -7566,8 +7920,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._pending_signin:                   # not signed in by the extension's first message already
             self._open_login_tab(b)
 
+    def _login_profile(self):
+        """The browser profile for the sign-in: the chosen one, else the one with the extension, else the last used."""
+        prs = browser_profiles(self._login_browser())
+        dirs = [p["dir"] for p in prs]
+        if self.cfg.get("chrome_profile") in dirs:
+            return self.cfg["chrome_profile"]
+        with_ext = [p["dir"] for p in prs if p["ext"]]
+        if with_ext:
+            return with_ext[0]
+        return next((p["dir"] for p in prs if p["last"]), dirs[0] if dirs else None)
+
     def _open_login_tab(self, b):
-        if not open_in_browser(b, LOGIN_URL):
+        if not open_in_browser(b, LOGIN_URL, self._login_profile()):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl(LOGIN_URL))
         self._on_log(f"Sign-in: opened a tab in {b['name']} – waiting for the YouTube login …")
         self._on_status(f"Sign in to YouTube in the new {b['name']} tab (or pick your account) – the app takes the "
@@ -7592,6 +7957,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._login_warned = False
             if first:
                 b = self._login_browser()
+                with_ext = [p["dir"] for p in browser_profiles(b) if p["ext"]]
+                if len(with_ext) == 1:
+                    self.cfg["chrome_profile"] = with_ext[0]     # the sign-in opens there from now on
                 self._on_log(f"✓ Signed in to YouTube (via {b['name'] if b else 'Chrome'}) – the extension keeps the "
                              "login up to date.")
                 self._on_status("✓  Signed in to YouTube.")
@@ -9388,6 +9756,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _restart(self):
         self.busy = False
         self._save_settings()
+        self.login_bridge.close()
         for pl in (self.player, self.aplayer):
             if pl is not None:
                 pl.stop()

@@ -1365,14 +1365,72 @@ def chromium_browsers() -> list:
     return out
 
 
-def open_in_browser(b, url) -> bool:
-    """Opens url as a new tab in the browser that is already running (or starts it)."""
+def open_in_browser(b, url, profile=None) -> bool:
+    """Opens url as a new tab in the browser that is already running (or starts it) – in the given profile, so
+    Chrome's "Who's using Chrome?" picker doesn't come in between. url None: a new window (new tab page).
+    Note: Chrome ignores chrome:// addresses given this way (security)."""
     try:
-        subprocess.Popen([b["exe"], url], creationflags=NO_WINDOW, close_fds=True,
+        cmd = [b["exe"], *([f"--profile-directory={profile}"] if profile else []), *([url] if url else [])]
+        subprocess.Popen(cmd, creationflags=NO_WINDOW, close_fds=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except (OSError, KeyError, TypeError):
         return False
+
+
+_USER_DATA_WIN = {"Chrome": r"Google\Chrome\User Data", "Edge": r"Microsoft\Edge\User Data",
+                  "Brave": r"BraveSoftware\Brave-Browser\User Data", "Vivaldi": r"Vivaldi\User Data",
+                  "Chromium": r"Chromium\User Data", "Thorium": r"Thorium\User Data"}
+_USER_DATA_NIX = {"Chrome": ".config/google-chrome", "Chromium": ".config/chromium", "Edge": ".config/microsoft-edge",
+                  "Brave": ".config/BraveSoftware/Brave-Browser"}
+
+
+def browser_user_data(b):
+    """The folder with the browser's profiles ("User Data") or None."""
+    over = os.environ.get("YTD_BROWSER_USER_DATA")
+    if over:
+        return Path(over)
+    if not b:
+        return None
+    if WIN:
+        rel = _USER_DATA_WIN.get(b["name"])
+        p = Path(os.environ.get("LOCALAPPDATA", "")) / rel if rel else None
+    else:
+        rel = _USER_DATA_NIX.get(b["name"])
+        p = Path.home() / rel if rel else None
+    return p if p and (p / "Local State").exists() else None
+
+
+def _has_ext(profile_dir: Path) -> bool:
+    for fn in ("Secure Preferences", "Preferences"):
+        try:
+            d = json.loads((profile_dir / fn).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if EXT_ID in (((d.get("extensions") or {}).get("settings")) or {}):
+            return True
+    return False
+
+
+def browser_profiles(b) -> list:
+    """The browser's profiles in its own order -> [{'dir', 'name', 'who', 'ext': extension added, 'last'}]."""
+    ud = browser_user_data(b)
+    if not ud:
+        return []
+    try:
+        prof = json.loads((ud / "Local State").read_text(encoding="utf-8", errors="replace")).get("profile") or {}
+    except (OSError, ValueError):
+        return []
+    cache = prof.get("info_cache") or {}
+    order = [d for d in (prof.get("profiles_order") or []) if d in cache]
+    order += [d for d in cache if d not in order]
+    last = prof.get("last_used") or (order[0] if order else "")
+    out = []
+    for d in order:
+        v = cache.get(d) or {}
+        out.append({"dir": d, "name": v.get("name") or d, "who": v.get("gaia_name") or v.get("user_name") or "",
+                    "ext": _has_ext(ud / d), "last": d == last})
+    return out
 
 
 # ---- the sign-in extension: a small helper in your own Chrome hands the YouTube login to this app
@@ -1749,6 +1807,113 @@ def login_hint(msg) -> str:
     if logged_in():
         return "\nTip: your YouTube login may have expired – Settings → YouTube login → Sign in again."
     return "\nTip: this video needs a YouTube login – Settings → YouTube login → Sign in."
+
+
+# ----------------------------------------------------------------------------- repair
+
+def _sha256_file(path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def repair_app_file(script, emit):
+    """The app file against the repo: newer there or damaged here -> loaded again. -> (state, text, restart)"""
+    try:
+        info = check_app_update()
+    except Exception as ex:  # noqa: BLE001
+        return "warn", f"GitHub not reachable – not checked ({clean_error(ex)[:80]})", False
+    same = _ver(info.get("version")) == _ver(APP_VERSION)
+    try:
+        intact = bool(info.get("sha256")) and _sha256_file(script) == info["sha256"]
+    except OSError:
+        intact = False
+    if same and intact:
+        return "ok", f"version {APP_VERSION} is complete", False
+    if not info.get("newer") and not same:
+        return "ok", f"version {APP_VERSION} (newer than the one on GitHub)", False
+    install_app_update(info, script, emit)
+    if info.get("newer"):
+        return "fixed", f"updated to {info.get('version')} – restart the app", True
+    return "fixed", "the app file was damaged or changed – loaded again from GitHub, restart the app", True
+
+
+def repair_tools(ffmpeg, ffprobe):
+    bad = []
+    for name, exe in (("FFmpeg", ffmpeg), ("FFprobe", ffprobe)):
+        try:
+            r = subprocess.run([exe, "-hide_banner", "-version"], capture_output=True, text=True, timeout=20,
+                               creationflags=NO_WINDOW) if exe else None
+            if r is None or r.returncode != 0:
+                bad.append(name)
+        except (OSError, subprocess.SubprocessError):
+            bad.append(name)
+    if bad:
+        return "error", (" and ".join(bad) + " missing or broken – start the setup (YouTube-Downloader.exe) again, "
+                         "it repairs the installation"), False
+    return "ok", "FFmpeg and FFprobe work", False
+
+
+def repair_extension():
+    """Puts the extension's files back (same key – the pairing stays)."""
+    before = {}
+    for f in EXT_DIR.glob("*") if EXT_DIR.exists() else []:
+        try:
+            before[f.name] = f.read_bytes()
+        except OSError:
+            pass
+    write_extension()
+    changed = [f.name for f in EXT_DIR.glob("*") if before.get(f.name) != f.read_bytes()]
+    if changed:
+        return "fixed", ("files restored (" + ", ".join(changed) + ") – if you added it in Chrome: click ↻ at "
+                         "“YouTube Downloader – Login” on the extensions page"), False
+    return "ok", "files complete", False
+
+
+def repair_login():
+    _LOGIN["text"] = None
+    if LOGIN_DAT.exists() and login_text() is None:
+        sign_out()
+        return "fixed", "the saved login couldn't be read (other PC / Windows user?) – removed, please sign in again", False
+    if COOKIE_FILE.exists() and can_protect():
+        login_text()                                   # turns the plain file into the encrypted one
+        return "fixed", "the login is stored encrypted now", False
+    apply_login()
+    return "ok", "signed in" if login_state()["signed_in"] else "not signed in (nothing to check)", False
+
+
+def repair_settings():
+    try:
+        raw = CFG_FILE.read_text(encoding="utf-8")
+        json.loads(raw) if raw.strip() else {}
+        return "ok", "settings file is fine", False
+    except FileNotFoundError:
+        return "ok", "no settings file yet", False
+    except (OSError, ValueError):
+        try:
+            os.replace(CFG_FILE, CFG_FILE.with_name("config.broken.json"))
+        except OSError:
+            pass
+        return "fixed", "the settings file was damaged – set aside (config.broken.json), saved again", False
+
+
+def repair_leftovers(signing_in=False):
+    n = 0
+    for pat in ("*.tmp", "*.new"):
+        for f in APP_DIR.glob(pat):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:
+                pass
+    if not signing_in and SIGNIN_DIR.exists():
+        shutil.rmtree(SIGNIN_DIR, ignore_errors=True)
+        n += 1
+    return ("fixed", f"{n} leftover file{'s' if n != 1 else ''} removed", False) if n else \
+        ("ok", "nothing left over", False)
 
 
 # ----------------------------------------------------------------------------- fonts for burned-in subtitles

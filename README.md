@@ -18,10 +18,14 @@ Download [`setup/YouTube-Downloader.exe`](setup/YouTube-Downloader.exe) and star
 
 Only needed for age-restricted, members-only or Premium videos. Two ways in **Settings → YouTube login**:
 
-- **Sign in with Chrome** – opens a tab in your own Chrome (or Edge, Brave …) with your Google accounts. A small extension of the app hands the YouTube login to the app on this PC and keeps it up to date. It only answers the real app (both share a key made on your PC), only after you clicked *Sign in*, only YouTube cookies, only to `127.0.0.1`. Added once per PC (developer mode → *Load unpacked*) – the app shows how.
+- **Sign in with Chrome** – opens a tab in your own Chrome (or Edge, Brave …) with your Google accounts. A small extension of the app hands the YouTube login to the app on this PC and keeps it up to date. It only answers the real app (both share a key made on your PC), only after you clicked *Sign in*, only YouTube cookies, only to `127.0.0.1`. Added once per PC – Chrome doesn't let programs add extensions themselves, so the app opens Chrome in the right profile, copies everything you need and you drag the folder onto the extensions page (developer mode).
 - **Without extension** – an own, empty browser window; sign in with e-mail and password. Nothing to install, but the login isn't kept up to date. The window's profile is deleted right after the sign-in.
 
 The login is stored encrypted with Windows' own protection (readable only by your Windows user on this PC) and handed to yt-dlp in memory. Tip: a second Google account is the safest choice.
+
+## Repair
+
+**Settings → Repair …** checks the app file (loads it again from GitHub if it's damaged), puts yt-dlp in again, checks FFmpeg, restores the sign-in extension, the login and the settings file, and removes leftovers. Settings, history and login stay.
 
 ## Updates
 

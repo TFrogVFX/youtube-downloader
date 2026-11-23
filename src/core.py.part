@@ -989,11 +989,16 @@ def fetch_bytes(url: str, timeout: float = 15.0, headers=None) -> bytes:
         return r.read()
 
 
-def update_ytdlp(emit) -> bool:
+def update_ytdlp(emit, force=False) -> bool:
+    """yt-dlp to the newest version (force: put its files in again even if it is up to date – repair)."""
     py = Path(sys.executable)
     if py.name.lower() == "pythonw.exe" and py.with_name("python.exe").exists():
         py = py.with_name("python.exe")
-    emit("log", "Checking for yt-dlp update …")
+    emit("log", "Reinstalling yt-dlp …" if force else "Checking for yt-dlp update …")
+    if force:
+        subprocess.run([str(py), "-m", "pip", "install", "-U", "-q", "--disable-pip-version-check", "--force-reinstall",
+                        "--no-deps", "yt-dlp"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       creationflags=NO_WINDOW)
     base = [str(py), "-m", "pip", "install", "-U", "-q", "--disable-pip-version-check", "yt-dlp[default]"]
     r = None
     for extra in ([], ["--user"]):

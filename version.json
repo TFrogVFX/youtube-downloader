@@ -1,8 +1,8 @@
 {
-  "version": "2.9.3",
+  "version": "2.9.4",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "1e5754ca4a274693dcf4055ca83bff7c92394832994f1d739d7d6ff648f48510",
-  "notes": "Sign in with or without the extension: “Sign in with Chrome” (tab in your Chrome, your accounts, kept up to date) or “Without extension” (own window, deleted right after). The extension now only talks to the real app (a key made on your PC) and only straight to 127.0.0.1. The login is stored encrypted (Windows protection, only your user on this PC) and handed to yt-dlp in memory. If you already added the extension: click ↻ (reload) at it on chrome://extensions once.",
+  "sha256": "a72ba2eb1a540efa4fc65613feb175f0221d9be8354f3975f2a6a200871544ef",
+  "notes": "Sign-in: Chrome opens in the profile you pick (no more “Who's using Chrome?” in between), chrome://extensions is copied, the extension folder can be dragged onto the page; “Sign in without the extension instead” right in that window. New: Settings → Repair … (app file, yt-dlp, FFmpeg, sign-in extension, login, settings, leftovers).",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
