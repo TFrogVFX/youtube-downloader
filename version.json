@@ -1,8 +1,8 @@
 {
-  "version": "2.9.2",
+  "version": "2.9.3",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "2b80e7ee83215fec30752666b43e79294c9b67304e5380aa60b7b0e95ee99c9c",
-  "notes": "Sign-in in your own Chrome: “Sign in with Chrome” opens a new tab with Google's account choice (your accounts and pictures as usual). A small extension of the app hands only the YouTube login to the app on this PC and keeps it up to date – the first time the app shows how to add it (once per PC). The separate sign-in window is gone.",
+  "sha256": "1e5754ca4a274693dcf4055ca83bff7c92394832994f1d739d7d6ff648f48510",
+  "notes": "Sign in with or without the extension: “Sign in with Chrome” (tab in your Chrome, your accounts, kept up to date) or “Without extension” (own window, deleted right after). The extension now only talks to the real app (a key made on your PC) and only straight to 127.0.0.1. The login is stored encrypted (Windows protection, only your user on this PC) and handed to yt-dlp in memory. If you already added the extension: click ↻ (reload) at it on chrome://extensions once.",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

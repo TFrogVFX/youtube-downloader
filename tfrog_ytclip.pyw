@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.2"
+APP_VERSION = "2.9.3"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -588,7 +588,7 @@ LOGIN_NOTE: list[str] = []   # set when YouTube says the saved login doesn't wor
 
 
 def _watch_login(msg) -> None:
-    if YDL_EXTRA.get("cookiefile") and re.search(r"cookies are no longer valid|account cookies", str(msg), re.I):
+    if YDL_EXTRA.get("login") and re.search(r"cookies are no longer valid|account cookies", str(msg), re.I):
         LOGIN_NOTE[:] = ["YouTube says your login has expired – sign in again: Settings → YouTube login."]
 
 
@@ -682,9 +682,11 @@ def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
 
 
 def ydl_extract(opts, url, download=True):
-    """One yt-dlp run (the YouTube login, if any, comes in through YDL_EXTRA -> cookiefile)."""
+    """One yt-dlp run (the YouTube login, if any, is handed in by add_login – from memory)."""
     from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
+    opts = {k: v for k, v in opts.items() if k != "login"}
     with YoutubeDL(opts) as ydl:
+        add_login(ydl)
         return ydl.extract_info(url, download=download)
 
 
@@ -1569,15 +1571,13 @@ def _net_ydl():
         from yt_dlp import YoutubeDL
     except ImportError:
         return None
-    key = repr(sorted((k, str(v)) for k, v in YDL_EXTRA.items()))
-    try:
-        key += f"|{os.path.getmtime(YDL_EXTRA['cookiefile'])}" if YDL_EXTRA.get("cookiefile") else ""
-    except OSError:
-        pass
+    key = repr(sorted((k, str(v)) for k, v in YDL_EXTRA.items())) + f"|{_LOGIN['ver']}"   # new login -> new instance
     with _NET_LOCK:
         if _NET["ydl"] is None or _NET["key"] != key:
             # the old one is just dropped: closing it would write its cookies back (e.g. after signing out)
-            _NET["ydl"] = YoutubeDL({"quiet": True, "no_warnings": True, "logger": _Silent(), **YDL_EXTRA})
+            _NET["ydl"] = YoutubeDL({"quiet": True, "no_warnings": True, "logger": _Silent(),
+                                     **{k: v for k, v in YDL_EXTRA.items() if k != "login"}})
+            add_login(_NET["ydl"])
             _NET["key"] = key
         return _NET["ydl"]
 
@@ -2592,62 +2592,197 @@ def remove_old_upscaler() -> None:
 LOGIN_COOKIES = {"LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "SID"}
 
 
-def write_cookie_file(cookies, path=None) -> int:
-    """cookies: [(domain, path, secure, expires (epoch, 0 = session), name, value, http_only)] -> Netscape cookies.txt
-    with the YouTube cookies only. -> number of cookies written."""
-    path = Path(path or COOKIE_FILE)
+# The login is kept encrypted with Windows' own protection (DPAPI): readable only by your Windows user on this PC
+# – a copied file is useless. yt-dlp gets the cookies handed in memory (no readable cookies file at all).
+
+LOGIN_DAT = APP_DIR / "youtube_login.dat"
+_LOGIN = {"text": None, "ver": 0}          # the login (Netscape cookie text) in memory while the app runs
+_PROTECT = {"ok": None}
+_DAT_MAGIC = b"YTD1"
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    def blob(b):
+        buf = (ctypes.c_ubyte * max(1, len(b))).from_buffer_copy(b or b"\0")
+        return BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))), buf
+
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    fn.argtypes = [ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.c_void_p,
+                   wintypes.DWORD, ctypes.POINTER(BLOB)]
+    fn.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    inp, k1 = blob(data)
+    ent, k2 = blob(b"tfrog YouTube Downloader login")
+    out = BLOB()
+    desc = ctypes.c_wchar_p("YouTube Downloader login") if protect else None
+    if not fn(ctypes.byref(inp), ctypes.cast(desc, ctypes.c_void_p) if desc else None, ctypes.byref(ent), None, None,
+              0x1, ctypes.byref(out)):                                  # 0x1: never show a dialog
+        raise OSError(f"Windows couldn't {'en' if protect else 'de'}crypt the login ({ctypes.GetLastError()})")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def _protect(data: bytes) -> bytes:
+    if os.environ.get("YTD_TEST_PROTECT"):                          # tests on Linux: a stand-in for DPAPI
+        return b"T" + base64.b64encode(data[::-1])
+    return _dpapi(data, True)
+
+
+def _unprotect(data: bytes) -> bytes:
+    if os.environ.get("YTD_TEST_PROTECT"):
+        if not data.startswith(b"T"):
+            raise OSError("not ours")
+        return base64.b64decode(data[1:])[::-1]
+    return _dpapi(data, False)
+
+
+def can_protect() -> bool:
+    """Encryption works on this PC (checked once)."""
+    if _PROTECT["ok"] is None:
+        try:
+            _PROTECT["ok"] = (WIN or bool(os.environ.get("YTD_TEST_PROTECT"))) and _unprotect(_protect(b"ytd")) == b"ytd"
+        except Exception:  # noqa: BLE001
+            _PROTECT["ok"] = False
+    return _PROTECT["ok"]
+
+
+def _netscape(cookies) -> str:
     lines = ["# Netscape HTTP Cookie File", "# YouTube login of the YouTube Downloader – keep it private.", ""]
-    n = 0
     for dom, cpath, secure, exp, name, value, http_only in cookies:
         if "youtube.com" not in dom or not name:
             continue
-        dom = dom if dom.startswith(".") or dom.count(".") < 2 else dom
         sub = "TRUE" if dom.startswith(".") else "FALSE"
         pre = "#HttpOnly_" if http_only else ""
         lines.append("\t".join([pre + dom, sub, cpath or "/", "TRUE" if secure else "FALSE", str(int(exp or 0)),
-                                 name, value]))
-        n += 1
+                                name, value]))
+    return "\n".join(lines) + "\n"
+
+
+def _save_login_text(text: str) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    return n
+    if can_protect():
+        tmp = LOGIN_DAT.with_suffix(".tmp")
+        tmp.write_bytes(_DAT_MAGIC + _protect(text.encode("utf-8")))
+        os.replace(tmp, LOGIN_DAT)
+        COOKIE_FILE.unlink(missing_ok=True)                 # no readable copy left
+    else:                                                   # encryption not available: as before (plain file)
+        tmp = COOKIE_FILE.with_suffix(".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, COOKIE_FILE)
+        LOGIN_DAT.unlink(missing_ok=True)
+    _LOGIN["text"] = text
+    _LOGIN["ver"] += 1
+
+
+def login_text() -> str | None:
+    """The saved login as cookie text (decrypted in memory) – None if there is none / it can't be read here."""
+    if _LOGIN["text"] is not None:
+        return _LOGIN["text"]
+    text = None
+    if LOGIN_DAT.exists():
+        try:
+            raw = LOGIN_DAT.read_bytes()
+            if raw.startswith(_DAT_MAGIC):
+                text = _unprotect(raw[len(_DAT_MAGIC):]).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - other PC / other Windows user -> not signed in
+            text = None
+    elif COOKIE_FILE.exists():                              # up to 2.9.2: plain file -> encrypted now
+        try:
+            text = COOKIE_FILE.read_text(encoding="utf-8", errors="replace")
+            if can_protect():
+                _save_login_text(text)
+        except OSError:
+            text = None
+    _LOGIN["text"] = text
+    return text
+
+
+def write_cookie_file(cookies, path=None) -> int:
+    """cookies: [(domain, path, secure, expires (epoch, 0 = session), name, value, http_only)] -> the app's login
+    (encrypted), or a plain Netscape cookies.txt at `path`. -> number of YouTube cookies."""
+    text = _netscape(cookies)
+    if path:
+        Path(path).write_text(text, encoding="utf-8")
+    else:
+        _save_login_text(text)
+    return sum(1 for c in cookies if "youtube.com" in c[0] and c[4])
+
+
+def _cookie_lines(path=None):
+    if path:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+    else:
+        text = login_text() or ""
+    for line in text.splitlines():
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7 and "youtube.com" in parts[0]:
+            yield parts
 
 
 def read_cookie_names(path=None) -> set:
-    names = set()
-    try:
-        for line in Path(path or COOKIE_FILE).read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("#HttpOnly_"):
-                line = line[len("#HttpOnly_"):]
-            elif line.startswith("#") or not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 7 and "youtube.com" in parts[0]:
-                names.add(parts[5])
-    except OSError:
-        pass
-    return names
+    return {parts[5] for parts in _cookie_lines(path)}
+
+
+def read_cookie_values(path=None) -> dict:
+    return {parts[5]: parts[6].strip() for parts in _cookie_lines(path)}
 
 
 def login_state() -> dict:
     """{'signed_in': bool, 'since': epoch or None}"""
     ok = bool(read_cookie_names() & LOGIN_COOKIES)
-    try:
-        since = COOKIE_FILE.stat().st_mtime if ok else None
-    except OSError:
-        since = None
+    since = None
+    if ok:
+        for f in (LOGIN_DAT, COOKIE_FILE):
+            try:
+                since = f.stat().st_mtime
+                break
+            except OSError:
+                continue
     return {"signed_in": ok, "since": since}
+
+
+def logged_in() -> bool:
+    return bool(YDL_EXTRA.get("login"))
 
 
 def apply_login() -> bool:
     """Use the saved YouTube login for every yt-dlp call (or nothing if there is none)."""
-    YDL_EXTRA.pop("cookiefile", None)
-    YDL_EXTRA.pop("cookiesfrombrowser", None)
+    for k in ("cookiefile", "cookiesfrombrowser", "login"):
+        YDL_EXTRA.pop(k, None)
     if login_state()["signed_in"]:
-        YDL_EXTRA["cookiefile"] = str(COOKIE_FILE)
+        YDL_EXTRA["login"] = _LOGIN["ver"] or 1      # marker only; the cookies are handed in by add_login()
         return True
     return False
+
+
+def add_login(ydl) -> None:
+    """Hands the saved login to a yt-dlp instance – in memory, nothing is written to disk."""
+    text = login_text() if logged_in() else None
+    if not text:
+        return
+    import io
+    from yt_dlp.cookies import YoutubeDLCookieJar
+    jar = YoutubeDLCookieJar(io.StringIO(text))
+    jar.load()
+    for c in jar:
+        ydl.cookiejar.set_cookie(c)
 
 
 def import_cookie_file(src) -> int:
@@ -2655,13 +2790,17 @@ def import_cookie_file(src) -> int:
     names = read_cookie_names(src)
     if not names & LOGIN_COOKIES:
         raise RuntimeError("No YouTube login in this file – export the cookies while you are signed in on youtube.com.")
-    shutil.copyfile(src, COOKIE_FILE)
+    _save_login_text(Path(src).read_text(encoding="utf-8", errors="replace"))
     return len(names)
 
 
 def sign_out() -> None:
-    COOKIE_FILE.unlink(missing_ok=True)
-    YDL_EXTRA.pop("cookiefile", None)
+    for f in (LOGIN_DAT, COOKIE_FILE):
+        f.unlink(missing_ok=True)
+    _LOGIN["text"] = None
+    _LOGIN["ver"] += 1
+    for k in ("cookiefile", "login"):
+        YDL_EXTRA.pop(k, None)
     clear_account()
 
 
@@ -2670,22 +2809,6 @@ def sign_out() -> None:
 ACCOUNT_FILE = APP_DIR / "account.json"
 ACCOUNT_PIC = APP_DIR / "account.jpg"
 _YT = "https://www.youtube.com"
-
-
-def read_cookie_values(path=None) -> dict:
-    vals = {}
-    try:
-        for line in Path(path or COOKIE_FILE).read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("#HttpOnly_"):
-                line = line[len("#HttpOnly_"):]
-            elif line.startswith("#") or not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 7 and "youtube.com" in parts[0]:
-                vals[parts[5]] = parts[6].strip()
-    except OSError:
-        pass
-    return vals
 
 
 def _sid_auth(cookies: dict, origin=_YT) -> str:
@@ -3021,7 +3144,7 @@ EXT_FILES = {
     "manifest.json": json.dumps({
         "manifest_version": 3,
         "name": "YouTube Downloader – Login",
-        "version": "1.0",
+        "version": "1.1",
         "description": "Hands your YouTube login to the YouTube Downloader app on this PC – only when the app asks for "
                        "it, only to this PC (127.0.0.1), nowhere else.",
         "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5ohi/zflHEKTNyvDtx+8B2tqrNr8f90JSz+9+6+H0sn2FGedFlrpwQUQdQoNDILkByHmB7DMP+dSQvxw0/yWfnXVSJ4u7hGnBqJP60AKITFHdFpdQwssM6o/ZZSJGIrfNGs2/VgfhxY2gWrzyp8ZkAa6VLQM37p67MwN9i9k3HYp5upfIeqTVAINGvvkcyKZgfNJc2O1in9z1H3swrsgle6Gq0y9Gqp7cStyAp3VEhWn3T1zvO4T3jaY9dYGUXKlMkUvKbHdtgQqW1h4Rk5j9Dnbe+9iedEzWl437Q3i2dv+bIhOXK+T4IfSPMkyM7ESK8fRFjWFNvTbvpHHGz7PcwIDAQAB",
@@ -3032,29 +3155,47 @@ EXT_FILES = {
     }, indent=2),
     "background.js": """// YouTube Downloader – Login helper.
 // Asks the YouTube Downloader app on this PC (127.0.0.1) whether it wants the YouTube login. Only if it does
-// (after "Sign in" in the app), the youtube.com cookies go to the app – to nothing else, nowhere else.
+// (after "Sign in" in the app) AND proves it is the real app (it knows the key in pair.json, written by the
+// app when it set up this extension), the youtube.com cookies go to it – to nothing else, nowhere else.
 const PORTS = [%PORTS%];
 let debounce = null;
+const enc = new TextEncoder();
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 
-async function state(port) {
-  const r = await fetch(`http://127.0.0.1:${port}/ytd/state`, {cache: "no-store", headers: {"X-Ytd": "1"}});
-  if (!r.ok) return null;
-  const j = await r.json();
-  return j && j.app === "ytd" ? j : null;
+async function pairKey() {
+  const r = await fetch(chrome.runtime.getURL("pair.json"), {cache: "no-store"});
+  const k = (await r.json()).key || "";
+  const bytes = new Uint8Array(k.match(/../g).map(h => parseInt(h, 16)));
+  return crypto.subtle.importKey("raw", bytes, {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+}
+
+async function mac(key, msg) {
+  return hex(await crypto.subtle.sign("HMAC", key, enc.encode(msg)));
 }
 
 async function sync(reason) {
+  let key;
+  try { key = await pairKey(); } catch (e) { return; }
   for (const port of PORTS) {
+    const n = hex(crypto.getRandomValues(new Uint8Array(16)));
     let st = null;
-    try { st = await state(port); } catch (e) { continue; }
-    if (!st) continue;
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/ytd/state?n=${n}`, {cache: "no-store", headers: {"X-Ytd": "2"}});
+      if (!r.ok) continue;
+      st = await r.json();
+    } catch (e) { continue; }
+    if (!st || st.app !== "ytd") continue;
+    // is it really the app? (another program on this port can't know the key)
+    if (st.proof !== await mac(key, `state|${n}|${st.want ? 1 : 0}`)) continue;
     if (!st.want) return;
     const all = await chrome.cookies.getAll({domain: "youtube.com"});
     const cookies = all.map(c => ({domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly,
                                    session: c.session, expires: c.expirationDate || 0, name: c.name, value: c.value}));
+    const body = JSON.stringify({reason, ts: Date.now(), n, cookies});
     try {
       await fetch(`http://127.0.0.1:${port}/ytd/cookies`, {method: "POST", cache: "no-store",
-        headers: {"Content-Type": "application/json", "X-Ytd": "1"}, body: JSON.stringify({reason, cookies})});
+        headers: {"Content-Type": "application/json", "X-Ytd": "2", "X-Ytd-Mac": await mac(key, "cookies|" + body)},
+        body});
     } catch (e) {}
     return;
   }
@@ -3078,10 +3219,36 @@ every30s();
 EXT_ICON = base64.b64decode("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")
 
 
+BRIDGE_KEY_FILE = APP_DIR / "bridge.key"
+
+
+def bridge_key() -> bytes:
+    """The key the app and its extension share (made once per PC) – proves to the extension that it talks to
+    this app and not to another program on the same port."""
+    try:
+        k = bytes.fromhex(BRIDGE_KEY_FILE.read_text(encoding="ascii").strip())
+        if len(k) == 32:
+            return k
+    except (OSError, ValueError):
+        pass
+    import secrets
+    k = secrets.token_bytes(32)
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    BRIDGE_KEY_FILE.write_text(k.hex(), encoding="ascii")
+    return k
+
+
+def bridge_mac(msg: str) -> str:
+    import hashlib
+    import hmac
+    return hmac.new(bridge_key(), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def write_extension() -> Path:
     """Puts the extension's files into EXT_DIR (only what changed – Chrome loads it from there)."""
     EXT_DIR.mkdir(parents=True, exist_ok=True)
-    for name, data in list(EXT_FILES.items()) + [("icon.png", EXT_ICON)]:
+    files = list(EXT_FILES.items()) + [("icon.png", EXT_ICON), ("pair.json", json.dumps({"key": bridge_key().hex()}))]
+    for name, data in files:
         f = EXT_DIR / name
         raw = data.encode("utf-8") if isinstance(data, str) else data
         try:
@@ -3116,6 +3283,7 @@ class LoginBridge:
     def __init__(self, want, on_event):
         self.want, self.on_event = want, on_event
         self.seen = 0.0                 # last time the extension asked
+        self.old_ext = 0.0              # last time an extension of 2.9.2 (without the key) asked
         self.port = None
         self.httpd = None
         self.lock = threading.Lock()
@@ -3137,28 +3305,45 @@ class LoginBridge:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def _ours(self):
-                # the extension sends its own header (web pages can't, without asking first) and, if any,
-                # its own origin
+            def _ours(self, ver="2"):
+                # only straight to 127.0.0.1 (no web page pretending to be this PC), with the extension's own
+                # header (web pages can't send it without asking first) and, if any, its own origin
+                host = (self.headers.get("Host") or "").lower()
                 origin = self.headers.get("Origin")
-                return self.headers.get("X-Ytd") == "1" and origin in (None, "", EXT_ORIGIN)
+                return (host in (f"127.0.0.1:{bridge.port}", f"localhost:{bridge.port}")
+                        and self.headers.get("X-Ytd") == ver and origin in (None, "", EXT_ORIGIN))
 
             def do_GET(self):
-                if self.path.split("?")[0] != "/ytd/state" or not self._ours():
+                from urllib.parse import parse_qs, urlsplit
+                u = urlsplit(self.path)
+                if u.path != "/ytd/state":
+                    return self._reply(404, {})
+                if self._ours("1"):                 # the extension of 2.9.2: has to be reloaded in Chrome
+                    bridge.old_ext = time.time()
+                    return self._reply(200, {"app": "ytd", "want": False})
+                nonce = (parse_qs(u.query).get("n") or [""])[0]
+                if not self._ours() or not re.fullmatch(r"[0-9a-f]{16,64}", nonce):
                     return self._reply(404, {})
                 bridge.seen = time.time()
-                self._reply(200, {"app": "ytd", "want": bool(bridge.want())})
+                want = bool(bridge.want())
+                self._reply(200, {"app": "ytd", "want": want, "proof": bridge_mac(f"state|{nonce}|{int(want)}")})
 
             def do_POST(self):
+                import hmac
                 if self.path.split("?")[0] != "/ytd/cookies" or not self._ours():
                     return self._reply(403, {})
                 n = int(self.headers.get("Content-Length") or 0)
                 if n <= 0 or n > 512 * 1024:
                     return self._reply(413, {})
+                raw = self.rfile.read(n).decode("utf-8", "replace")
+                if not hmac.compare_digest(self.headers.get("X-Ytd-Mac") or "", bridge_mac("cookies|" + raw)):
+                    return self._reply(403, {})     # not from the extension with this PC's key
                 try:
-                    data = json.loads(self.rfile.read(n).decode("utf-8"))
+                    data = json.loads(raw)
                 except ValueError:
                     return self._reply(400, {})
+                if abs(time.time() * 1000 - float(data.get("ts") or 0)) > 10 * 60 * 1000:
+                    return self._reply(403, {})     # an old message played again
                 bridge.seen = time.time()
                 self._reply(200, bridge.take(data.get("cookies")))
 
@@ -3194,8 +3379,125 @@ class LoginBridge:
         return {"ok": True, "changed": True}
 
     def close(self):
-        if self.httpd is not None:
-            threading.Thread(target=self.httpd.shutdown, daemon=True).start()
+        h, self.httpd = self.httpd, None
+        if h is not None:
+            def stop():
+                h.shutdown()
+                h.server_close()
+            threading.Thread(target=stop, daemon=True).start()
+
+
+# ---- sign-in without the extension: an own browser window
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        return so.getsockname()[1]
+
+
+class BrowserSignIn:
+    """Opens the default browser with its own profile (your normal browser stays untouched) on the YouTube
+    sign-in page. As soon as YouTube shows you as signed in, the login is saved for yt-dlp and the window closes.
+    Chrome, Edge, Brave, Opera, Vivaldi: read through the browser's local debug connection (only while the
+    window is open). Firefox: read from its profile."""
+
+    def __init__(self, browser):
+        self.b = browser
+        self.proc = None
+        self.port = None
+        self.profile = SIGNIN_DIR / ("firefox" if browser["kind"] == "firefox" else "chromium")
+        self.seen = False          # the browser answered at least once
+        self.t0 = 0.0
+
+    def start(self):
+        self.profile.mkdir(parents=True, exist_ok=True)
+        if self.b["kind"] == "firefox":
+            cmd = [self.b["exe"], "-profile", str(self.profile), "-no-remote", "-new-instance", LOGIN_URL]
+        else:
+            self.port = _free_port()
+            cmd = [self.b["exe"], f"--user-data-dir={self.profile}", f"--remote-debugging-port={self.port}",
+                   "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
+                   "--new-window", *os.environ.get("YTD_BROWSER_ARGS", "").split(), LOGIN_URL]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.t0 = time.time()
+
+    # chromium: DevTools protocol over a local websocket
+    def _cdp(self, method, params=None, timeout=8.0):
+        from websockets.sync.client import connect
+        info = json.loads(fetch_bytes(f"http://127.0.0.1:{self.port}/json/version", timeout=3).decode("utf-8"))
+        with connect(info["webSocketDebuggerUrl"], open_timeout=timeout, max_size=None,
+                     additional_headers=None) as ws:
+            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+            end = time.time() + timeout
+            while time.time() < end:
+                msg = json.loads(ws.recv(timeout=max(0.5, end - time.time())))
+                if msg.get("id") == 1:
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"].get("message", "DevTools error"))
+                    return msg.get("result") or {}
+        raise TimeoutError(method)
+
+    def _chromium_rows(self):
+        res = self._cdp("Storage.getCookies")
+        return [(c.get("domain", ""), c.get("path", "/"), bool(c.get("secure")),
+                 0 if c.get("session") or (c.get("expires") or -1) < 0 else int(c["expires"]),
+                 c.get("name", ""), c.get("value", ""), bool(c.get("httpOnly"))) for c in res.get("cookies", [])]
+
+    def _firefox_rows(self):
+        import sqlite3
+        import tempfile
+        db = self.profile / "cookies.sqlite"
+        if not db.exists():
+            return []
+        with tempfile.TemporaryDirectory(prefix="ytd_ff_") as td:
+            for suf in ("", "-wal", "-shm"):
+                f = Path(str(db) + suf)
+                if f.exists():
+                    try:
+                        shutil.copyfile(f, Path(td) / ("cookies.sqlite" + suf))
+                    except OSError:
+                        pass
+            con = sqlite3.connect(str(Path(td) / "cookies.sqlite"))
+            try:
+                rows = con.execute("SELECT host, path, isSecure, expiry, name, value, isHttpOnly FROM moz_cookies "
+                                   "WHERE host LIKE '%youtube.com'").fetchall()
+            finally:
+                con.close()
+        return [(h, p, bool(sec), int(exp // 1000 if exp > 10 ** 11 else exp), n, v, bool(ho))
+                for h, p, sec, exp, n, v, ho in rows]
+
+    def poll(self) -> str:
+        """-> 'waiting' | 'done' | 'closed'"""
+        running = self.proc is not None and self.proc.poll() is None
+        try:
+            rows = self._firefox_rows() if self.b["kind"] == "firefox" else self._chromium_rows()
+            self.seen = True
+            self.misses = 0
+        except Exception:  # noqa: BLE001 - not reachable (yet / any more)
+            rows = None
+            self.misses = getattr(self, "misses", 0) + 1
+        if rows and _has_login(rows):
+            write_cookie_file(rows)
+            self.close()
+            return "done"
+        if self.b["kind"] == "firefox":
+            return "waiting" if running else "closed"
+        if rows is None and ((self.seen and self.misses >= 3) or (not self.seen and time.time() - self.t0 > 45)):
+            return "closed"      # window closed (or the browser never opened)
+        return "waiting"
+
+    def close(self):
+        if self.b["kind"] != "firefox" and self.port:
+            try:
+                self._cdp("Browser.close", timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
 
 def login_hint(msg) -> str:
@@ -3203,7 +3505,7 @@ def login_hint(msg) -> str:
     if not re.search(r"log ?in|sign in|cookies|members[- ]only|age[- ]restricted|confirm your age|inappropriate",
                      msg or "", re.I):
         return ""
-    if YDL_EXTRA.get("cookiefile"):
+    if logged_in():
         return "\nTip: your YouTube login may have expired – Settings → YouTube login → Sign in again."
     return "\nTip: this video needs a YouTube login – Settings → YouTube login → Sign in."
 
@@ -5369,8 +5671,9 @@ class ExtSetupDialog(QtWidgets.QDialog):
         t = label(f"Add the sign-in extension to {name} – once", "h1")
         lay.addWidget(t)
         intro = label(f"With it, “Sign in” opens a normal tab in your {name} with your Google accounts. The extension "
-                      "hands only the YouTube login to this app on this PC – nowhere else – and keeps it up to date.",
-                      "muted")
+                      "hands only the YouTube login to this app on this PC – nowhere else – and keeps it up to date. "
+                      "Tip: a second Google account is the safest choice – YouTube can limit accounts that are used "
+                      "with download tools.", "muted")
         intro.setWordWrap(True)
         lay.addWidget(intro)
         page = extensions_page(b)
@@ -5438,6 +5741,10 @@ class ExtSetupDialog(QtWidgets.QDialog):
         self.state.setText("Path copied – paste it into the folder field of “Load unpacked”.")
 
     def _check(self):
+        if self.main._ext_outdated() and not self.main._ext_connected(20):
+            self.state.setText("The extension is already there but got an update: on the extensions page click ↻ "
+                               "(reload) at “YouTube Downloader – Login”.")
+            set_state(self.state, "")
         if self.main.login_bridge.seen >= self._t0 - 1 or self.main._ext_connected(20):
             self.timer.stop()
             signed = not self.main._pending_signin
@@ -5607,10 +5914,23 @@ class SettingsDialog(QtWidgets.QDialog):
         self.btn_cookies.setObjectName("ghost")
         self.btn_cookies.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_cookies.clicked.connect(self._load_cookies)
+        self.btn_login2 = QtWidgets.QPushButton("Without extension …")
+        self.btn_login2.setObjectName("ghost")
+        self.btn_login2.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_login2.clicked.connect(lambda: (self.main._sign_in_window(), self.show_login_state()))
         lr.addWidget(self.btn_login)
-        lr.addWidget(self.btn_cookies)
+        lr.addWidget(self.btn_login2)
         lr.addStretch(1)
         right.addLayout(lr)
+        lr2 = QtWidgets.QHBoxLayout()
+        lr2.setContentsMargins(0, 0, 0, 0)
+        lr2.addWidget(self.btn_cookies)
+        lr2.addStretch(1)
+        right.addLayout(lr2)
+        self.lbl_login_tip = label("Tip: a second Google account is the safest choice – YouTube can limit accounts "
+                                   "that are used with download tools.", "hint")
+        self.lbl_login_tip.setWordWrap(True)
+        right.addWidget(self.lbl_login_tip)
         right.addStretch(1)
         self.show_login_state()
         self.refresh_dirs()
@@ -5631,11 +5951,27 @@ class SettingsDialog(QtWidgets.QDialog):
         self._sync()
 
     def show_login_state(self):
+        self._show_login_state()
+        QtCore.QTimer.singleShot(0, self._fit)
+
+    def _show_login_state(self):
         st = login_state()
         pending = bool(self.main._pending_signin)
+        si = self.main._signin
         b = self.main._login_browser()
         bname = b["name"] if b else "Chrome"
-        self.btn_cookies.setEnabled(not pending)
+        self.btn_cookies.setEnabled(not pending and si is None)
+        self.btn_login2.setVisible(not st["signed_in"] and not pending and si is None)
+        self.btn_cookies.setVisible(not st["signed_in"] or pending or si is not None)
+        self.lbl_login_tip.setVisible(not st["signed_in"])
+        if si is not None:
+            self.acc_card.set_account({})
+            self.lbl_login.setText(f"Sign in to YouTube in the {si.b['name']} window that opened. As soon as YouTube "
+                                   "shows you as signed in, the app takes the login and closes that window.")
+            self.btn_login.setText("Cancel sign-in")
+            self.btn_login.setEnabled(True)
+            tip(self.btn_login, "Cancel sign-in", f"Closes the {si.b['name']} sign-in window.")
+            return
         if pending:
             self.acc_card.set_account({})
             self.lbl_login.setText(f"Sign in to YouTube in the {bname} tab that opened, or pick your account there. "
@@ -5650,8 +5986,13 @@ class SettingsDialog(QtWidgets.QDialog):
             who = "" if self.main.account.get("name") else " to YouTube"
             since = f" since {when}" if when else ""
             if self.main.cfg.get("login_via") == "chrome":
-                keep = "keeps the login up to date" if self.main._ext_connected(600) else \
-                    "keeps the login up to date while it is open"
+                if self.main._ext_outdated():
+                    keep = ("– the extension got an update: click ↻ (reload) at “YouTube Downloader – Login” on "
+                            f"{extensions_page(b)} or restart {bname}")
+                elif self.main._ext_connected(600):
+                    keep = "keeps the login up to date"
+                else:
+                    keep = "keeps the login up to date while it is open"
                 self.lbl_login.setText(f"✓ Signed in{who}{since} – used for every download. {bname} {keep}.")
             else:
                 self.lbl_login.setText(f"✓ Signed in{who}{since}. Used for every download – needed for "
@@ -5664,14 +6005,28 @@ class SettingsDialog(QtWidgets.QDialog):
                                    "your login stays on this PC.")
             self.btn_login.setText(f"Sign in with {bname} …")
             self.btn_login.setEnabled(b is not None)
+            wb = self.main._window_browser()
+            self.btn_login2.setEnabled(wb is not None)
+            tip(self.btn_login2, "Sign in without the extension",
+                f"Opens {wb['name'] if wb else 'your browser'} in an own, empty window – sign in there with "
+                "e-mail and password. Nothing to install, but your accounts aren't there and the login isn't kept up "
+                "to date: when it expires, sign in again. The window and its data are deleted right after the "
+                "sign-in.")
             tip(self.btn_login, "Sign in", f"Opens a new tab in your {bname} with Google's account choice – your "
                                            "accounts are there as usual. The app's small extension hands the YouTube "
                                            "login to the app (only YouTube, only to this PC). The first time it shows "
                                            "you how to add the extension. Note: YouTube can limit accounts that are "
                                            "used with download tools – a second account is the safe choice.")
 
+    def _fit(self):
+        if self.isVisible():
+            self.layout().activate()
+            need = self.sizeHint().height()
+            if need > self.height():
+                self.resize(self.width(), need)
+
     def _login_clicked(self):
-        if self.main._pending_signin:
+        if self.main._pending_signin or self.main._signin is not None:
             self.main._cancel_sign_in()
         elif login_state()["signed_in"]:
             self.main._sign_out()
@@ -5841,6 +6196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lines_dlg = None
         self._login_noted = False
         self._pending_signin = 0.0          # time "Sign in" was clicked (0 = not waiting for the Chrome login)
+        self._signin = None                  # sign-in without the extension (own browser window) while it runs
         self._resetting = False
         self._out_vol = None
         apply_login()
@@ -7172,10 +7528,14 @@ class MainWindow(QtWidgets.QMainWindow):
         from it."""
         if self._pending_signin and time.time() - self._pending_signin < 15 * 60:
             return True
-        return self.cfg.get("login_via") == "chrome" and COOKIE_FILE.exists()
+        return self.cfg.get("login_via") == "chrome" and logged_in()
 
     def _ext_connected(self, within=90) -> bool:
         return time.time() - self.login_bridge.seen < within
+
+    def _ext_outdated(self) -> bool:
+        """An extension from 2.9.2 asks (without the key) and the new one doesn't: Chrome has to reload it."""
+        return time.time() - self.login_bridge.old_ext < 120 and not self._ext_connected(120)
 
     def _login_browser(self):
         """The Chrome-like browser for the sign-in: the default one if it is one, else an installed one."""
@@ -7246,7 +7606,87 @@ class MainWindow(QtWidgets.QMainWindow):
             if dlg is not None:
                 dlg.show_login_state()
 
+    def _sign_in_window(self):
+        """Sign-in without the extension: the default browser in an own, empty profile; the login is picked up by
+        itself, then the window and its profile are deleted."""
+        if self._signin is not None or self._pending_signin:
+            return
+        b = self._window_browser()
+        if not b:
+            return self._on_error("No default browser found that the app can use (Chrome, Edge, Brave, Opera, "
+                                  "Vivaldi or Firefox). Use Settings → YouTube login → Load cookies.txt instead.")
+        si = BrowserSignIn(b)
+        try:
+            si.start()
+        except OSError as ex:
+            return self._on_error(f"Could not open {b['name']}: {ex}")
+        self._signin = si
+        self._on_log(f"Sign-in: opened {b['name']} with its own profile – waiting for the YouTube login …")
+        self._on_status(f"Sign in to YouTube in the {b['name']} window that just opened – it closes by itself.")
+        set_state(self.status, "")
+        self._login_state_changed()
+
+        def work():
+            end = time.time() + 15 * 60
+            state = "waiting"
+            while state == "waiting" and time.time() < end and self._signin is si:
+                time.sleep(1.5)
+                try:
+                    state = si.poll()
+                except Exception as ex:  # noqa: BLE001
+                    state = "error:" + clean_error(ex)
+            if self._signin is not si:
+                return                      # cancelled
+            if state == "waiting":
+                si.close()
+                state = "timeout"
+            self.emit("signin", state)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_signin(self, state):
+        si, self._signin = self._signin, None
+        self._drop_signin_profile()             # the window's own profile (a whole Google login) is not kept
+        name = si.b["name"] if si else "the browser"
+        if state == "done" and apply_login():
+            LOGIN_NOTE.clear()
+            self._login_noted = False
+            self.cfg["login_via"] = "window"
+            self._on_log(f"✓ Signed in to YouTube (via {name}) – the login is used for every download.")
+            self._refresh_account(force=True)
+            self._on_status("✓  Signed in to YouTube.")
+            set_state(self.status, "ok")
+            self.raise_()
+            self.activateWindow()
+        elif state == "closed":
+            self._on_status(f"The {name} window was closed before YouTube showed you as signed in – not signed in.")
+        elif state == "timeout":
+            self._on_status("Sign-in took too long – try again.")
+        else:
+            self._on_error(f"Sign-in with {name} didn't work: {state.split(':', 1)[-1]}\n"
+                           "You can use Settings → YouTube login → Load cookies.txt instead.")
+        self._login_state_changed()
+
+    def _window_browser(self):
+        if not hasattr(self, "_default_browser"):
+            self._default_browser = default_browser()
+        return self._default_browser
+
+    def _drop_signin_profile(self):
+        def work():
+            for _ in range(20):                  # the browser may still hold its files for a moment
+                shutil.rmtree(SIGNIN_DIR, ignore_errors=True)
+                if not SIGNIN_DIR.exists():
+                    return
+                time.sleep(1.0)
+        threading.Thread(target=work, daemon=True).start()
+
     def _cancel_sign_in(self):
+        si, self._signin = self._signin, None
+        if si is not None:
+            def close():
+                si.close()
+                self._drop_signin_profile()
+            threading.Thread(target=close, daemon=True).start()
         self._pending_signin = 0.0
         self._on_status("Sign-in cancelled.")
         self._login_state_changed()
@@ -8456,7 +8896,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_log(self, msg):
         self.log.appendPlainText(str(msg).rstrip())
-        if YDL_EXTRA.get("cookiefile") and re.search(r"no longer valid|likely been rotated", str(msg), re.I) \
+        if logged_in() and re.search(r"no longer valid|likely been rotated", str(msg), re.I) \
                 and not getattr(self, "_login_warned", False):
             self._login_warned = True
             self.status.setText("⚠  Your YouTube login has expired – Settings → YouTube login → Sign out, then sign in "
@@ -8992,6 +9432,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._save_settings()
         self.login_bridge.close()
+        si, self._signin = self._signin, None
+        if si is not None and si.proc is not None and si.proc.poll() is None:
+            try:
+                si.proc.kill()           # the sign-in window of an unfinished sign-in
+            except OSError:
+                pass
         for pl in (self.player, self.aplayer):
             if pl is not None:
                 pl.stop()

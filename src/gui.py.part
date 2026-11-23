@@ -2026,8 +2026,9 @@ class ExtSetupDialog(QtWidgets.QDialog):
         t = label(f"Add the sign-in extension to {name} – once", "h1")
         lay.addWidget(t)
         intro = label(f"With it, “Sign in” opens a normal tab in your {name} with your Google accounts. The extension "
-                      "hands only the YouTube login to this app on this PC – nowhere else – and keeps it up to date.",
-                      "muted")
+                      "hands only the YouTube login to this app on this PC – nowhere else – and keeps it up to date. "
+                      "Tip: a second Google account is the safest choice – YouTube can limit accounts that are used "
+                      "with download tools.", "muted")
         intro.setWordWrap(True)
         lay.addWidget(intro)
         page = extensions_page(b)
@@ -2095,6 +2096,10 @@ class ExtSetupDialog(QtWidgets.QDialog):
         self.state.setText("Path copied – paste it into the folder field of “Load unpacked”.")
 
     def _check(self):
+        if self.main._ext_outdated() and not self.main._ext_connected(20):
+            self.state.setText("The extension is already there but got an update: on the extensions page click ↻ "
+                               "(reload) at “YouTube Downloader – Login”.")
+            set_state(self.state, "")
         if self.main.login_bridge.seen >= self._t0 - 1 or self.main._ext_connected(20):
             self.timer.stop()
             signed = not self.main._pending_signin
@@ -2264,10 +2269,23 @@ class SettingsDialog(QtWidgets.QDialog):
         self.btn_cookies.setObjectName("ghost")
         self.btn_cookies.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_cookies.clicked.connect(self._load_cookies)
+        self.btn_login2 = QtWidgets.QPushButton("Without extension …")
+        self.btn_login2.setObjectName("ghost")
+        self.btn_login2.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_login2.clicked.connect(lambda: (self.main._sign_in_window(), self.show_login_state()))
         lr.addWidget(self.btn_login)
-        lr.addWidget(self.btn_cookies)
+        lr.addWidget(self.btn_login2)
         lr.addStretch(1)
         right.addLayout(lr)
+        lr2 = QtWidgets.QHBoxLayout()
+        lr2.setContentsMargins(0, 0, 0, 0)
+        lr2.addWidget(self.btn_cookies)
+        lr2.addStretch(1)
+        right.addLayout(lr2)
+        self.lbl_login_tip = label("Tip: a second Google account is the safest choice – YouTube can limit accounts "
+                                   "that are used with download tools.", "hint")
+        self.lbl_login_tip.setWordWrap(True)
+        right.addWidget(self.lbl_login_tip)
         right.addStretch(1)
         self.show_login_state()
         self.refresh_dirs()
@@ -2288,11 +2306,27 @@ class SettingsDialog(QtWidgets.QDialog):
         self._sync()
 
     def show_login_state(self):
+        self._show_login_state()
+        QtCore.QTimer.singleShot(0, self._fit)
+
+    def _show_login_state(self):
         st = login_state()
         pending = bool(self.main._pending_signin)
+        si = self.main._signin
         b = self.main._login_browser()
         bname = b["name"] if b else "Chrome"
-        self.btn_cookies.setEnabled(not pending)
+        self.btn_cookies.setEnabled(not pending and si is None)
+        self.btn_login2.setVisible(not st["signed_in"] and not pending and si is None)
+        self.btn_cookies.setVisible(not st["signed_in"] or pending or si is not None)
+        self.lbl_login_tip.setVisible(not st["signed_in"])
+        if si is not None:
+            self.acc_card.set_account({})
+            self.lbl_login.setText(f"Sign in to YouTube in the {si.b['name']} window that opened. As soon as YouTube "
+                                   "shows you as signed in, the app takes the login and closes that window.")
+            self.btn_login.setText("Cancel sign-in")
+            self.btn_login.setEnabled(True)
+            tip(self.btn_login, "Cancel sign-in", f"Closes the {si.b['name']} sign-in window.")
+            return
         if pending:
             self.acc_card.set_account({})
             self.lbl_login.setText(f"Sign in to YouTube in the {bname} tab that opened, or pick your account there. "
@@ -2307,8 +2341,13 @@ class SettingsDialog(QtWidgets.QDialog):
             who = "" if self.main.account.get("name") else " to YouTube"
             since = f" since {when}" if when else ""
             if self.main.cfg.get("login_via") == "chrome":
-                keep = "keeps the login up to date" if self.main._ext_connected(600) else \
-                    "keeps the login up to date while it is open"
+                if self.main._ext_outdated():
+                    keep = ("– the extension got an update: click ↻ (reload) at “YouTube Downloader – Login” on "
+                            f"{extensions_page(b)} or restart {bname}")
+                elif self.main._ext_connected(600):
+                    keep = "keeps the login up to date"
+                else:
+                    keep = "keeps the login up to date while it is open"
                 self.lbl_login.setText(f"✓ Signed in{who}{since} – used for every download. {bname} {keep}.")
             else:
                 self.lbl_login.setText(f"✓ Signed in{who}{since}. Used for every download – needed for "
@@ -2321,14 +2360,28 @@ class SettingsDialog(QtWidgets.QDialog):
                                    "your login stays on this PC.")
             self.btn_login.setText(f"Sign in with {bname} …")
             self.btn_login.setEnabled(b is not None)
+            wb = self.main._window_browser()
+            self.btn_login2.setEnabled(wb is not None)
+            tip(self.btn_login2, "Sign in without the extension",
+                f"Opens {wb['name'] if wb else 'your browser'} in an own, empty window – sign in there with "
+                "e-mail and password. Nothing to install, but your accounts aren't there and the login isn't kept up "
+                "to date: when it expires, sign in again. The window and its data are deleted right after the "
+                "sign-in.")
             tip(self.btn_login, "Sign in", f"Opens a new tab in your {bname} with Google's account choice – your "
                                            "accounts are there as usual. The app's small extension hands the YouTube "
                                            "login to the app (only YouTube, only to this PC). The first time it shows "
                                            "you how to add the extension. Note: YouTube can limit accounts that are "
                                            "used with download tools – a second account is the safe choice.")
 
+    def _fit(self):
+        if self.isVisible():
+            self.layout().activate()
+            need = self.sizeHint().height()
+            if need > self.height():
+                self.resize(self.width(), need)
+
     def _login_clicked(self):
-        if self.main._pending_signin:
+        if self.main._pending_signin or self.main._signin is not None:
             self.main._cancel_sign_in()
         elif login_state()["signed_in"]:
             self.main._sign_out()
@@ -2498,6 +2551,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lines_dlg = None
         self._login_noted = False
         self._pending_signin = 0.0          # time "Sign in" was clicked (0 = not waiting for the Chrome login)
+        self._signin = None                  # sign-in without the extension (own browser window) while it runs
         self._resetting = False
         self._out_vol = None
         apply_login()
@@ -3829,10 +3883,14 @@ class MainWindow(QtWidgets.QMainWindow):
         from it."""
         if self._pending_signin and time.time() - self._pending_signin < 15 * 60:
             return True
-        return self.cfg.get("login_via") == "chrome" and COOKIE_FILE.exists()
+        return self.cfg.get("login_via") == "chrome" and logged_in()
 
     def _ext_connected(self, within=90) -> bool:
         return time.time() - self.login_bridge.seen < within
+
+    def _ext_outdated(self) -> bool:
+        """An extension from 2.9.2 asks (without the key) and the new one doesn't: Chrome has to reload it."""
+        return time.time() - self.login_bridge.old_ext < 120 and not self._ext_connected(120)
 
     def _login_browser(self):
         """The Chrome-like browser for the sign-in: the default one if it is one, else an installed one."""
@@ -3903,7 +3961,87 @@ class MainWindow(QtWidgets.QMainWindow):
             if dlg is not None:
                 dlg.show_login_state()
 
+    def _sign_in_window(self):
+        """Sign-in without the extension: the default browser in an own, empty profile; the login is picked up by
+        itself, then the window and its profile are deleted."""
+        if self._signin is not None or self._pending_signin:
+            return
+        b = self._window_browser()
+        if not b:
+            return self._on_error("No default browser found that the app can use (Chrome, Edge, Brave, Opera, "
+                                  "Vivaldi or Firefox). Use Settings → YouTube login → Load cookies.txt instead.")
+        si = BrowserSignIn(b)
+        try:
+            si.start()
+        except OSError as ex:
+            return self._on_error(f"Could not open {b['name']}: {ex}")
+        self._signin = si
+        self._on_log(f"Sign-in: opened {b['name']} with its own profile – waiting for the YouTube login …")
+        self._on_status(f"Sign in to YouTube in the {b['name']} window that just opened – it closes by itself.")
+        set_state(self.status, "")
+        self._login_state_changed()
+
+        def work():
+            end = time.time() + 15 * 60
+            state = "waiting"
+            while state == "waiting" and time.time() < end and self._signin is si:
+                time.sleep(1.5)
+                try:
+                    state = si.poll()
+                except Exception as ex:  # noqa: BLE001
+                    state = "error:" + clean_error(ex)
+            if self._signin is not si:
+                return                      # cancelled
+            if state == "waiting":
+                si.close()
+                state = "timeout"
+            self.emit("signin", state)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_signin(self, state):
+        si, self._signin = self._signin, None
+        self._drop_signin_profile()             # the window's own profile (a whole Google login) is not kept
+        name = si.b["name"] if si else "the browser"
+        if state == "done" and apply_login():
+            LOGIN_NOTE.clear()
+            self._login_noted = False
+            self.cfg["login_via"] = "window"
+            self._on_log(f"✓ Signed in to YouTube (via {name}) – the login is used for every download.")
+            self._refresh_account(force=True)
+            self._on_status("✓  Signed in to YouTube.")
+            set_state(self.status, "ok")
+            self.raise_()
+            self.activateWindow()
+        elif state == "closed":
+            self._on_status(f"The {name} window was closed before YouTube showed you as signed in – not signed in.")
+        elif state == "timeout":
+            self._on_status("Sign-in took too long – try again.")
+        else:
+            self._on_error(f"Sign-in with {name} didn't work: {state.split(':', 1)[-1]}\n"
+                           "You can use Settings → YouTube login → Load cookies.txt instead.")
+        self._login_state_changed()
+
+    def _window_browser(self):
+        if not hasattr(self, "_default_browser"):
+            self._default_browser = default_browser()
+        return self._default_browser
+
+    def _drop_signin_profile(self):
+        def work():
+            for _ in range(20):                  # the browser may still hold its files for a moment
+                shutil.rmtree(SIGNIN_DIR, ignore_errors=True)
+                if not SIGNIN_DIR.exists():
+                    return
+                time.sleep(1.0)
+        threading.Thread(target=work, daemon=True).start()
+
     def _cancel_sign_in(self):
+        si, self._signin = self._signin, None
+        if si is not None:
+            def close():
+                si.close()
+                self._drop_signin_profile()
+            threading.Thread(target=close, daemon=True).start()
         self._pending_signin = 0.0
         self._on_status("Sign-in cancelled.")
         self._login_state_changed()
@@ -5113,7 +5251,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_log(self, msg):
         self.log.appendPlainText(str(msg).rstrip())
-        if YDL_EXTRA.get("cookiefile") and re.search(r"no longer valid|likely been rotated", str(msg), re.I) \
+        if logged_in() and re.search(r"no longer valid|likely been rotated", str(msg), re.I) \
                 and not getattr(self, "_login_warned", False):
             self._login_warned = True
             self.status.setText("⚠  Your YouTube login has expired – Settings → YouTube login → Sign out, then sign in "
@@ -5649,6 +5787,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._save_settings()
         self.login_bridge.close()
+        si, self._signin = self._signin, None
+        if si is not None and si.proc is not None and si.proc.poll() is None:
+            try:
+                si.proc.kill()           # the sign-in window of an unfinished sign-in
+            except OSError:
+                pass
         for pl in (self.player, self.aplayer):
             if pl is not None:
                 pl.stop()

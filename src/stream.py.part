@@ -16,15 +16,13 @@ def _net_ydl():
         from yt_dlp import YoutubeDL
     except ImportError:
         return None
-    key = repr(sorted((k, str(v)) for k, v in YDL_EXTRA.items()))
-    try:
-        key += f"|{os.path.getmtime(YDL_EXTRA['cookiefile'])}" if YDL_EXTRA.get("cookiefile") else ""
-    except OSError:
-        pass
+    key = repr(sorted((k, str(v)) for k, v in YDL_EXTRA.items())) + f"|{_LOGIN['ver']}"   # new login -> new instance
     with _NET_LOCK:
         if _NET["ydl"] is None or _NET["key"] != key:
             # the old one is just dropped: closing it would write its cookies back (e.g. after signing out)
-            _NET["ydl"] = YoutubeDL({"quiet": True, "no_warnings": True, "logger": _Silent(), **YDL_EXTRA})
+            _NET["ydl"] = YoutubeDL({"quiet": True, "no_warnings": True, "logger": _Silent(),
+                                     **{k: v for k, v in YDL_EXTRA.items() if k != "login"}})
+            add_login(_NET["ydl"])
             _NET["key"] = key
         return _NET["ydl"]
 
