@@ -8,6 +8,7 @@ Requires: Python 3.10+, yt-dlp[default], PySide6, FFmpeg, Deno  ->  installed by
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -19,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.9.2"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -156,9 +157,10 @@ FONTS_DIR = APP_DIR / "fonts"
 SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
              "bold": True, "pos": None}
 COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies), taken from the sign-in in your browser
-SIGNIN_DIR = APP_DIR / "signin"                 # own browser profile for the sign-in (your normal one stays untouched)
-LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&hl=en"
-             "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3D%252F")
+SIGNIN_DIR = APP_DIR / "signin"                 # old own browser profile (up to 2.9.1) – removed once
+LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true"
+             "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop"
+             "%26next%3Dhttps%253A%252F%252Fwww.youtube.com%252F")
 HISTORY_MAX = 500
 # where the history (links + small pictures) and the small preview copies are kept – changeable in Settings
 DEFAULT_PATHS = {"history": APP_DIR / "history", "preview": APP_DIR / "preview"}
@@ -2967,120 +2969,233 @@ def default_browser() -> dict | None:
     return None
 
 
-def _free_port() -> int:
-    import socket
-    with socket.socket() as so:
-        so.bind(("127.0.0.1", 0))
-        return so.getsockname()[1]
-
-
 def _has_login(rows) -> bool:
     names = {r[4] for r in rows if "youtube.com" in r[0]}
     return "LOGIN_INFO" in names and bool(names & {"SAPISID", "__Secure-3PAPISID", "SID", "__Secure-1PSID"})
 
 
-class BrowserSignIn:
-    """Opens the default browser with its own profile (your normal browser stays untouched) on the YouTube
-    sign-in page. As soon as YouTube shows you as signed in, the login is saved for yt-dlp and the window closes.
-    Chrome, Edge, Brave, Opera, Vivaldi: read through the browser's local debug connection (only while the
-    window is open). Firefox: read from its profile."""
+def chromium_browsers() -> list:
+    """Installed Chrome-like browsers (the sign-in extension runs in these) -> [{'name', 'kind', 'exe'}]."""
+    out, seen = [], set()
 
-    def __init__(self, browser):
-        self.b = browser
-        self.proc = None
+    def add(b):
+        if b and b["kind"] == "chromium" and Path(b["exe"]).exists() and b["exe"].lower() not in seen:
+            seen.add(b["exe"].lower())
+            out.append(b)
+    add(default_browser())
+    if WIN:
+        import winreg
+        for exe in ("chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.exe"):
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
+                        add(_browser_from_exe(winreg.QueryValueEx(k, "")[0]))
+                except OSError:
+                    continue
+    else:
+        for name in ("google-chrome", "chromium", "microsoft-edge", "brave-browser"):
+            exe = shutil.which(name)
+            if exe:
+                b = _browser_from_exe(name)
+                add(b and {**b, "exe": exe})
+    return out
+
+
+def open_in_browser(b, url) -> bool:
+    """Opens url as a new tab in the browser that is already running (or starts it)."""
+    try:
+        subprocess.Popen([b["exe"], url], creationflags=NO_WINDOW, close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, KeyError, TypeError):
+        return False
+
+
+# ---- the sign-in extension: a small helper in your own Chrome hands the YouTube login to this app
+
+EXT_DIR = APP_DIR / "chrome-extension"
+EXT_ID = "mdhangbfgllnapcnookjceagljebgnmb"            # fixed by the key in the manifest
+EXT_ORIGIN = f"chrome-extension://{EXT_ID}"
+BRIDGE_PORTS = (47815, 47816, 47817)
+EXT_FILES = {
+    "manifest.json": json.dumps({
+        "manifest_version": 3,
+        "name": "YouTube Downloader – Login",
+        "version": "1.0",
+        "description": "Hands your YouTube login to the YouTube Downloader app on this PC – only when the app asks for "
+                       "it, only to this PC (127.0.0.1), nowhere else.",
+        "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5ohi/zflHEKTNyvDtx+8B2tqrNr8f90JSz+9+6+H0sn2FGedFlrpwQUQdQoNDILkByHmB7DMP+dSQvxw0/yWfnXVSJ4u7hGnBqJP60AKITFHdFpdQwssM6o/ZZSJGIrfNGs2/VgfhxY2gWrzyp8ZkAa6VLQM37p67MwN9i9k3HYp5upfIeqTVAINGvvkcyKZgfNJc2O1in9z1H3swrsgle6Gq0y9Gqp7cStyAp3VEhWn3T1zvO4T3jaY9dYGUXKlMkUvKbHdtgQqW1h4Rk5j9Dnbe+9iedEzWl437Q3i2dv+bIhOXK+T4IfSPMkyM7ESK8fRFjWFNvTbvpHHGz7PcwIDAQAB",
+        "permissions": ["cookies", "alarms"],
+        "host_permissions": ["https://*.youtube.com/*", "http://127.0.0.1/*"],
+        "background": {"service_worker": "background.js"},
+        "icons": {"16": "icon.png", "48": "icon.png", "128": "icon.png"},
+    }, indent=2),
+    "background.js": """// YouTube Downloader – Login helper.
+// Asks the YouTube Downloader app on this PC (127.0.0.1) whether it wants the YouTube login. Only if it does
+// (after "Sign in" in the app), the youtube.com cookies go to the app – to nothing else, nowhere else.
+const PORTS = [%PORTS%];
+let debounce = null;
+
+async function state(port) {
+  const r = await fetch(`http://127.0.0.1:${port}/ytd/state`, {cache: "no-store", headers: {"X-Ytd": "1"}});
+  if (!r.ok) return null;
+  const j = await r.json();
+  return j && j.app === "ytd" ? j : null;
+}
+
+async function sync(reason) {
+  for (const port of PORTS) {
+    let st = null;
+    try { st = await state(port); } catch (e) { continue; }
+    if (!st) continue;
+    if (!st.want) return;
+    const all = await chrome.cookies.getAll({domain: "youtube.com"});
+    const cookies = all.map(c => ({domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly,
+                                   session: c.session, expires: c.expirationDate || 0, name: c.name, value: c.value}));
+    try {
+      await fetch(`http://127.0.0.1:${port}/ytd/cookies`, {method: "POST", cache: "no-store",
+        headers: {"Content-Type": "application/json", "X-Ytd": "1"}, body: JSON.stringify({reason, cookies})});
+    } catch (e) {}
+    return;
+  }
+}
+
+function every30s() {
+  chrome.alarms.get("ytd-sync", a => { if (!a) chrome.alarms.create("ytd-sync", {periodInMinutes: 0.5}); });
+}
+
+chrome.cookies.onChanged.addListener(info => {
+  if (!(info.cookie.domain || "").endsWith("youtube.com")) return;
+  clearTimeout(debounce);
+  debounce = setTimeout(() => sync("change"), 1500);
+});
+chrome.alarms.onAlarm.addListener(a => { if (a.name === "ytd-sync") sync("tick"); });
+chrome.runtime.onInstalled.addListener(() => { every30s(); sync("installed"); });
+chrome.runtime.onStartup.addListener(() => { every30s(); sync("startup"); });
+every30s();
+""".replace("%PORTS%", ", ".join(str(x) for x in BRIDGE_PORTS)),
+}
+EXT_ICON = base64.b64decode("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")
+
+
+def write_extension() -> Path:
+    """Puts the extension's files into EXT_DIR (only what changed – Chrome loads it from there)."""
+    EXT_DIR.mkdir(parents=True, exist_ok=True)
+    for name, data in list(EXT_FILES.items()) + [("icon.png", EXT_ICON)]:
+        f = EXT_DIR / name
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        try:
+            if f.read_bytes() == raw:
+                continue
+        except OSError:
+            pass
+        f.write_bytes(raw)
+    return EXT_DIR
+
+
+def extensions_page(b) -> str:
+    return {"Edge": "edge://extensions/", "Brave": "brave://extensions/", "Opera": "opera://extensions",
+            "Vivaldi": "vivaldi://extensions/"}.get((b or {}).get("name"), "chrome://extensions/")
+
+
+def cookie_rows(cookies) -> list:
+    """The extension's cookie list -> rows for write_cookie_file (YouTube only)."""
+    rows = []
+    for c in cookies if isinstance(cookies, list) else []:
+        if not isinstance(c, dict) or "youtube.com" not in str(c.get("domain", "")) or not c.get("name"):
+            continue
+        exp = 0 if c.get("session") else int(float(c.get("expires") or 0))
+        rows.append((str(c["domain"]), str(c.get("path") or "/"), bool(c.get("secure")), exp, str(c["name"]),
+                     str(c.get("value", "")), bool(c.get("httpOnly"))))
+    return rows
+
+
+class LoginBridge:
+    """Tiny local server (127.0.0.1 only) the Chrome extension talks to: 'do you want the login?' and the
+    cookies. Accepts cookies only from the extension and only while want() is true."""
+    def __init__(self, want, on_event):
+        self.want, self.on_event = want, on_event
+        self.seen = 0.0                 # last time the extension asked
         self.port = None
-        self.profile = SIGNIN_DIR / ("firefox" if browser["kind"] == "firefox" else "chromium")
-        self.seen = False          # the browser answered at least once
-        self.t0 = 0.0
+        self.httpd = None
+        self.lock = threading.Lock()
 
     def start(self):
-        self.profile.mkdir(parents=True, exist_ok=True)
-        if self.b["kind"] == "firefox":
-            cmd = [self.b["exe"], "-profile", str(self.profile), "-no-remote", "-new-instance", LOGIN_URL]
-        else:
-            self.port = _free_port()
-            cmd = [self.b["exe"], f"--user-data-dir={self.profile}", f"--remote-debugging-port={self.port}",
-                   "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
-                   "--new-window", *os.environ.get("YTD_BROWSER_ARGS", "").split(), LOGIN_URL]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.t0 = time.time()
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        bridge = self
 
-    # chromium: DevTools protocol over a local websocket
-    def _cdp(self, method, params=None, timeout=8.0):
-        from websockets.sync.client import connect
-        info = json.loads(fetch_bytes(f"http://127.0.0.1:{self.port}/json/version", timeout=3).decode("utf-8"))
-        with connect(info["webSocketDebuggerUrl"], open_timeout=timeout, max_size=None,
-                     additional_headers=None) as ws:
-            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
-            end = time.time() + timeout
-            while time.time() < end:
-                msg = json.loads(ws.recv(timeout=max(0.5, end - time.time())))
-                if msg.get("id") == 1:
-                    if "error" in msg:
-                        raise RuntimeError(msg["error"].get("message", "DevTools error"))
-                    return msg.get("result") or {}
-        raise TimeoutError(method)
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
 
-    def _chromium_rows(self):
-        res = self._cdp("Storage.getCookies")
-        return [(c.get("domain", ""), c.get("path", "/"), bool(c.get("secure")),
-                 0 if c.get("session") or (c.get("expires") or -1) < 0 else int(c["expires"]),
-                 c.get("name", ""), c.get("value", ""), bool(c.get("httpOnly"))) for c in res.get("cookies", [])]
+            def _reply(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
 
-    def _firefox_rows(self):
-        import sqlite3
-        import tempfile
-        db = self.profile / "cookies.sqlite"
-        if not db.exists():
-            return []
-        with tempfile.TemporaryDirectory(prefix="ytd_ff_") as td:
-            for suf in ("", "-wal", "-shm"):
-                f = Path(str(db) + suf)
-                if f.exists():
-                    try:
-                        shutil.copyfile(f, Path(td) / ("cookies.sqlite" + suf))
-                    except OSError:
-                        pass
-            con = sqlite3.connect(str(Path(td) / "cookies.sqlite"))
+            def _ours(self):
+                # the extension sends its own header (web pages can't, without asking first) and, if any,
+                # its own origin
+                origin = self.headers.get("Origin")
+                return self.headers.get("X-Ytd") == "1" and origin in (None, "", EXT_ORIGIN)
+
+            def do_GET(self):
+                if self.path.split("?")[0] != "/ytd/state" or not self._ours():
+                    return self._reply(404, {})
+                bridge.seen = time.time()
+                self._reply(200, {"app": "ytd", "want": bool(bridge.want())})
+
+            def do_POST(self):
+                if self.path.split("?")[0] != "/ytd/cookies" or not self._ours():
+                    return self._reply(403, {})
+                n = int(self.headers.get("Content-Length") or 0)
+                if n <= 0 or n > 512 * 1024:
+                    return self._reply(413, {})
+                try:
+                    data = json.loads(self.rfile.read(n).decode("utf-8"))
+                except ValueError:
+                    return self._reply(400, {})
+                bridge.seen = time.time()
+                self._reply(200, bridge.take(data.get("cookies")))
+
+        for port in BRIDGE_PORTS:
             try:
-                rows = con.execute("SELECT host, path, isSecure, expiry, name, value, isHttpOnly FROM moz_cookies "
-                                   "WHERE host LIKE '%youtube.com'").fetchall()
-            finally:
-                con.close()
-        return [(h, p, bool(sec), int(exp // 1000 if exp > 10 ** 11 else exp), n, v, bool(ho))
-                for h, p, sec, exp, n, v, ho in rows]
+                self.httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+                self.port = port
+                break
+            except OSError:
+                continue
+        if self.httpd is not None:
+            self.httpd.daemon_threads = True
+            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        return self.port
 
-    def poll(self) -> str:
-        """-> 'waiting' | 'done' | 'closed'"""
-        running = self.proc is not None and self.proc.poll() is None
-        try:
-            rows = self._firefox_rows() if self.b["kind"] == "firefox" else self._chromium_rows()
-            self.seen = True
-            self.misses = 0
-        except Exception:  # noqa: BLE001 - not reachable (yet / any more)
-            rows = None
-            self.misses = getattr(self, "misses", 0) + 1
-        if rows and _has_login(rows):
+    def take(self, cookies) -> dict:
+        if not self.want():
+            return {"ok": False, "why": "not wanted"}
+        rows = cookie_rows(cookies)
+        if not _has_login(rows):
+            self.on_event(("no_login", None))
+            return {"ok": False, "why": "not signed in to YouTube in this browser"}
+        with self.lock:
+            old = read_cookie_values()
+            new = {r[4]: r[5] for r in rows}
+            if new == old:
+                self.on_event(("same", None))
+                return {"ok": True, "changed": False}
             write_cookie_file(rows)
-            self.close()
-            return "done"
-        if self.b["kind"] == "firefox":
-            return "waiting" if running else "closed"
-        if rows is None and ((self.seen and self.misses >= 3) or (not self.seen and time.time() - self.t0 > 45)):
-            return "closed"      # window closed (or the browser never opened)
-        return "waiting"
+            apply_login()
+            who = lambda v: (v.get("LOGIN_INFO"), v.get("SID") or v.get("__Secure-3PSID"))
+            self.on_event(("login", who(old) != who(new)))      # True: other account (or first time)
+        return {"ok": True, "changed": True}
 
     def close(self):
-        if self.b["kind"] != "firefox" and self.port:
-            try:
-                self._cdp("Browser.close", timeout=3)
-            except Exception:  # noqa: BLE001
-                pass
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.wait(timeout=4)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        if self.httpd is not None:
+            threading.Thread(target=self.httpd.shutdown, daemon=True).start()
 
 
 def login_hint(msg) -> str:
@@ -3311,6 +3426,8 @@ QLabel#h1 {{ font-size: 24px; font-weight: 700; }}
 QLabel#sub {{ color: {c['muted']}; }}
 QLabel#section {{ color: {c['muted']}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
 QLabel#muted, QLabel#field {{ color: {c['muted']}; }}
+QLabel#muted[state="ok"] {{ color: {c['accent']}; font-weight: 600; }}
+QLabel#stepnum {{ background: {c['accent']}; color: {c['on_accent']}; border-radius: 12px; font-weight: 700; }}
 QLabel#hint {{ color: {c['muted']}; font-size: 12px; }}
 QLabel#hint[state="warn"] {{ color: {c['warn']}; }}
 QLabel#hint[state="error"] {{ color: {c['err']}; }}
@@ -5236,6 +5353,99 @@ def _dir_buttons(on_open, on_change, on_default):
     return row, b_def
 
 
+class ExtSetupDialog(QtWidgets.QDialog):
+    """Once per PC: add the app's sign-in extension to Chrome (developer mode -> Load unpacked). Closes by itself
+    as soon as the extension reports in."""
+    def __init__(self, main, b):
+        super().__init__(main)
+        self.main, self.b = main, b
+        self.setWindowTitle("Sign-in extension")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(10)
+        name = b["name"]
+        t = label(f"Add the sign-in extension to {name} – once", "h1")
+        lay.addWidget(t)
+        intro = label(f"With it, “Sign in” opens a normal tab in your {name} with your Google accounts. The extension "
+                      "hands only the YouTube login to this app on this PC – nowhere else – and keeps it up to date.",
+                      "muted")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        page = extensions_page(b)
+
+        def step(n, text, *widgets):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            num = label(str(n), "stepnum")
+            num.setFixedSize(24, 24)
+            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row.addWidget(num, 0, Qt.AlignmentFlag.AlignTop)
+            col = QtWidgets.QVBoxLayout()
+            col.setSpacing(6)
+            lab = label(text)
+            lab.setWordWrap(True)
+            lab.setTextFormat(Qt.TextFormat.RichText)
+            col.addWidget(lab)
+            if widgets:
+                wr = QtWidgets.QHBoxLayout()
+                wr.setSpacing(6)
+                for w in widgets:
+                    wr.addWidget(w)
+                wr.addStretch(1)
+                col.addLayout(wr)
+            row.addLayout(col, 1)
+            lay.addLayout(row)
+
+        b_open = QtWidgets.QPushButton(f"Open {page.rstrip('/')}")
+        b_open.clicked.connect(self._open_page)
+        step(1, f"Open the extensions page of {name} (in the profile you use YouTube with).", b_open)
+        step(2, "Switch on <b>Developer mode</b> (top right on that page).")
+        self.path = QtWidgets.QLineEdit(str(EXT_DIR))
+        self.path.setReadOnly(True)
+        self.path.setMinimumWidth(340)
+        b_copy = QtWidgets.QPushButton("Copy")
+        b_copy.clicked.connect(self._copy)
+        b_folder = QtWidgets.QPushButton("Open folder")
+        b_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(EXT_DIR))))
+        step(3, "Click <b>Load unpacked</b> and pick this folder (paste the path into the folder field):",
+             self.path, b_copy, b_folder)
+        self.state = label("Waiting for the extension …", "muted")
+        lay.addSpacing(4)
+        lay.addWidget(self.state)
+        bot = QtWidgets.QHBoxLayout()
+        bot.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(self.reject)
+        bot.addWidget(cancel)
+        lay.addLayout(bot)
+        self._t0 = time.time()
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(400)
+        self.timer.timeout.connect(self._check)
+        self.timer.start()
+
+    def _open_page(self):
+        page = extensions_page(self.b)
+        if not open_in_browser(self.b, page):
+            QtWidgets.QApplication.clipboard().setText(page)
+            self.state.setText(f"Couldn't open it – “{page}” is copied, paste it into the address bar.")
+
+    def _copy(self):
+        QtWidgets.QApplication.clipboard().setText(str(EXT_DIR))
+        self.state.setText("Path copied – paste it into the folder field of “Load unpacked”.")
+
+    def _check(self):
+        if self.main.login_bridge.seen >= self._t0 - 1 or self.main._ext_connected(20):
+            self.timer.stop()
+            signed = not self.main._pending_signin
+            self.state.setText("✓ Extension added – " + ("signed in." if signed else "opening the YouTube sign-in …"))
+            set_state(self.state, "ok")
+            QtCore.QTimer.singleShot(900, self.accept)
+
+
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent, theme, accent, tips_on, apply, apply_tips, auto_pv=True, apply_pv=None,
                  pv_mode="download", apply_mode=None):
@@ -5422,37 +5632,46 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def show_login_state(self):
         st = login_state()
-        si = self.main._signin
-        self.btn_cookies.setEnabled(si is None)
-        if si is not None:
-            self.lbl_login.setText(f"Sign in to YouTube in the {si.b['name']} window that opened. As soon as YouTube "
-                                   "shows you as signed in, the app takes the login and closes that window.")
+        pending = bool(self.main._pending_signin)
+        b = self.main._login_browser()
+        bname = b["name"] if b else "Chrome"
+        self.btn_cookies.setEnabled(not pending)
+        if pending:
+            self.acc_card.set_account({})
+            self.lbl_login.setText(f"Sign in to YouTube in the {bname} tab that opened, or pick your account there. "
+                                   "As soon as YouTube shows you as signed in, the app takes the login by itself.")
             self.btn_login.setText("Cancel sign-in")
-            tip(self.btn_login, "Cancel sign-in", f"Closes the {si.b['name']} sign-in window.")
+            self.btn_login.setEnabled(True)
+            tip(self.btn_login, "Cancel sign-in", "Stops waiting for the login.")
             return
         self.acc_card.set_account(self.main.account if st["signed_in"] else {})
         if st["signed_in"]:
             when = time.strftime("%d.%m.%Y", time.localtime(st["since"])) if st["since"] else ""
             who = "" if self.main.account.get("name") else " to YouTube"
-            self.lbl_login.setText(f"✓ Signed in{who}{' since ' + when if when else ''}. Used for every "
-                                   "download – needed for age-restricted or members-only videos.")
+            since = f" since {when}" if when else ""
+            if self.main.cfg.get("login_via") == "chrome":
+                keep = "keeps the login up to date" if self.main._ext_connected(600) else \
+                    "keeps the login up to date while it is open"
+                self.lbl_login.setText(f"✓ Signed in{who}{since} – used for every download. {bname} {keep}.")
+            else:
+                self.lbl_login.setText(f"✓ Signed in{who}{since}. Used for every download – needed for "
+                                       "age-restricted or members-only videos.")
             self.btn_login.setText("Sign out")
             self.btn_login.setEnabled(True)
             tip(self.btn_login, "Sign out", "Removes the YouTube login from this app.")
         else:
             self.lbl_login.setText("Not signed in. Only needed for age-restricted or members-only videos – "
                                    "your login stays on this PC.")
-            b = self.main._browser_info()
-            self.btn_login.setText(f"Sign in with {b['name']} …" if b else "Sign in to YouTube …")
+            self.btn_login.setText(f"Sign in with {bname} …")
             self.btn_login.setEnabled(b is not None)
-            tip(self.btn_login, "Sign in", f"Opens {b['name'] if b else 'your default browser'} with its own profile "
-                                           "(your normal browser data stays untouched) on the YouTube sign-in. The app "
-                                           "takes the login by itself and closes the window. Note: YouTube can limit "
-                                           "accounts that are used with download tools – a second account is the "
-                                           "safe choice.")
+            tip(self.btn_login, "Sign in", f"Opens a new tab in your {bname} with Google's account choice – your "
+                                           "accounts are there as usual. The app's small extension hands the YouTube "
+                                           "login to the app (only YouTube, only to this PC). The first time it shows "
+                                           "you how to add the extension. Note: YouTube can limit accounts that are "
+                                           "used with download tools – a second account is the safe choice.")
 
     def _login_clicked(self):
-        if self.main._signin is not None:
+        if self.main._pending_signin:
             self.main._cancel_sign_in()
         elif login_state()["signed_in"]:
             self.main._sign_out()
@@ -5471,6 +5690,8 @@ class SettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "YouTube login", clean_error(ex))
             return
         apply_login()
+        self.main.cfg["login_via"] = "file"
+        self.main._pending_signin = 0.0
         self.main._on_log("✓ YouTube login loaded from a cookies file.")
         self.main._refresh_account(force=True)
         self.show_login_state()
@@ -5619,11 +5840,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sub_req = 0
         self.lines_dlg = None
         self._login_noted = False
-        self._signin = None
+        self._pending_signin = 0.0          # time "Sign in" was clicked (0 = not waiting for the Chrome login)
         self._resetting = False
         self._out_vol = None
         apply_login()
         self.cfg.pop("browser", None)
+        if SIGNIN_DIR.exists():              # the own browser profile of the old sign-in (up to 2.9.1) is not used any more
+            shutil.rmtree(SIGNIN_DIR, ignore_errors=True)
+        try:
+            write_extension()
+        except OSError:
+            pass
+        self.login_bridge = LoginBridge(self._bridge_wants, lambda ev: self.emit("bridge", ev))
+        self.login_bridge.start()
         st = self.cfg.get("sub_style") if isinstance(self.cfg.get("sub_style"), dict) else {}
         self.sub_style = {**SUB_STYLE, **{k: v for k, v in st.items() if k in SUB_STYLE}}
         if self.sub_style.get("pos"):
@@ -6938,74 +7167,89 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.emit("error", clean_error(ex))
         threading.Thread(target=work, daemon=True).start()
 
+    def _bridge_wants(self) -> bool:
+        """The extension may hand over the login: while signing in, and later (to keep it fresh) if the login came
+        from it."""
+        if self._pending_signin and time.time() - self._pending_signin < 15 * 60:
+            return True
+        return self.cfg.get("login_via") == "chrome" and COOKIE_FILE.exists()
+
+    def _ext_connected(self, within=90) -> bool:
+        return time.time() - self.login_bridge.seen < within
+
+    def _login_browser(self):
+        """The Chrome-like browser for the sign-in: the default one if it is one, else an installed one."""
+        bs = chromium_browsers()
+        return bs[0] if bs else None
+
     def _sign_in(self):
-        """Opens the default browser (own profile) on the YouTube sign-in; the login is picked up by itself."""
-        if self._signin is not None:
-            return
-        b = default_browser()
-        if not b:
-            return self._on_error("No default browser found that the app can use (Chrome, Edge, Brave, Opera, "
-                                  "Vivaldi or Firefox). Use Settings → YouTube login → Load cookies.txt instead.")
-        si = BrowserSignIn(b)
-        try:
-            si.start()
-        except OSError as ex:
-            return self._on_error(f"Could not open {b['name']}: {ex}")
-        self._signin = si
-        self._on_log(f"Sign-in: opened {b['name']} with its own profile – waiting for the YouTube login …")
-        self._on_status(f"Sign in to YouTube in the {b['name']} window that just opened – it closes by itself.")
-        set_state(self.status, "")
+        """Sign-in in your own Chrome: a new tab with Google's account choice; the app's extension hands the login
+        over (and keeps it up to date)."""
+        if self.login_bridge.port is None:
+            return self._on_error("The sign-in can't start: the ports 47815–47817 on this PC are taken by another "
+                                  "program. Restart the PC or use Settings → YouTube login → Load cookies.txt.")
+        b = self._login_browser()
+        if b is None:
+            return self._on_error("The sign-in needs Chrome, Edge, Brave, Opera or Vivaldi – none was found. You can "
+                                  "use Settings → YouTube login → Load cookies.txt instead.")
+        self._pending_signin = time.time()
         self._login_state_changed()
+        if self._ext_connected():
+            self._open_login_tab(b)
+            return
+        dlg = ExtSetupDialog(self, b)
+        res = dlg.exec()
+        if res != QtWidgets.QDialog.DialogCode.Accepted:
+            if self._pending_signin:
+                self._cancel_sign_in()
+            return
+        if self._pending_signin:                   # not signed in by the extension's first message already
+            self._open_login_tab(b)
 
-        def work():
-            end = time.time() + 15 * 60
-            state = "waiting"
-            while state == "waiting" and time.time() < end and self._signin is si:
-                time.sleep(1.5)
-                try:
-                    state = si.poll()
-                except Exception as ex:  # noqa: BLE001
-                    state = "error:" + clean_error(ex)
-            if self._signin is not si:
-                return                      # cancelled
-            if state == "waiting":
-                si.close()
-                state = "timeout"
-            self.emit("signin", state)
-        threading.Thread(target=work, daemon=True).start()
+    def _open_login_tab(self, b):
+        if not open_in_browser(b, LOGIN_URL):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(LOGIN_URL))
+        self._on_log(f"Sign-in: opened a tab in {b['name']} – waiting for the YouTube login …")
+        self._on_status(f"Sign in to YouTube in the new {b['name']} tab (or pick your account) – the app takes the "
+                        "login by itself.")
+        set_state(self.status, "")
+        QtCore.QTimer.singleShot(15 * 60 * 1000 + 500, self._signin_timeout)
 
-    def _on_signin(self, state):
-        si, self._signin = self._signin, None
-        name = si.b["name"] if si else "the browser"
-        if state == "done" and apply_login():
+    def _signin_timeout(self):
+        if self._pending_signin and time.time() - self._pending_signin >= 15 * 60:
+            self._pending_signin = 0.0
+            self._on_status("Sign-in took too long – try again.")
+            self._login_state_changed()
+
+    def _on_bridge(self, ev):
+        kind, val = ev
+        if kind == "login":
+            first = bool(self._pending_signin)
+            self._pending_signin = 0.0
+            self.cfg["login_via"] = "chrome"
             LOGIN_NOTE.clear()
             self._login_noted = False
-            self._on_log(f"✓ Signed in to YouTube (via {name}) – the login is used for every download.")
-            self._refresh_account(force=True)
-            self._on_status("✓  Signed in to YouTube.")
-            set_state(self.status, "ok")
-            self.raise_()
-            self.activateWindow()
-        elif state == "closed":
-            self._on_status(f"The {name} window was closed before YouTube showed you as signed in – not signed in.")
-        elif state == "timeout":
-            self._on_status("Sign-in took too long – try again.")
-        else:
-            self._on_error(f"Sign-in with {name} didn't work: {state.split(':', 1)[-1]}\n"
-                           "You can use Settings → YouTube login → Load cookies.txt instead.")
-        self._login_state_changed()
+            self._login_warned = False
+            if first:
+                b = self._login_browser()
+                self._on_log(f"✓ Signed in to YouTube (via {b['name'] if b else 'Chrome'}) – the extension keeps the "
+                             "login up to date.")
+                self._on_status("✓  Signed in to YouTube.")
+                set_state(self.status, "ok")
+                self.raise_()
+                self.activateWindow()
+            if first or val:                       # first time or another account -> name + picture
+                self._refresh_account(force=True)
+            self._login_state_changed()
+        elif kind == "no_login" and self._pending_signin:
+            dlg = getattr(self, "settings_dlg", None)
+            if dlg is not None:
+                dlg.show_login_state()
 
     def _cancel_sign_in(self):
-        si, self._signin = self._signin, None
-        if si is not None:
-            threading.Thread(target=si.close, daemon=True).start()
+        self._pending_signin = 0.0
         self._on_status("Sign-in cancelled.")
         self._login_state_changed()
-
-    def _browser_info(self):
-        if not hasattr(self, "_default_browser"):
-            self._default_browser = default_browser()
-        return self._default_browser
 
     def _refresh_account(self, force=False):
         """Which account is signed in (name + picture): from the saved file, looked up again in the background
@@ -7064,8 +7308,9 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg.show_login_state()
 
     def _sign_out(self):
+        self._pending_signin = 0.0
+        self.cfg.pop("login_via", None)             # the extension doesn't hand over anything any more
         sign_out()
-        shutil.rmtree(SIGNIN_DIR, ignore_errors=True)     # next sign-in starts fresh (another account possible)
         self._on_log("Signed out of YouTube.")
         self._on_status("Signed out of YouTube.")
         self._login_state_changed()
@@ -8746,12 +8991,7 @@ class MainWindow(QtWidgets.QMainWindow):
             e.ignore()
             return
         self._save_settings()
-        si, self._signin = self._signin, None
-        if si is not None and si.proc is not None and si.proc.poll() is None:
-            try:
-                si.proc.kill()           # the sign-in window of an unfinished sign-in
-            except OSError:
-                pass
+        self.login_bridge.close()
         for pl in (self.player, self.aplayer):
             if pl is not None:
                 pl.stop()

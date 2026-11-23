@@ -83,6 +83,8 @@ QLabel#h1 {{ font-size: 24px; font-weight: 700; }}
 QLabel#sub {{ color: {c['muted']}; }}
 QLabel#section {{ color: {c['muted']}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
 QLabel#muted, QLabel#field {{ color: {c['muted']}; }}
+QLabel#muted[state="ok"] {{ color: {c['accent']}; font-weight: 600; }}
+QLabel#stepnum {{ background: {c['accent']}; color: {c['on_accent']}; border-radius: 12px; font-weight: 700; }}
 QLabel#hint {{ color: {c['muted']}; font-size: 12px; }}
 QLabel#hint[state="warn"] {{ color: {c['warn']}; }}
 QLabel#hint[state="error"] {{ color: {c['err']}; }}
@@ -2008,6 +2010,99 @@ def _dir_buttons(on_open, on_change, on_default):
     return row, b_def
 
 
+class ExtSetupDialog(QtWidgets.QDialog):
+    """Once per PC: add the app's sign-in extension to Chrome (developer mode -> Load unpacked). Closes by itself
+    as soon as the extension reports in."""
+    def __init__(self, main, b):
+        super().__init__(main)
+        self.main, self.b = main, b
+        self.setWindowTitle("Sign-in extension")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(10)
+        name = b["name"]
+        t = label(f"Add the sign-in extension to {name} – once", "h1")
+        lay.addWidget(t)
+        intro = label(f"With it, “Sign in” opens a normal tab in your {name} with your Google accounts. The extension "
+                      "hands only the YouTube login to this app on this PC – nowhere else – and keeps it up to date.",
+                      "muted")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        page = extensions_page(b)
+
+        def step(n, text, *widgets):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            num = label(str(n), "stepnum")
+            num.setFixedSize(24, 24)
+            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row.addWidget(num, 0, Qt.AlignmentFlag.AlignTop)
+            col = QtWidgets.QVBoxLayout()
+            col.setSpacing(6)
+            lab = label(text)
+            lab.setWordWrap(True)
+            lab.setTextFormat(Qt.TextFormat.RichText)
+            col.addWidget(lab)
+            if widgets:
+                wr = QtWidgets.QHBoxLayout()
+                wr.setSpacing(6)
+                for w in widgets:
+                    wr.addWidget(w)
+                wr.addStretch(1)
+                col.addLayout(wr)
+            row.addLayout(col, 1)
+            lay.addLayout(row)
+
+        b_open = QtWidgets.QPushButton(f"Open {page.rstrip('/')}")
+        b_open.clicked.connect(self._open_page)
+        step(1, f"Open the extensions page of {name} (in the profile you use YouTube with).", b_open)
+        step(2, "Switch on <b>Developer mode</b> (top right on that page).")
+        self.path = QtWidgets.QLineEdit(str(EXT_DIR))
+        self.path.setReadOnly(True)
+        self.path.setMinimumWidth(340)
+        b_copy = QtWidgets.QPushButton("Copy")
+        b_copy.clicked.connect(self._copy)
+        b_folder = QtWidgets.QPushButton("Open folder")
+        b_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(EXT_DIR))))
+        step(3, "Click <b>Load unpacked</b> and pick this folder (paste the path into the folder field):",
+             self.path, b_copy, b_folder)
+        self.state = label("Waiting for the extension …", "muted")
+        lay.addSpacing(4)
+        lay.addWidget(self.state)
+        bot = QtWidgets.QHBoxLayout()
+        bot.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(self.reject)
+        bot.addWidget(cancel)
+        lay.addLayout(bot)
+        self._t0 = time.time()
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(400)
+        self.timer.timeout.connect(self._check)
+        self.timer.start()
+
+    def _open_page(self):
+        page = extensions_page(self.b)
+        if not open_in_browser(self.b, page):
+            QtWidgets.QApplication.clipboard().setText(page)
+            self.state.setText(f"Couldn't open it – “{page}” is copied, paste it into the address bar.")
+
+    def _copy(self):
+        QtWidgets.QApplication.clipboard().setText(str(EXT_DIR))
+        self.state.setText("Path copied – paste it into the folder field of “Load unpacked”.")
+
+    def _check(self):
+        if self.main.login_bridge.seen >= self._t0 - 1 or self.main._ext_connected(20):
+            self.timer.stop()
+            signed = not self.main._pending_signin
+            self.state.setText("✓ Extension added – " + ("signed in." if signed else "opening the YouTube sign-in …"))
+            set_state(self.state, "ok")
+            QtCore.QTimer.singleShot(900, self.accept)
+
+
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent, theme, accent, tips_on, apply, apply_tips, auto_pv=True, apply_pv=None,
                  pv_mode="download", apply_mode=None):
@@ -2194,37 +2289,46 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def show_login_state(self):
         st = login_state()
-        si = self.main._signin
-        self.btn_cookies.setEnabled(si is None)
-        if si is not None:
-            self.lbl_login.setText(f"Sign in to YouTube in the {si.b['name']} window that opened. As soon as YouTube "
-                                   "shows you as signed in, the app takes the login and closes that window.")
+        pending = bool(self.main._pending_signin)
+        b = self.main._login_browser()
+        bname = b["name"] if b else "Chrome"
+        self.btn_cookies.setEnabled(not pending)
+        if pending:
+            self.acc_card.set_account({})
+            self.lbl_login.setText(f"Sign in to YouTube in the {bname} tab that opened, or pick your account there. "
+                                   "As soon as YouTube shows you as signed in, the app takes the login by itself.")
             self.btn_login.setText("Cancel sign-in")
-            tip(self.btn_login, "Cancel sign-in", f"Closes the {si.b['name']} sign-in window.")
+            self.btn_login.setEnabled(True)
+            tip(self.btn_login, "Cancel sign-in", "Stops waiting for the login.")
             return
         self.acc_card.set_account(self.main.account if st["signed_in"] else {})
         if st["signed_in"]:
             when = time.strftime("%d.%m.%Y", time.localtime(st["since"])) if st["since"] else ""
             who = "" if self.main.account.get("name") else " to YouTube"
-            self.lbl_login.setText(f"✓ Signed in{who}{' since ' + when if when else ''}. Used for every "
-                                   "download – needed for age-restricted or members-only videos.")
+            since = f" since {when}" if when else ""
+            if self.main.cfg.get("login_via") == "chrome":
+                keep = "keeps the login up to date" if self.main._ext_connected(600) else \
+                    "keeps the login up to date while it is open"
+                self.lbl_login.setText(f"✓ Signed in{who}{since} – used for every download. {bname} {keep}.")
+            else:
+                self.lbl_login.setText(f"✓ Signed in{who}{since}. Used for every download – needed for "
+                                       "age-restricted or members-only videos.")
             self.btn_login.setText("Sign out")
             self.btn_login.setEnabled(True)
             tip(self.btn_login, "Sign out", "Removes the YouTube login from this app.")
         else:
             self.lbl_login.setText("Not signed in. Only needed for age-restricted or members-only videos – "
                                    "your login stays on this PC.")
-            b = self.main._browser_info()
-            self.btn_login.setText(f"Sign in with {b['name']} …" if b else "Sign in to YouTube …")
+            self.btn_login.setText(f"Sign in with {bname} …")
             self.btn_login.setEnabled(b is not None)
-            tip(self.btn_login, "Sign in", f"Opens {b['name'] if b else 'your default browser'} with its own profile "
-                                           "(your normal browser data stays untouched) on the YouTube sign-in. The app "
-                                           "takes the login by itself and closes the window. Note: YouTube can limit "
-                                           "accounts that are used with download tools – a second account is the "
-                                           "safe choice.")
+            tip(self.btn_login, "Sign in", f"Opens a new tab in your {bname} with Google's account choice – your "
+                                           "accounts are there as usual. The app's small extension hands the YouTube "
+                                           "login to the app (only YouTube, only to this PC). The first time it shows "
+                                           "you how to add the extension. Note: YouTube can limit accounts that are "
+                                           "used with download tools – a second account is the safe choice.")
 
     def _login_clicked(self):
-        if self.main._signin is not None:
+        if self.main._pending_signin:
             self.main._cancel_sign_in()
         elif login_state()["signed_in"]:
             self.main._sign_out()
@@ -2243,6 +2347,8 @@ class SettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "YouTube login", clean_error(ex))
             return
         apply_login()
+        self.main.cfg["login_via"] = "file"
+        self.main._pending_signin = 0.0
         self.main._on_log("✓ YouTube login loaded from a cookies file.")
         self.main._refresh_account(force=True)
         self.show_login_state()
@@ -2391,11 +2497,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sub_req = 0
         self.lines_dlg = None
         self._login_noted = False
-        self._signin = None
+        self._pending_signin = 0.0          # time "Sign in" was clicked (0 = not waiting for the Chrome login)
         self._resetting = False
         self._out_vol = None
         apply_login()
         self.cfg.pop("browser", None)
+        if SIGNIN_DIR.exists():              # the own browser profile of the old sign-in (up to 2.9.1) is not used any more
+            shutil.rmtree(SIGNIN_DIR, ignore_errors=True)
+        try:
+            write_extension()
+        except OSError:
+            pass
+        self.login_bridge = LoginBridge(self._bridge_wants, lambda ev: self.emit("bridge", ev))
+        self.login_bridge.start()
         st = self.cfg.get("sub_style") if isinstance(self.cfg.get("sub_style"), dict) else {}
         self.sub_style = {**SUB_STYLE, **{k: v for k, v in st.items() if k in SUB_STYLE}}
         if self.sub_style.get("pos"):
@@ -3710,74 +3824,89 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.emit("error", clean_error(ex))
         threading.Thread(target=work, daemon=True).start()
 
+    def _bridge_wants(self) -> bool:
+        """The extension may hand over the login: while signing in, and later (to keep it fresh) if the login came
+        from it."""
+        if self._pending_signin and time.time() - self._pending_signin < 15 * 60:
+            return True
+        return self.cfg.get("login_via") == "chrome" and COOKIE_FILE.exists()
+
+    def _ext_connected(self, within=90) -> bool:
+        return time.time() - self.login_bridge.seen < within
+
+    def _login_browser(self):
+        """The Chrome-like browser for the sign-in: the default one if it is one, else an installed one."""
+        bs = chromium_browsers()
+        return bs[0] if bs else None
+
     def _sign_in(self):
-        """Opens the default browser (own profile) on the YouTube sign-in; the login is picked up by itself."""
-        if self._signin is not None:
-            return
-        b = default_browser()
-        if not b:
-            return self._on_error("No default browser found that the app can use (Chrome, Edge, Brave, Opera, "
-                                  "Vivaldi or Firefox). Use Settings → YouTube login → Load cookies.txt instead.")
-        si = BrowserSignIn(b)
-        try:
-            si.start()
-        except OSError as ex:
-            return self._on_error(f"Could not open {b['name']}: {ex}")
-        self._signin = si
-        self._on_log(f"Sign-in: opened {b['name']} with its own profile – waiting for the YouTube login …")
-        self._on_status(f"Sign in to YouTube in the {b['name']} window that just opened – it closes by itself.")
-        set_state(self.status, "")
+        """Sign-in in your own Chrome: a new tab with Google's account choice; the app's extension hands the login
+        over (and keeps it up to date)."""
+        if self.login_bridge.port is None:
+            return self._on_error("The sign-in can't start: the ports 47815–47817 on this PC are taken by another "
+                                  "program. Restart the PC or use Settings → YouTube login → Load cookies.txt.")
+        b = self._login_browser()
+        if b is None:
+            return self._on_error("The sign-in needs Chrome, Edge, Brave, Opera or Vivaldi – none was found. You can "
+                                  "use Settings → YouTube login → Load cookies.txt instead.")
+        self._pending_signin = time.time()
         self._login_state_changed()
+        if self._ext_connected():
+            self._open_login_tab(b)
+            return
+        dlg = ExtSetupDialog(self, b)
+        res = dlg.exec()
+        if res != QtWidgets.QDialog.DialogCode.Accepted:
+            if self._pending_signin:
+                self._cancel_sign_in()
+            return
+        if self._pending_signin:                   # not signed in by the extension's first message already
+            self._open_login_tab(b)
 
-        def work():
-            end = time.time() + 15 * 60
-            state = "waiting"
-            while state == "waiting" and time.time() < end and self._signin is si:
-                time.sleep(1.5)
-                try:
-                    state = si.poll()
-                except Exception as ex:  # noqa: BLE001
-                    state = "error:" + clean_error(ex)
-            if self._signin is not si:
-                return                      # cancelled
-            if state == "waiting":
-                si.close()
-                state = "timeout"
-            self.emit("signin", state)
-        threading.Thread(target=work, daemon=True).start()
+    def _open_login_tab(self, b):
+        if not open_in_browser(b, LOGIN_URL):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(LOGIN_URL))
+        self._on_log(f"Sign-in: opened a tab in {b['name']} – waiting for the YouTube login …")
+        self._on_status(f"Sign in to YouTube in the new {b['name']} tab (or pick your account) – the app takes the "
+                        "login by itself.")
+        set_state(self.status, "")
+        QtCore.QTimer.singleShot(15 * 60 * 1000 + 500, self._signin_timeout)
 
-    def _on_signin(self, state):
-        si, self._signin = self._signin, None
-        name = si.b["name"] if si else "the browser"
-        if state == "done" and apply_login():
+    def _signin_timeout(self):
+        if self._pending_signin and time.time() - self._pending_signin >= 15 * 60:
+            self._pending_signin = 0.0
+            self._on_status("Sign-in took too long – try again.")
+            self._login_state_changed()
+
+    def _on_bridge(self, ev):
+        kind, val = ev
+        if kind == "login":
+            first = bool(self._pending_signin)
+            self._pending_signin = 0.0
+            self.cfg["login_via"] = "chrome"
             LOGIN_NOTE.clear()
             self._login_noted = False
-            self._on_log(f"✓ Signed in to YouTube (via {name}) – the login is used for every download.")
-            self._refresh_account(force=True)
-            self._on_status("✓  Signed in to YouTube.")
-            set_state(self.status, "ok")
-            self.raise_()
-            self.activateWindow()
-        elif state == "closed":
-            self._on_status(f"The {name} window was closed before YouTube showed you as signed in – not signed in.")
-        elif state == "timeout":
-            self._on_status("Sign-in took too long – try again.")
-        else:
-            self._on_error(f"Sign-in with {name} didn't work: {state.split(':', 1)[-1]}\n"
-                           "You can use Settings → YouTube login → Load cookies.txt instead.")
-        self._login_state_changed()
+            self._login_warned = False
+            if first:
+                b = self._login_browser()
+                self._on_log(f"✓ Signed in to YouTube (via {b['name'] if b else 'Chrome'}) – the extension keeps the "
+                             "login up to date.")
+                self._on_status("✓  Signed in to YouTube.")
+                set_state(self.status, "ok")
+                self.raise_()
+                self.activateWindow()
+            if first or val:                       # first time or another account -> name + picture
+                self._refresh_account(force=True)
+            self._login_state_changed()
+        elif kind == "no_login" and self._pending_signin:
+            dlg = getattr(self, "settings_dlg", None)
+            if dlg is not None:
+                dlg.show_login_state()
 
     def _cancel_sign_in(self):
-        si, self._signin = self._signin, None
-        if si is not None:
-            threading.Thread(target=si.close, daemon=True).start()
+        self._pending_signin = 0.0
         self._on_status("Sign-in cancelled.")
         self._login_state_changed()
-
-    def _browser_info(self):
-        if not hasattr(self, "_default_browser"):
-            self._default_browser = default_browser()
-        return self._default_browser
 
     def _refresh_account(self, force=False):
         """Which account is signed in (name + picture): from the saved file, looked up again in the background
@@ -3836,8 +3965,9 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg.show_login_state()
 
     def _sign_out(self):
+        self._pending_signin = 0.0
+        self.cfg.pop("login_via", None)             # the extension doesn't hand over anything any more
         sign_out()
-        shutil.rmtree(SIGNIN_DIR, ignore_errors=True)     # next sign-in starts fresh (another account possible)
         self._on_log("Signed out of YouTube.")
         self._on_status("Signed out of YouTube.")
         self._login_state_changed()
@@ -5518,12 +5648,7 @@ class MainWindow(QtWidgets.QMainWindow):
             e.ignore()
             return
         self._save_settings()
-        si, self._signin = self._signin, None
-        if si is not None and si.proc is not None and si.proc.poll() is None:
-            try:
-                si.proc.kill()           # the sign-in window of an unfinished sign-in
-            except OSError:
-                pass
+        self.login_bridge.close()
         for pl in (self.player, self.aplayer):
             if pl is not None:
                 pl.stop()

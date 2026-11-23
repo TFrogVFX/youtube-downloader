@@ -1210,120 +1210,233 @@ def default_browser() -> dict | None:
     return None
 
 
-def _free_port() -> int:
-    import socket
-    with socket.socket() as so:
-        so.bind(("127.0.0.1", 0))
-        return so.getsockname()[1]
-
-
 def _has_login(rows) -> bool:
     names = {r[4] for r in rows if "youtube.com" in r[0]}
     return "LOGIN_INFO" in names and bool(names & {"SAPISID", "__Secure-3PAPISID", "SID", "__Secure-1PSID"})
 
 
-class BrowserSignIn:
-    """Opens the default browser with its own profile (your normal browser stays untouched) on the YouTube
-    sign-in page. As soon as YouTube shows you as signed in, the login is saved for yt-dlp and the window closes.
-    Chrome, Edge, Brave, Opera, Vivaldi: read through the browser's local debug connection (only while the
-    window is open). Firefox: read from its profile."""
+def chromium_browsers() -> list:
+    """Installed Chrome-like browsers (the sign-in extension runs in these) -> [{'name', 'kind', 'exe'}]."""
+    out, seen = [], set()
 
-    def __init__(self, browser):
-        self.b = browser
-        self.proc = None
+    def add(b):
+        if b and b["kind"] == "chromium" and Path(b["exe"]).exists() and b["exe"].lower() not in seen:
+            seen.add(b["exe"].lower())
+            out.append(b)
+    add(default_browser())
+    if WIN:
+        import winreg
+        for exe in ("chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.exe"):
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
+                        add(_browser_from_exe(winreg.QueryValueEx(k, "")[0]))
+                except OSError:
+                    continue
+    else:
+        for name in ("google-chrome", "chromium", "microsoft-edge", "brave-browser"):
+            exe = shutil.which(name)
+            if exe:
+                b = _browser_from_exe(name)
+                add(b and {**b, "exe": exe})
+    return out
+
+
+def open_in_browser(b, url) -> bool:
+    """Opens url as a new tab in the browser that is already running (or starts it)."""
+    try:
+        subprocess.Popen([b["exe"], url], creationflags=NO_WINDOW, close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, KeyError, TypeError):
+        return False
+
+
+# ---- the sign-in extension: a small helper in your own Chrome hands the YouTube login to this app
+
+EXT_DIR = APP_DIR / "chrome-extension"
+EXT_ID = "mdhangbfgllnapcnookjceagljebgnmb"            # fixed by the key in the manifest
+EXT_ORIGIN = f"chrome-extension://{EXT_ID}"
+BRIDGE_PORTS = (47815, 47816, 47817)
+EXT_FILES = {
+    "manifest.json": json.dumps({
+        "manifest_version": 3,
+        "name": "YouTube Downloader – Login",
+        "version": "1.0",
+        "description": "Hands your YouTube login to the YouTube Downloader app on this PC – only when the app asks for "
+                       "it, only to this PC (127.0.0.1), nowhere else.",
+        "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5ohi/zflHEKTNyvDtx+8B2tqrNr8f90JSz+9+6+H0sn2FGedFlrpwQUQdQoNDILkByHmB7DMP+dSQvxw0/yWfnXVSJ4u7hGnBqJP60AKITFHdFpdQwssM6o/ZZSJGIrfNGs2/VgfhxY2gWrzyp8ZkAa6VLQM37p67MwN9i9k3HYp5upfIeqTVAINGvvkcyKZgfNJc2O1in9z1H3swrsgle6Gq0y9Gqp7cStyAp3VEhWn3T1zvO4T3jaY9dYGUXKlMkUvKbHdtgQqW1h4Rk5j9Dnbe+9iedEzWl437Q3i2dv+bIhOXK+T4IfSPMkyM7ESK8fRFjWFNvTbvpHHGz7PcwIDAQAB",
+        "permissions": ["cookies", "alarms"],
+        "host_permissions": ["https://*.youtube.com/*", "http://127.0.0.1/*"],
+        "background": {"service_worker": "background.js"},
+        "icons": {"16": "icon.png", "48": "icon.png", "128": "icon.png"},
+    }, indent=2),
+    "background.js": """// YouTube Downloader – Login helper.
+// Asks the YouTube Downloader app on this PC (127.0.0.1) whether it wants the YouTube login. Only if it does
+// (after "Sign in" in the app), the youtube.com cookies go to the app – to nothing else, nowhere else.
+const PORTS = [%PORTS%];
+let debounce = null;
+
+async function state(port) {
+  const r = await fetch(`http://127.0.0.1:${port}/ytd/state`, {cache: "no-store", headers: {"X-Ytd": "1"}});
+  if (!r.ok) return null;
+  const j = await r.json();
+  return j && j.app === "ytd" ? j : null;
+}
+
+async function sync(reason) {
+  for (const port of PORTS) {
+    let st = null;
+    try { st = await state(port); } catch (e) { continue; }
+    if (!st) continue;
+    if (!st.want) return;
+    const all = await chrome.cookies.getAll({domain: "youtube.com"});
+    const cookies = all.map(c => ({domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly,
+                                   session: c.session, expires: c.expirationDate || 0, name: c.name, value: c.value}));
+    try {
+      await fetch(`http://127.0.0.1:${port}/ytd/cookies`, {method: "POST", cache: "no-store",
+        headers: {"Content-Type": "application/json", "X-Ytd": "1"}, body: JSON.stringify({reason, cookies})});
+    } catch (e) {}
+    return;
+  }
+}
+
+function every30s() {
+  chrome.alarms.get("ytd-sync", a => { if (!a) chrome.alarms.create("ytd-sync", {periodInMinutes: 0.5}); });
+}
+
+chrome.cookies.onChanged.addListener(info => {
+  if (!(info.cookie.domain || "").endsWith("youtube.com")) return;
+  clearTimeout(debounce);
+  debounce = setTimeout(() => sync("change"), 1500);
+});
+chrome.alarms.onAlarm.addListener(a => { if (a.name === "ytd-sync") sync("tick"); });
+chrome.runtime.onInstalled.addListener(() => { every30s(); sync("installed"); });
+chrome.runtime.onStartup.addListener(() => { every30s(); sync("startup"); });
+every30s();
+""".replace("%PORTS%", ", ".join(str(x) for x in BRIDGE_PORTS)),
+}
+EXT_ICON = base64.b64decode("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")
+
+
+def write_extension() -> Path:
+    """Puts the extension's files into EXT_DIR (only what changed – Chrome loads it from there)."""
+    EXT_DIR.mkdir(parents=True, exist_ok=True)
+    for name, data in list(EXT_FILES.items()) + [("icon.png", EXT_ICON)]:
+        f = EXT_DIR / name
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        try:
+            if f.read_bytes() == raw:
+                continue
+        except OSError:
+            pass
+        f.write_bytes(raw)
+    return EXT_DIR
+
+
+def extensions_page(b) -> str:
+    return {"Edge": "edge://extensions/", "Brave": "brave://extensions/", "Opera": "opera://extensions",
+            "Vivaldi": "vivaldi://extensions/"}.get((b or {}).get("name"), "chrome://extensions/")
+
+
+def cookie_rows(cookies) -> list:
+    """The extension's cookie list -> rows for write_cookie_file (YouTube only)."""
+    rows = []
+    for c in cookies if isinstance(cookies, list) else []:
+        if not isinstance(c, dict) or "youtube.com" not in str(c.get("domain", "")) or not c.get("name"):
+            continue
+        exp = 0 if c.get("session") else int(float(c.get("expires") or 0))
+        rows.append((str(c["domain"]), str(c.get("path") or "/"), bool(c.get("secure")), exp, str(c["name"]),
+                     str(c.get("value", "")), bool(c.get("httpOnly"))))
+    return rows
+
+
+class LoginBridge:
+    """Tiny local server (127.0.0.1 only) the Chrome extension talks to: 'do you want the login?' and the
+    cookies. Accepts cookies only from the extension and only while want() is true."""
+    def __init__(self, want, on_event):
+        self.want, self.on_event = want, on_event
+        self.seen = 0.0                 # last time the extension asked
         self.port = None
-        self.profile = SIGNIN_DIR / ("firefox" if browser["kind"] == "firefox" else "chromium")
-        self.seen = False          # the browser answered at least once
-        self.t0 = 0.0
+        self.httpd = None
+        self.lock = threading.Lock()
 
     def start(self):
-        self.profile.mkdir(parents=True, exist_ok=True)
-        if self.b["kind"] == "firefox":
-            cmd = [self.b["exe"], "-profile", str(self.profile), "-no-remote", "-new-instance", LOGIN_URL]
-        else:
-            self.port = _free_port()
-            cmd = [self.b["exe"], f"--user-data-dir={self.profile}", f"--remote-debugging-port={self.port}",
-                   "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
-                   "--new-window", *os.environ.get("YTD_BROWSER_ARGS", "").split(), LOGIN_URL]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.t0 = time.time()
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        bridge = self
 
-    # chromium: DevTools protocol over a local websocket
-    def _cdp(self, method, params=None, timeout=8.0):
-        from websockets.sync.client import connect
-        info = json.loads(fetch_bytes(f"http://127.0.0.1:{self.port}/json/version", timeout=3).decode("utf-8"))
-        with connect(info["webSocketDebuggerUrl"], open_timeout=timeout, max_size=None,
-                     additional_headers=None) as ws:
-            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
-            end = time.time() + timeout
-            while time.time() < end:
-                msg = json.loads(ws.recv(timeout=max(0.5, end - time.time())))
-                if msg.get("id") == 1:
-                    if "error" in msg:
-                        raise RuntimeError(msg["error"].get("message", "DevTools error"))
-                    return msg.get("result") or {}
-        raise TimeoutError(method)
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
 
-    def _chromium_rows(self):
-        res = self._cdp("Storage.getCookies")
-        return [(c.get("domain", ""), c.get("path", "/"), bool(c.get("secure")),
-                 0 if c.get("session") or (c.get("expires") or -1) < 0 else int(c["expires"]),
-                 c.get("name", ""), c.get("value", ""), bool(c.get("httpOnly"))) for c in res.get("cookies", [])]
+            def _reply(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
 
-    def _firefox_rows(self):
-        import sqlite3
-        import tempfile
-        db = self.profile / "cookies.sqlite"
-        if not db.exists():
-            return []
-        with tempfile.TemporaryDirectory(prefix="ytd_ff_") as td:
-            for suf in ("", "-wal", "-shm"):
-                f = Path(str(db) + suf)
-                if f.exists():
-                    try:
-                        shutil.copyfile(f, Path(td) / ("cookies.sqlite" + suf))
-                    except OSError:
-                        pass
-            con = sqlite3.connect(str(Path(td) / "cookies.sqlite"))
+            def _ours(self):
+                # the extension sends its own header (web pages can't, without asking first) and, if any,
+                # its own origin
+                origin = self.headers.get("Origin")
+                return self.headers.get("X-Ytd") == "1" and origin in (None, "", EXT_ORIGIN)
+
+            def do_GET(self):
+                if self.path.split("?")[0] != "/ytd/state" or not self._ours():
+                    return self._reply(404, {})
+                bridge.seen = time.time()
+                self._reply(200, {"app": "ytd", "want": bool(bridge.want())})
+
+            def do_POST(self):
+                if self.path.split("?")[0] != "/ytd/cookies" or not self._ours():
+                    return self._reply(403, {})
+                n = int(self.headers.get("Content-Length") or 0)
+                if n <= 0 or n > 512 * 1024:
+                    return self._reply(413, {})
+                try:
+                    data = json.loads(self.rfile.read(n).decode("utf-8"))
+                except ValueError:
+                    return self._reply(400, {})
+                bridge.seen = time.time()
+                self._reply(200, bridge.take(data.get("cookies")))
+
+        for port in BRIDGE_PORTS:
             try:
-                rows = con.execute("SELECT host, path, isSecure, expiry, name, value, isHttpOnly FROM moz_cookies "
-                                   "WHERE host LIKE '%youtube.com'").fetchall()
-            finally:
-                con.close()
-        return [(h, p, bool(sec), int(exp // 1000 if exp > 10 ** 11 else exp), n, v, bool(ho))
-                for h, p, sec, exp, n, v, ho in rows]
+                self.httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+                self.port = port
+                break
+            except OSError:
+                continue
+        if self.httpd is not None:
+            self.httpd.daemon_threads = True
+            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        return self.port
 
-    def poll(self) -> str:
-        """-> 'waiting' | 'done' | 'closed'"""
-        running = self.proc is not None and self.proc.poll() is None
-        try:
-            rows = self._firefox_rows() if self.b["kind"] == "firefox" else self._chromium_rows()
-            self.seen = True
-            self.misses = 0
-        except Exception:  # noqa: BLE001 - not reachable (yet / any more)
-            rows = None
-            self.misses = getattr(self, "misses", 0) + 1
-        if rows and _has_login(rows):
+    def take(self, cookies) -> dict:
+        if not self.want():
+            return {"ok": False, "why": "not wanted"}
+        rows = cookie_rows(cookies)
+        if not _has_login(rows):
+            self.on_event(("no_login", None))
+            return {"ok": False, "why": "not signed in to YouTube in this browser"}
+        with self.lock:
+            old = read_cookie_values()
+            new = {r[4]: r[5] for r in rows}
+            if new == old:
+                self.on_event(("same", None))
+                return {"ok": True, "changed": False}
             write_cookie_file(rows)
-            self.close()
-            return "done"
-        if self.b["kind"] == "firefox":
-            return "waiting" if running else "closed"
-        if rows is None and ((self.seen and self.misses >= 3) or (not self.seen and time.time() - self.t0 > 45)):
-            return "closed"      # window closed (or the browser never opened)
-        return "waiting"
+            apply_login()
+            who = lambda v: (v.get("LOGIN_INFO"), v.get("SID") or v.get("__Secure-3PSID"))
+            self.on_event(("login", who(old) != who(new)))      # True: other account (or first time)
+        return {"ok": True, "changed": True}
 
     def close(self):
-        if self.b["kind"] != "firefox" and self.port:
-            try:
-                self._cdp("Browser.close", timeout=3)
-            except Exception:  # noqa: BLE001
-                pass
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.wait(timeout=4)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        if self.httpd is not None:
+            threading.Thread(target=self.httpd.shutdown, daemon=True).start()
 
 
 def login_hint(msg) -> str:
