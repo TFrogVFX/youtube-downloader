@@ -31,6 +31,13 @@ Only needed for age-restricted, members-only or Premium videos. Two ways in **Se
 
 The login is stored encrypted with Windows' own protection (readable only by your Windows user on this PC) and handed to yt-dlp in memory. Tip: a second Google account is the safest choice.
 
+## AI upscaling (optional)
+
+Output → **Upscale** 2× / 4× with an **AI model**: *Normal* (Real-ESRGAN), *Anime – fast* (Real-ESRGAN anime) or
+*Anime – best* (Real-CUGAN). Used for the video, **Save frame** and the thumbnail. The upscaler is downloaded the first
+time (≈ 45 MB, checksum checked) and runs on any graphics card with Vulkan (NVIDIA / AMD / Intel).
+Settings → **AI upscalers** shows the installed versions and offers an update when a newer build is out.
+
 ## Repair
 
 **Settings → Repair …** checks the app file (loads it again from GitHub if it's damaged), puts yt-dlp in again, checks FFmpeg, restores the sign-in extension, the login and the settings file, and removes leftovers. Settings, history and login stay.

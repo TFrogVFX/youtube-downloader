@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.6"
+APP_VERSION = "2.9.7"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -96,6 +96,12 @@ AUDIO_HINTS = {"mp3": "With title, artist and cover art.",
 
 # ---- hover help (Settings → "Show help when hovering")
 ITEM_HELP = {
+    "No upscaling": "The picture keeps its size.",
+    "2× (AI)": "Twice as wide and high, with AI detail (e.g. 1080p -> 4K). Takes a while for videos.",
+    "4× (AI)": "Four times as wide and high, with AI detail. For small pictures – slow for videos.",
+    "Normal (Real-ESRGAN)": "For filmed things, games, photos. Removes compression blocks and adds detail.",
+    "Anime – fast (Real-ESRGAN)": "For anime / drawings – quick, clean lines.",
+    "Anime – best (Real-CUGAN)": "For anime / drawings – the sharpest lines and textures, slower.",
     # quality
     "Best available": "The highest resolution this video has.",
     "2160p (4K)": "Up to 3840 × 2160. Big files.",
@@ -149,6 +155,13 @@ ITEM_HELP = {
     "Light": "Bright theme for daylight.",
 }
 # ---- frame (crop)
+# AI upscaling (Output tab; also Save frame / Save thumbnail)
+AI_UPSCALES = {"No upscaling": None, "2× (AI)": 2, "4× (AI)": 4}
+AI_MODELS = {   # label -> (engine, model)
+    "Normal (Real-ESRGAN)": ("esrgan", "normal"),
+    "Anime – fast (Real-ESRGAN)": ("esrgan", "anime"),
+    "Anime – best (Real-CUGAN)": ("cugan", "se"),
+}
 FREE = "free"            # "Custom": a box of any shape
 ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "Custom": FREE}
 # volume curve: how the volume goes from a point to the next one

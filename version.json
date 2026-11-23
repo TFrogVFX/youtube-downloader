@@ -1,8 +1,8 @@
 {
-  "version": "2.9.6",
+  "version": "2.9.7",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "587b0b42a0a4befb60b5cc92cfef415c6bf3898818cf01f08af2d350fc140637",
-  "notes": "The “Update yt-dlp” button lights up red when a new yt-dlp is out (checked at start and every 2 hours), and asks for a restart once it's installed.",
+  "sha256": "28d1dab6517edaf4df99fa9b67735b429a9c5004d2947a1bc9e6e70206acdf18",
+  "notes": "AI upscaling (Real-ESRGAN / Real-CUGAN) for video, Save frame and Save thumbnail; Settings show the upscaler versions and offer updates",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
