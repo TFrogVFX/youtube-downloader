@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.7.2"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -2452,19 +2452,16 @@ def _cookie_header(s) -> str:
     return "; ".join(out)
 
 
-def media_url(url, height=None):
-    """Direct address (+ HTTP headers) of the best picture up to `height` – for grabbing single frames."""
+def media_url(url, height=None) -> dict:
+    """The best picture up to `height` as a stream item (address + the HTTP headers yt-dlp uses) – for single
+    frames. Prefers H.264 / MP4 (quick to seek)."""
     fmt = f"bv*[height<={height}]/b[height<={height}]/bv*/b" if height else "bv*/b"
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "format": fmt,
+            "format_sort": [f"res:{height}" if height else "res", "fps", "vcodec:h264", "ext:mp4"],
             "logger": _Silent(), **YDL_EXTRA}
     info = ydl_extract(opts, url, download=False)
     f = (info.get("requested_formats") or [info])[0]
-    hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
-            if k.lower() not in ("accept-encoding", "range")}
-    ck = _cookie_header(f.get("cookies") or info.get("cookies"))
-    if ck:
-        hdrs["Cookie"] = ck
-    return f["url"], hdrs
+    return _stream_fmt(f, info)
 
 
 def _png_size(path):
@@ -2481,19 +2478,25 @@ def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model
     fps = fps if fps and fps > 1 else 30.0
     frame = int(t * fps + 1e-3)
     seek = max(0.0, frame / fps - 0.5 / fps)        # first frame at or after this = the frame on screen
+    proxy = None
     with tempfile.TemporaryDirectory(prefix="ytclip_still_") as td:
         raw = Path(td) / "frame.png"
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
         if local:
             inp = str(src)
         else:
+            # YouTube refuses FFmpeg's own big requests (403) – the small local proxy fetches the needed parts
+            # in pieces with yt-dlp's headers, exactly like the preview player
             emit("status", "Finding the full-quality video …")
-            inp, hdrs = media_url(src, height)
-            if hdrs:
-                cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())]
+            proxy = StreamProxy()
+            inp = proxy.add(media_url(src, height))
         emit("status", "Grabbing the frame …")
         cmd += ["-ss", f"{seek:.4f}", "-i", inp, "-frames:v", "1", "-update", "1", str(raw)]
-        r = subprocess.run(cmd, capture_output=True, timeout=300, creationflags=NO_WINDOW)
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=300, creationflags=NO_WINDOW)
+        finally:
+            if proxy is not None:
+                proxy.close()
         if r.returncode != 0 or not raw.is_file():
             raise RuntimeError("Could not grab the frame:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
         W, H = _png_size(raw)

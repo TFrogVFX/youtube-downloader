@@ -6,7 +6,7 @@ param([switch]$Exe)   # -Exe: started by YouTube-Downloader.exe (keep window ope
 
 $ErrorActionPreference = 'Continue'
 $AppName = 'YouTube Downloader'
-$AppVersion = '2.6.0'
+$AppVersion = '2.7.2'
 $OldNames = @('tfrog YT Clip')
 $AppDir  = Join-Path $env:LOCALAPPDATA 'tfrog_ytclip'
 $Script  = 'tfrog_ytclip.pyw'

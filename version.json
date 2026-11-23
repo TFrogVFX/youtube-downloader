@@ -1,8 +1,8 @@
 {
-  "version": "2.7.1",
+  "version": "2.7.2",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "57c8f05021c0ea41d93a22faa18189495b27168b04764ecec7d8590ea1c2b753",
-  "notes": "YouTube sign-in now opens your default browser (Chrome, Edge, Brave, Opera, Vivaldi or Firefox) with its own profile and takes the login by itself. Volume curve is reset for every new video (also from the history); fixed the hang when loading a new video after changing the volume.",
+  "sha256": "bea6595109579ad8394ebd96494e13b4fab8190fa1a37ae8459c1e98e70d1200",
+  "notes": "Save frame works with YouTube again (it was refused with 403). New app icon.",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
