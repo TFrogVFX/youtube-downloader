@@ -1,8 +1,8 @@
 {
-  "version": "2.9.7",
+  "version": "2.9.8",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "28d1dab6517edaf4df99fa9b67735b429a9c5004d2947a1bc9e6e70206acdf18",
-  "notes": "AI upscaling (Real-ESRGAN / Real-CUGAN) for video, Save frame and Save thumbnail; Settings show the upscaler versions and offer updates",
+  "sha256": "fc9c512e9692006168b880da80c3533658032b0d906718b9837ec6deddc70f73",
+  "notes": "Signed in (e.g. Premium) but YouTube offers no video: other YouTube clients are tried with the login first (and remembered); login_debug.txt for diagnosis",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

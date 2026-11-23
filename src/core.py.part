@@ -492,27 +492,114 @@ def _base_opts(outdir, suffix, section, emit, name=None) -> dict:
 
 
 _NO_FORMATS = re.compile(r"Requested format is not available|Only images are available|No video formats found", re.I)
+# yt-dlp asks YouTube with a few "clients" (web, TV, …). Signed in (esp. with Premium) its default ones can come back
+# empty (YouTube wants a "PO token" from them) – these others often still work with the login.
+LOGIN_CLIENTS = ["tv", "tv_simply", "tv_downgraded", "mweb", "web_safari", "web_embedded"]
+LOGIN_DEBUG = APP_DIR / "login_debug.txt"
+
+
+class _Keep:
+    """Logger that passes everything on and keeps a copy (for login_debug.txt)."""
+
+    def __init__(self, inner, lines):
+        self.inner, self.lines = inner, lines
+
+    def _k(self, kind, msg):
+        self.lines.append(f"{kind}: {ANSI.sub('', str(msg))}"[:600])
+
+    def debug(self, msg):
+        self._k("debug", msg)
+        if self.inner is not None and not str(msg).startswith("[debug] "):
+            self.inner.debug(msg)
+
+    def info(self, msg):
+        self._k("info", msg)
+        if self.inner is not None:
+            self.inner.info(msg)
+
+    def warning(self, msg):
+        self._k("WARNING", msg)
+        if self.inner is not None:
+            self.inner.warning(msg)
+
+    def error(self, msg):
+        self._k("ERROR", msg)
+        if self.inner is not None:
+            self.inner.error(msg)
+
+
+def _login_debug(url, tries):
+    """What happened with the login (no cookies, no account data) -> login_debug.txt, for finding the cause."""
+    try:
+        import yt_dlp
+        head = [f"time: {time.strftime('%Y-%m-%d %H:%M:%S')}", f"app: {APP_VERSION}",
+                f"yt-dlp: {yt_dlp.version.__version__}", f"deno: {shutil.which('deno') or '-'}",
+                f"url: {url}", ""]
+        body = []
+        for name, lines, res in tries:
+            body += [f"===== {name}: {res}"] + [x for x in lines if not re.search(r"cookie|SAPISID|Authorization", x, re.I)
+                                               or x.startswith(("WARNING", "ERROR"))] + [""]
+        LOGIN_DEBUG.write_text("\n".join(head + body)[-200_000:], encoding="utf-8")
+    except Exception:  # noqa: BLE001 - only diagnostics
+        pass
 
 
 def ydl_extract(opts, url, download=True, use_login=True):
     """One yt-dlp run (the YouTube login, if any, is handed in by add_login – from memory). If YouTube offers no
-    video at all with the login, the same run is done once more without it."""
+    video with the login, other YouTube clients are tried with the login; only then the run is done without it."""
     from yt_dlp import YoutubeDL  # imported late so the auto-update can run first
     clean = {k: v for k, v in opts.items() if k != "login"}
-    try:
+    if not (use_login and logged_in()):
         with YoutubeDL(clean) as ydl:
-            if use_login:
-                add_login(ydl)
             return ydl.extract_info(url, download=download)
-    except Exception as ex:  # noqa: BLE001
-        if not (use_login and logged_in() and _NO_FORMATS.search(str(ex))):
-            raise
-        log = opts.get("logger")
-        if log is not None and hasattr(log, "warning"):
-            log.warning("With your YouTube login YouTube offered no video – trying without the login …")
-        LOGIN_NOTE[:] = ["With your YouTube login, YouTube offered no video for this link, so it was loaded without "
-                         "the login. If that keeps happening: Settings → YouTube login → Sign out and sign in again."]
-        return ydl_extract(opts, url, download, use_login=False)
+    log = opts.get("logger")
+    tries = []
+    preferred = load_cfg().get("login_clients")
+    plans = [("default clients", None)]
+    if preferred:
+        plans.insert(0, ("last working clients", preferred))
+    plans.append(("other clients", [c for c in LOGIN_CLIENTS if c not in (preferred or [])] or LOGIN_CLIENTS))
+    last = None
+    for i, (name, clients) in enumerate(plans):
+        lines: list[str] = []
+        o = dict(clean, logger=_Keep(log, lines), verbose=True)
+        if clients:
+            ea = {k: dict(v) for k, v in (clean.get("extractor_args") or {}).items()}
+            ea.setdefault("youtube", {})["player_client"] = list(clients)
+            o["extractor_args"] = ea
+        try:
+            with YoutubeDL(o) as ydl:
+                add_login(ydl)
+                res = ydl.extract_info(url, download=download)
+            tries.append((name, lines, "OK"))
+            if clients and clients != preferred:
+                try:
+                    save_cfg({**load_cfg(), "login_clients": list(clients)})
+                except Exception:  # noqa: BLE001
+                    pass
+            if i or tries[0][2] != "OK":
+                _login_debug(url, tries)
+            return res
+        except Exception as ex:  # noqa: BLE001
+            tries.append((name, lines, f"failed – {ANSI.sub('', str(ex))[:300]}"))
+            if not _NO_FORMATS.search(str(ex)):
+                _login_debug(url, tries)
+                raise
+            last = ex
+            if clients == preferred and preferred:
+                try:
+                    save_cfg({k: v for k, v in load_cfg().items() if k != "login_clients"})
+                except Exception:  # noqa: BLE001
+                    pass
+            if log is not None and hasattr(log, "warning") and i < len(plans) - 1:
+                log.warning("With your YouTube login YouTube offered no video – trying other YouTube clients …")
+    _login_debug(url, tries)
+    if log is not None and hasattr(log, "warning"):
+        log.warning("With your YouTube login YouTube offered no video – trying without the login …")
+    LOGIN_NOTE[:] = ["With your YouTube login, YouTube offered no video for this link, so it was loaded without "
+                     "the login. Details for fixing it: login_debug.txt in the app folder."]
+    del last
+    return ydl_extract(opts, url, download, use_login=False)
 
 
 def _suffix(start, end) -> str:
