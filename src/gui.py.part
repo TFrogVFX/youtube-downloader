@@ -3164,6 +3164,21 @@ class MainWindow(QtWidgets.QMainWindow):
         tv.addLayout(tr2)
         self.transport.hide()
         L.addWidget(self.transport)
+        # before a preview is there: load the small copy or play live from YouTube
+        self.offer_row = QtWidgets.QWidget()
+        orl = QtWidgets.QHBoxLayout(self.offer_row)
+        orl.setContentsMargins(0, 2, 0, 0)
+        orl.setSpacing(6)
+        self.btn_offer_copy = QtWidgets.QPushButton("▶  Load small copy")
+        self.btn_offer_live = QtWidgets.QPushButton("●  Live YouTube")
+        for b_, fn in ((self.btn_offer_copy, self._offer_copy), (self.btn_offer_live, self._offer_live)):
+            b_.setObjectName("chip")
+            b_.setCursor(Qt.CursorShape.PointingHandCursor)
+            b_.clicked.connect(fn)
+            orl.addWidget(b_)
+        orl.addStretch(1)
+        self.offer_row.hide()
+        L.addWidget(self.offer_row)
         self.vtitle = label("", "vtitle")
         self.vtitle.setWordWrap(True)
         self.vmeta = label("", "muted")
@@ -3596,6 +3611,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_out_info(self):
         if not self.isVisible():
             return
+        self._sync_offer_row()
         try:
             t = self._out_text()
         except Exception:  # noqa: BLE001 - only a hint
@@ -4779,6 +4795,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return fx
 
     def _srt_job(self):
+        if self.seg.value() == "mp3":       # the Subtitles tab is hidden for audio
+            return None
         return self.sub_cues if (self.sub_cues and self.cb_srt.isChecked()) else None
 
     # ------------------------------------------------------------------ settings / theme
@@ -4975,6 +4993,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.setCurrentIndex(["mp4", "mp3", "gif"].index(mode))
         self.tabs.set_shown("frame", mode != "mp3")      # audio has no picture
         self.tabs.set_shown("volume", mode != "gif")     # GIFs have no sound
+        self.tabs.set_shown("subs", mode != "mp3")       # audio has no picture for subtitles
         self._fit_stack(self.stack)
         self._fit_stack(self.tabstack)
         self._refresh_ext()
@@ -5416,6 +5435,35 @@ class MainWindow(QtWidgets.QMainWindow):
         a.setActionGroup(grp)
         a.triggered.connect(lambda: self._switch_preview("download"))
         m.exec(self.lbl_pv_src.mapToGlobal(QtCore.QPoint(0, self.lbl_pv_src.height() + 2)))
+
+    def _offer_copy(self):
+        if self._is_info_current() and not self.info.get("local") and self._pv_state in ("offer", "error"):
+            self._load_preview()
+
+    def _offer_live(self):
+        if not (self._is_info_current() and not self.info.get("local") and self._can_stream()):
+            return
+        self.cfg["preview_mode"] = "stream"
+        save_cfg(self.cfg)
+        self._start_stream()
+
+    def _sync_offer_row(self):
+        """The two choices under the picture while there is no preview yet (also while the copy loads)."""
+        show = (self._is_info_current() and not self.info.get("local") and bool(self.info_url)
+                and self._pv_state in ("offer", "error", "loading") and PLAYER_OK)
+        if show:
+            dur = self.info.get("duration") or 0
+            self.btn_offer_copy.setVisible(self._pv_state != "loading")
+            self.btn_offer_copy.setText("▶  Load small copy" + (f"  (≈ {preview_mb(dur)} MB)" if dur else ""))
+            can = self._can_stream()
+            self.btn_offer_live.setEnabled(can)
+            tip(self.btn_offer_live, "Live YouTube preview",
+                "Plays the preview straight from YouTube – starts at once, nothing is downloaded, and you can pick "
+                "the quality." if can else "This video can't be played live – use the small copy.")
+            tip(self.btn_offer_copy, "Small copy", "Downloads a small copy only for the preview – your download "
+                                                   "uses the quality you pick.")
+        if show != self.offer_row.isVisible():
+            self.offer_row.setVisible(show)
 
     def _toggle_live(self):
         """Preview: downloaded small copy <-> played live from YouTube (then the quality can be picked)."""

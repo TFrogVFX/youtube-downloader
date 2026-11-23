@@ -1,8 +1,8 @@
 {
-  "version": "2.9.12",
+  "version": "2.9.13",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "bb4e08796b4ce218dd8f6d597ae3c6487dd5b8f7d1c024ca4ac964e7fede01a2",
-  "notes": "Live YouTube button in the preview (pick the stream quality); the Output line always shows what you get (size, fps, format, length, \u2248 MB); setup opens its own window instead of PowerShell",
+  "sha256": "5be75c199d837938007ed57d428e0943f7687745feaf1e521027809dd9fc8564",
+  "notes": "Live YouTube button also before a preview is loaded (next to 'Load small copy'); no Subtitles tab for audio",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
@@ -11,5 +11,5 @@
   "extra": [
     "icon.ico"
   ],
-  "setup_sha256": "d425aa5b517ede6193988e0a632f88dccfcdc441ea2988eef015e466ec25b636"
+  "setup_sha256": "68d725e9485f5e5743f765db23cbed28e4fede813e74f5f47ec01b5d01cbd040"
 }
