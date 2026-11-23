@@ -12,7 +12,15 @@ Windows app for YouTube: download a clip (time range, frame-accurate), the audio
 
 ## Install
 
-Download [`setup/YouTube-Downloader.exe`](setup/YouTube-Downloader.exe) and start it. The first start installs Python, FFmpeg, Deno and the app (takes 1–3 minutes); after that the same exe just starts the app.
+**Without warnings (recommended):** press Start, type `PowerShell`, press Enter, paste this line and press Enter:
+
+```powershell
+irm https://raw.githubusercontent.com/TFrogVFX/youtube-downloader/main/installer/web-install.ps1 | iex
+```
+
+It loads the newest version from this repository, checks it and installs Python, FFmpeg, Deno and the app (1–3 minutes). Shortcuts go on the desktop and into the Start menu.
+
+**Or with the setup file:** download [`setup/YouTube-Downloader.exe`](setup/YouTube-Downloader.exe) and start it. The file isn't signed, so the browser asks whether to keep it (*Keep*) and Windows shows "Windows protected your PC" – click *More info* → *Run anyway*. After the first start the same exe just starts the app.
 
 ## YouTube login (optional)
 
