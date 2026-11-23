@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -2724,22 +2724,10 @@ def _yt_text(v) -> str:
     return ""
 
 
-def _find(obj, test):
-    """First dict in a nested JSON for which test(dict) is true."""
-    stack = [obj]
-    while stack:
-        o = stack.pop(0)
-        if isinstance(o, dict):
-            if test(o):
-                return o
-            stack.extend(o.values())
-        elif isinstance(o, list):
-            stack.extend(o)
-    return None
-
-
 def _best_thumb(t) -> str:
-    th = [x for x in ((t or {}).get("thumbnails") or []) if isinstance(x, dict) and x.get("url")]
+    """{'thumbnails': [...]} or {'sources': [...]} -> address of the biggest picture (asked for at 176 px)."""
+    t = t or {}
+    th = [x for x in (t.get("thumbnails") or t.get("sources") or []) if isinstance(x, dict) and x.get("url")]
     if not th:
         return ""
     url = max(th, key=lambda x: x.get("width") or 0)["url"]
@@ -2747,29 +2735,92 @@ def _best_thumb(t) -> str:
     return re.sub(r"=s\d+-", "=s176-", url)          # sharper picture
 
 
-def parse_account_menu(data: dict) -> dict:
-    """YouTube's account menu -> {'name', 'handle', 'email', 'photo'} (empty strings if missing)."""
-    h = _find(data, lambda d: "accountName" in d and ("accountPhoto" in d or "channelHandle" in d or "email" in d))
-    if not h:
+def parse_accounts(data) -> dict:
+    """YouTube's account menu / account switcher -> the active account {'name', 'handle', 'email', 'photo'}."""
+    items, stack = [], [data]
+    while stack:
+        o = stack.pop(0)
+        if isinstance(o, dict):
+            if "accountName" in o and any(k in o for k in ("accountPhoto", "channelHandle", "email", "accountByline")):
+                items.append(o)
+            stack.extend(o.values())
+        elif isinstance(o, list):
+            stack.extend(o)
+    if not items:
         return {}
-    return {"name": _yt_text(h.get("accountName")).strip(), "handle": _yt_text(h.get("channelHandle")).strip(),
-            "email": _yt_text(h.get("email")).strip(), "photo": _best_thumb(h.get("accountPhoto"))}
+    h = next((i for i in items if i.get("isSelected") is True), items[0])
+    byline = _yt_text(h.get("accountByline")).strip()
+    handle = _yt_text(h.get("channelHandle")).strip() or (byline if byline.startswith("@") else "")
+    email = _yt_text(h.get("email")).strip() or (byline if "@" in byline[1:] and " " not in byline else "")
+    return {"name": _yt_text(h.get("accountName")).strip(), "handle": handle, "email": email,
+            "photo": _best_thumb(h.get("accountPhoto"))}
+
+
+parse_account_menu = parse_accounts
 
 
 def parse_home_avatar(html: str) -> str:
-    """Fallback: the round picture in the top right of youtube.com."""
+    """The round picture in the top right of youtube.com (only from the top bar, not the videos below)."""
     i = html.find('"topbarMenuButtonRenderer"')
-    m = re.search(r'"avatar"\s*:\s*\{\s*"thumbnails"\s*:\s*(\[[^\]]*\])', html[i:] if i >= 0 else html)
-    if not m:
+    if i < 0:
         return ""
+    seg = html[i:i + 6000]
+    m = re.search(r'"avatar"\s*:\s*\{\s*"thumbnails"\s*:\s*(\[[^\]]*\])', seg)
+    if m:
+        try:
+            return _best_thumb({"thumbnails": json.loads(m.group(1))})
+        except ValueError:
+            pass
+    m = re.search(r'"(https://yt\d\.(?:ggpht|googleusercontent)\.com/[^"\\]+)"', seg)
+    return re.sub(r"=s\d+-", "=s176-", m.group(1)) if m else ""
+
+
+def _ytdlp_version() -> str:
     try:
-        return _best_thumb({"thumbnails": json.loads(m.group(1))})
-    except ValueError:
-        return ""
+        from yt_dlp.version import __version__
+        return __version__
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def _json_reply(raw: bytes):
+    txt = raw.decode("utf-8", "replace")
+    return json.loads(txt[txt.find("{"):]) if "{" in txt else {}       # some answers start with )]}'
+
+
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+
+
+def _account_via_ytdlp(ydl, notes) -> dict:
+    """Like yt-dlp's own signed-in requests: YouTube's start page (-> its settings + the picture in the top bar),
+    then the account menu with exactly the headers yt-dlp sends."""
+    info = {}
+    ie = ydl.get_info_extractor("Youtube")
+    ie.initialize()
+    page = ie._download_webpage(_YT + "/", None, note=False, errnote=False, fatal=True,
+                                headers={"Accept-Language": "en-US,en;q=0.8"})
+    cfg = ie.extract_ytcfg(None, page) or {}
+    if cfg and not cfg.get("LOGGED_IN"):
+        notes.append("start page: YouTube does not see you as signed in")
+    photo = parse_home_avatar(page)
+    if photo:
+        info["photo"] = photo
+    try:
+        data = ie._call_api("account/account_menu", {}, None, fatal=True, note=False,
+                            headers=ie.generate_api_headers(ytcfg=cfg), context=ie._extract_context(cfg))
+        got = parse_accounts(data)
+        if got:
+            info = {**got, "photo": got.get("photo") or info.get("photo", "")}
+        else:
+            notes.append("account menu: no account in the answer (" + ", ".join(list(data)[:5]) + ")")
+    except Exception as ex:  # noqa: BLE001
+        notes.append(f"account menu: {clean_error(ex)[:160]}")
+    return info
 
 
 def fetch_account(timeout=20.0) -> dict:
-    """Asks YouTube with the saved login which account it is -> saved in account.json (+ the picture)."""
+    """Asks YouTube with the saved login which account it is -> saved in account.json (+ the picture).
+    Three ways, the first that knows the name wins; what didn't work is written to account_lookup.txt."""
     cookies = read_cookie_values()
     if not cookies:
         raise RuntimeError("Not signed in.")
@@ -2777,34 +2828,55 @@ def fetch_account(timeout=20.0) -> dict:
     if ydl is None:
         raise RuntimeError("yt-dlp is missing.")
     from yt_dlp.networking import Request
-    ver = _web_client_version()
-    headers = {"Content-Type": "application/json", "Origin": _YT, "X-Origin": _YT, "Referer": _YT + "/",
-               "X-Goog-AuthUser": "0", "X-Youtube-Client-Name": "1", "X-Youtube-Client-Version": ver,
-               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                             "Chrome/142.0.0.0 Safari/537.36"}
-    auth = _sid_auth(cookies, _YT)
-    if auth:
-        headers["Authorization"] = auth
-    body = json.dumps({"context": {"client": {"clientName": "WEB", "clientVersion": ver, "hl": "en"}}}).encode()
-    info, err = {}, ""
+    notes, info = [], {}
+    # 1) the way yt-dlp itself talks to YouTube when signed in
     try:
-        with ydl.urlopen(Request(_YT + "/youtubei/v1/account/account_menu?prettyPrint=false", data=body,
-                                 headers=headers, extensions={"timeout": timeout})) as r:
-            info = parse_account_menu(json.loads(r.read().decode("utf-8", "replace")))
+        info = _account_via_ytdlp(ydl, notes)
     except Exception as ex:  # noqa: BLE001
-        err = clean_error(ex)
-    if not info.get("photo"):
+        notes.append(f"start page: {clean_error(ex)[:160]}")
+    # 2) the account switcher (needs only the cookies)
+    if not info.get("name"):
         try:
-            with ydl.urlopen(Request(_YT + "/", headers={"User-Agent": headers["User-Agent"],
-                                                         "Accept-Language": "en"},
-                                     extensions={"timeout": timeout})) as r:
-                photo = parse_home_avatar(r.read().decode("utf-8", "replace"))
-            if photo:
-                info["photo"] = photo
+            with ydl.urlopen(Request(_YT + "/getAccountSwitcherEndpoint",
+                                     headers={"User-Agent": _UA, "Accept-Language": "en-US,en;q=0.8",
+                                              "Referer": _YT + "/"}, extensions={"timeout": timeout})) as r:
+                got = parse_accounts(_json_reply(r.read()))
+            if got.get("name"):
+                info = {**got, "photo": got.get("photo") or info.get("photo", "")}
+            else:
+                notes.append("account switcher: no account in the answer")
         except Exception as ex:  # noqa: BLE001
-            err = err or clean_error(ex)
-    if not info:
-        raise RuntimeError(err or "YouTube didn't say which account this is.")
+            notes.append(f"account switcher: {clean_error(ex)[:160]}")
+    # 3) the account menu, headers built here
+    if not info.get("name"):
+        ver = _web_client_version()
+        headers = {"Content-Type": "application/json", "Origin": _YT, "X-Origin": _YT, "Referer": _YT + "/",
+                   "X-Goog-AuthUser": "0", "X-Youtube-Client-Name": "1", "X-Youtube-Client-Version": ver,
+                   "X-Youtube-Bootstrap-Logged-In": "true", "User-Agent": _UA}
+        auth = _sid_auth(cookies, _YT)
+        if auth:
+            headers["Authorization"] = auth
+        body = json.dumps({"context": {"client": {"clientName": "WEB", "clientVersion": ver, "hl": "en"}}}).encode()
+        try:
+            with ydl.urlopen(Request(_YT + "/youtubei/v1/account/account_menu?prettyPrint=false", data=body,
+                                     headers=headers, extensions={"timeout": timeout})) as r:
+                got = parse_accounts(_json_reply(r.read()))
+            if got.get("name") or got.get("photo"):
+                info = {**info, **{k: v for k, v in got.items() if v}}
+            else:
+                notes.append("account menu (2): no account in the answer")
+        except Exception as ex:  # noqa: BLE001
+            notes.append(f"account menu (2): {clean_error(ex)[:160]}")
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        (APP_DIR / "account_lookup.txt").write_text(
+            time.strftime("%Y-%m-%d %H:%M:%S") + f"  yt-dlp {_ytdlp_version()}\n"
+            + (f"found: name={'yes' if info.get('name') else 'no'}, picture={'yes' if info.get('photo') else 'no'}\n")
+            + "".join(f"- {n}\n" for n in notes), encoding="utf-8")
+    except OSError:
+        pass
+    if not info.get("name") and not info.get("photo"):
+        raise RuntimeError("; ".join(notes) or "YouTube didn't say which account this is.")
     pic = ""
     if info.get("photo"):
         try:
@@ -4981,7 +5053,8 @@ class AccountChip(QtWidgets.QAbstractButton):
         self.acc = {}
         self._pix = None
         self.av = 40 if big else 26
-        self.setCursor(Qt.CursorShape.ArrowCursor if big else Qt.CursorShape.PointingHandCursor)
+        self.busy = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setVisible(False)
 
@@ -4997,7 +5070,8 @@ class AccountChip(QtWidgets.QAbstractButton):
         name, sub = self._lines()
         tipt = f"Signed in to YouTube as {name}" + (f" ({sub})" if sub else "") if self.acc.get("name") else \
             "Signed in to YouTube"
-        self.setToolTip(tip_html("YouTube account", tipt + ("" if self.big else " – click for the Settings.")))
+        more = " – click to look up name and picture again." if self.big else " – click for the Settings."
+        self.setToolTip(tip_html("YouTube account", tipt + more))
         self.updateGeometry()
         self.update()
 
@@ -5005,8 +5079,10 @@ class AccountChip(QtWidgets.QAbstractButton):
         a = self.acc
         name = a.get("name") or "Signed in"
         sub = "  ·  ".join(x for x in (a.get("handle"), a.get("email")) if x)
-        if not a.get("name") and not sub:
-            sub = "YouTube account" if self.big else ""
+        if self.big and self.busy:
+            sub = "Looking up name and picture …"
+        elif not a.get("name") and not sub:
+            sub = "Name and picture not found – click to try again" if self.big else ""
         return name, sub
 
     def sizeHint(self):
@@ -5016,7 +5092,7 @@ class AccountChip(QtWidgets.QAbstractButton):
             bf = QtGui.QFont(self.font())
             bf.setBold(True)
             w = max(QtGui.QFontMetrics(bf).horizontalAdvance(name), fm.horizontalAdvance(sub))
-            return QtCore.QSize(min(self.av + 12 + w + 4, 380), self.av + 4)
+            return QtCore.QSize(min(4 + self.av + 12 + w + 14, 380), self.av + 8)
         return QtCore.QSize(3 + self.av + 8 + min(fm.horizontalAdvance(name), 170) + 10 + 4, 32)
 
     def enterEvent(self, e):
@@ -5032,12 +5108,12 @@ class AccountChip(QtWidgets.QAbstractButton):
         p = QtGui.QPainter(self)
         p.setRenderHint(AA)
         p.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
-        hover = self.underMouse() and not self.big
+        hover = self.underMouse()
         if hover:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QtGui.QColor(c["panel2"]))
-            p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
-        x0 = 2 if self.big else 3
+            p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16 if not self.big else 24, 16 if not self.big else 24)
+        x0 = 4 if self.big else 3
         y0 = (self.height() - self.av) / 2
         r = QtCore.QRectF(x0, y0, self.av, self.av)
         name, sub = self._lines()
@@ -5061,7 +5137,7 @@ class AccountChip(QtWidgets.QAbstractButton):
             p.setBrush(QtGui.QColor("#3ddc84"))
             p.drawEllipse(QtCore.QPointF(r.right() - 3, r.bottom() - 3), 3.2, 3.2)
         tx = r.right() + (12 if self.big else 8)
-        tw = self.width() - tx - (2 if self.big else 10)
+        tw = self.width() - tx - (12 if self.big else 10)
         fm = self.fontMetrics()
         if self.big:
             bf = QtGui.QFont(self.font())
@@ -5305,7 +5381,8 @@ class SettingsDialog(QtWidgets.QDialog):
         right.addWidget(section("YouTube login"))
         self.acc_card = AccountChip(big=True)
         self.acc_card.set_colors(theme_colors(self.main.theme, self.main.accent))
-        right.addWidget(self.acc_card)
+        self.acc_card.clicked.connect(lambda: self.main._refresh_account(force=True))
+        right.addWidget(self.acc_card, 0, Qt.AlignmentFlag.AlignLeft)
         self.lbl_login = label("", "muted")
         self.lbl_login.setWordWrap(True)
         right.addWidget(self.lbl_login)
@@ -6945,6 +7022,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "_acc_busy", False):
             return
         self._acc_busy = True
+        self._acc_card_busy(True)
 
         def work():
             try:
@@ -6953,9 +7031,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.emit("account", ("err", clean_error(ex)))
         threading.Thread(target=work, daemon=True).start()
 
+    def _acc_card_busy(self, on):
+        dlg = getattr(self, "settings_dlg", None)
+        if dlg is not None and hasattr(dlg, "acc_card"):
+            dlg.acc_card.busy = on
+            dlg.acc_card.set_account(self.account)
+
     def _on_account(self, val):
         kind, v = val
         self._acc_busy = False
+        dlg = getattr(self, "settings_dlg", None)
+        if dlg is not None and hasattr(dlg, "acc_card"):
+            dlg.acc_card.busy = False
         if not login_state()["signed_in"]:          # signed out meanwhile
             clear_account()
             self.account = {}
@@ -6964,7 +7051,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if v.get("name"):
                 self._on_log(f"YouTube account: {v['name']}" + (f" ({v['handle']})" if v.get("handle") else ""))
         else:
-            self._on_log(f"Couldn't read the name of the YouTube account ({v}) – the login itself works.")
+            self._on_log(f"Couldn't read name and picture of the YouTube account – {v}")
         self.chip_account.set_account(self.account)
         self._login_state_changed()
 

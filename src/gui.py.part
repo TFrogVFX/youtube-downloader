@@ -1825,7 +1825,8 @@ class AccountChip(QtWidgets.QAbstractButton):
         self.acc = {}
         self._pix = None
         self.av = 40 if big else 26
-        self.setCursor(Qt.CursorShape.ArrowCursor if big else Qt.CursorShape.PointingHandCursor)
+        self.busy = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setVisible(False)
 
@@ -1841,7 +1842,8 @@ class AccountChip(QtWidgets.QAbstractButton):
         name, sub = self._lines()
         tipt = f"Signed in to YouTube as {name}" + (f" ({sub})" if sub else "") if self.acc.get("name") else \
             "Signed in to YouTube"
-        self.setToolTip(tip_html("YouTube account", tipt + ("" if self.big else " – click for the Settings.")))
+        more = " – click to look up name and picture again." if self.big else " – click for the Settings."
+        self.setToolTip(tip_html("YouTube account", tipt + more))
         self.updateGeometry()
         self.update()
 
@@ -1849,8 +1851,10 @@ class AccountChip(QtWidgets.QAbstractButton):
         a = self.acc
         name = a.get("name") or "Signed in"
         sub = "  ·  ".join(x for x in (a.get("handle"), a.get("email")) if x)
-        if not a.get("name") and not sub:
-            sub = "YouTube account" if self.big else ""
+        if self.big and self.busy:
+            sub = "Looking up name and picture …"
+        elif not a.get("name") and not sub:
+            sub = "Name and picture not found – click to try again" if self.big else ""
         return name, sub
 
     def sizeHint(self):
@@ -1860,7 +1864,7 @@ class AccountChip(QtWidgets.QAbstractButton):
             bf = QtGui.QFont(self.font())
             bf.setBold(True)
             w = max(QtGui.QFontMetrics(bf).horizontalAdvance(name), fm.horizontalAdvance(sub))
-            return QtCore.QSize(min(self.av + 12 + w + 4, 380), self.av + 4)
+            return QtCore.QSize(min(4 + self.av + 12 + w + 14, 380), self.av + 8)
         return QtCore.QSize(3 + self.av + 8 + min(fm.horizontalAdvance(name), 170) + 10 + 4, 32)
 
     def enterEvent(self, e):
@@ -1876,12 +1880,12 @@ class AccountChip(QtWidgets.QAbstractButton):
         p = QtGui.QPainter(self)
         p.setRenderHint(AA)
         p.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
-        hover = self.underMouse() and not self.big
+        hover = self.underMouse()
         if hover:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QtGui.QColor(c["panel2"]))
-            p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
-        x0 = 2 if self.big else 3
+            p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16 if not self.big else 24, 16 if not self.big else 24)
+        x0 = 4 if self.big else 3
         y0 = (self.height() - self.av) / 2
         r = QtCore.QRectF(x0, y0, self.av, self.av)
         name, sub = self._lines()
@@ -1905,7 +1909,7 @@ class AccountChip(QtWidgets.QAbstractButton):
             p.setBrush(QtGui.QColor("#3ddc84"))
             p.drawEllipse(QtCore.QPointF(r.right() - 3, r.bottom() - 3), 3.2, 3.2)
         tx = r.right() + (12 if self.big else 8)
-        tw = self.width() - tx - (2 if self.big else 10)
+        tw = self.width() - tx - (12 if self.big else 10)
         fm = self.fontMetrics()
         if self.big:
             bf = QtGui.QFont(self.font())
@@ -2149,7 +2153,8 @@ class SettingsDialog(QtWidgets.QDialog):
         right.addWidget(section("YouTube login"))
         self.acc_card = AccountChip(big=True)
         self.acc_card.set_colors(theme_colors(self.main.theme, self.main.accent))
-        right.addWidget(self.acc_card)
+        self.acc_card.clicked.connect(lambda: self.main._refresh_account(force=True))
+        right.addWidget(self.acc_card, 0, Qt.AlignmentFlag.AlignLeft)
         self.lbl_login = label("", "muted")
         self.lbl_login.setWordWrap(True)
         right.addWidget(self.lbl_login)
@@ -3789,6 +3794,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "_acc_busy", False):
             return
         self._acc_busy = True
+        self._acc_card_busy(True)
 
         def work():
             try:
@@ -3797,9 +3803,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.emit("account", ("err", clean_error(ex)))
         threading.Thread(target=work, daemon=True).start()
 
+    def _acc_card_busy(self, on):
+        dlg = getattr(self, "settings_dlg", None)
+        if dlg is not None and hasattr(dlg, "acc_card"):
+            dlg.acc_card.busy = on
+            dlg.acc_card.set_account(self.account)
+
     def _on_account(self, val):
         kind, v = val
         self._acc_busy = False
+        dlg = getattr(self, "settings_dlg", None)
+        if dlg is not None and hasattr(dlg, "acc_card"):
+            dlg.acc_card.busy = False
         if not login_state()["signed_in"]:          # signed out meanwhile
             clear_account()
             self.account = {}
@@ -3808,7 +3823,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if v.get("name"):
                 self._on_log(f"YouTube account: {v['name']}" + (f" ({v['handle']})" if v.get("handle") else ""))
         else:
-            self._on_log(f"Couldn't read the name of the YouTube account ({v}) – the login itself works.")
+            self._on_log(f"Couldn't read name and picture of the YouTube account – {v}")
         self.chip_account.set_account(self.account)
         self._login_state_changed()
 

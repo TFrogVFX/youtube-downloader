@@ -1,8 +1,8 @@
 {
-  "version": "2.9.0",
+  "version": "2.9.1",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "545cbeed4e68169c03f5692786de081276990a4dfc0b1397f3bec889db432efd",
-  "notes": "Update button lights up when a new version is out (checked at every start and every 2 hours, no more 5-minute delay). Signed in: your YouTube profile picture and name in the top right and in the Settings. Preview: downloading a small copy is the standard now, streaming is an option in the Settings. Frame: 4:3 instead of 3:4, plus Custom – any shape, pull corners and sides or type the size in px. Tabs that can't be used are hidden (Volume for GIFs, Frame for audio).",
+  "sha256": "12a1166bb1e9b69135c703053fc41778be4538a1e8e8e3ef19e0f8ad8f732713",
+  "notes": "Account picture and name: looked up the way yt-dlp itself talks to YouTube, with two more ways if that fails. Click the account in the Settings to look it up again. What went wrong is written to account_lookup.txt.",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
