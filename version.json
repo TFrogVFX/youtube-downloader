@@ -1,8 +1,8 @@
 {
-  "version": "2.9.5",
+  "version": "2.9.6",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "bccb5e75dab27c99c7bbe71a7354a598c70500ba615c275ad7a539988b9016bd",
-  "notes": "If YouTube offers no video with your login (“Requested format is not available”), the app loads it once more without the login and tells you.",
+  "sha256": "587b0b42a0a4befb60b5cc92cfef415c6bf3898818cf01f08af2d350fc140637",
+  "notes": "The “Update yt-dlp” button lights up red when a new yt-dlp is out (checked at start and every 2 hours), and asks for a restart once it's installed.",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

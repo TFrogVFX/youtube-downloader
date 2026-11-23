@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.5"
+APP_VERSION = "2.9.6"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -2918,6 +2918,23 @@ def parse_home_avatar(html: str) -> str:
             pass
     m = re.search(r'"(https://yt\d\.(?:ggpht|googleusercontent)\.com/[^"\\]+)"', seg)
     return re.sub(r"=s\d+-", "=s176-", m.group(1)) if m else ""
+
+
+def ytdlp_versions(timeout=10.0) -> dict:
+    """{'installed': on disk, 'loaded': running in the app, 'latest': on PyPI (None if not reachable)}"""
+    import importlib.metadata
+    try:
+        installed = importlib.metadata.version("yt-dlp")
+    except Exception:  # noqa: BLE001
+        installed = None
+    loaded = installed
+    if "yt_dlp.version" in sys.modules:
+        loaded = getattr(sys.modules["yt_dlp.version"], "__version__", installed)
+    try:
+        latest = json.loads(fetch_bytes("https://pypi.org/pypi/yt-dlp/json", timeout=timeout))["info"]["version"]
+    except Exception:  # noqa: BLE001
+        latest = None
+    return {"installed": installed, "loaded": loaded, "latest": latest}
 
 
 def _ytdlp_version() -> str:
@@ -6628,7 +6645,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(3000, lambda: self._check_app_update(manual=False))
         self._app_upd_timer = QtCore.QTimer(self)
         self._app_upd_timer.setInterval(2 * 3600 * 1000)
-        self._app_upd_timer.timeout.connect(lambda: self._check_app_update(manual=False))
+        self._app_upd_timer.timeout.connect(lambda: (self._check_app_update(manual=False), self._check_ytdlp()))
+        QtCore.QTimer.singleShot(4500, self._check_ytdlp)
         self._app_upd_timer.start()
 
     # ------------------------------------------------------------------ layout
@@ -9334,6 +9352,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_updated(self, ok):
         self.update_done.set()
         self.btn_upd.setEnabled(True)
+        self._check_ytdlp()
         if ok:
             self.cfg["last_update"] = time.time()
             save_cfg(self.cfg)
@@ -9785,9 +9804,36 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._on_error(f"Please start the app again ({ex}).")
         QtCore.QTimer.singleShot(150, lambda: os._exit(0))
 
+    def _check_ytdlp(self):
+        """Is there a newer yt-dlp (or one waiting for a restart)? -> the button lights up."""
+        threading.Thread(target=lambda: self.emit("ytdlp_ver", ytdlp_versions()), daemon=True).start()
+
+    def _on_ytdlp_ver(self, v):
+        self._ytdlp_v = v
+        inst, loaded, latest = v.get("installed"), v.get("loaded"), v.get("latest")
+        if latest and inst and _ver(latest) > _ver(inst):
+            self.btn_upd.setText(f"●  Update yt-dlp to {latest}")
+            set_state(self.btn_upd, "new")
+            tip(self.btn_upd, f"yt-dlp {latest} is out", f"You have {inst}. Click to update – takes a few seconds.")
+        elif inst and loaded and _ver(inst) > _ver(loaded):
+            self.btn_upd.setText(f"●  Restart for yt-dlp {inst}")
+            set_state(self.btn_upd, "new")
+            tip(self.btn_upd, "Restart", f"yt-dlp {inst} is installed – it works after restarting the app "
+                                         "(click to restart now).")
+        else:
+            self.btn_upd.setText("Update yt-dlp")
+            set_state(self.btn_upd, "")
+            tip(self.btn_upd, "Update yt-dlp", f"yt-dlp {inst or ''} is up to date. It does the YouTube part – if "
+                                               "downloads suddenly fail, an update usually helps.")
+        self.btn_upd.updateGeometry()
+
     def _run_update(self, manual=False):
         if manual and self.busy:
             return
+        v = getattr(self, "_ytdlp_v", None) or {}
+        if manual and v.get("installed") and v.get("loaded") and _ver(v["installed"]) > _ver(v["loaded"]) \
+                and not (v.get("latest") and _ver(v["latest"]) > _ver(v["installed"])):
+            return self._restart()
         self.update_done.clear()
         self.btn_upd.setEnabled(False)
         self._on_status("Checking for yt-dlp update …")
