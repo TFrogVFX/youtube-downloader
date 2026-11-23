@@ -31,12 +31,14 @@ Only needed for age-restricted, members-only or Premium videos. Two ways in **Se
 
 The login is stored encrypted with Windows' own protection (readable only by your Windows user on this PC) and handed to yt-dlp in memory. Tip: a second Google account is the safest choice.
 
-## AI upscaling (optional)
+## AI upscaling for pictures (optional)
 
-Output → **Upscale** 2× / 4× with an **AI model**: *Normal* (Real-ESRGAN), *Anime – fast* (Real-ESRGAN anime) or
-*Anime – best* (Real-CUGAN). Used for the video, **Save frame** and the thumbnail. The upscaler is downloaded the first
-time (≈ 45 MB, checksum checked) and runs on any graphics card with Vulkan (NVIDIA / AMD / Intel).
-Settings → **AI upscalers** shows the installed versions and offers an update when a newer build is out.
+The **✦ AI** button next to *Save frame* makes frames and thumbnails 2× or 4× bigger (videos stay as they are).
+Models: **UltraSharp** (Kim2091), **Siax** (NMKD, large), **Nomos8kSC** (Phhofm), Real-ESRGAN for films and photos;
+**Real-CUGAN Pro**, **HFA2k** (Phhofm), Real-ESRGAN anime for anime. Everything is downloaded on first use (checksums
+checked; ncnn files from the Upscayl project) and runs on any graphics card with Vulkan (NVIDIA / AMD / Intel).
+Settings → **AI upscalers** shows versions, updates and lets you download or remove models.
+Note: some models have their own licenses (UltraSharp: CC BY-NC-SA 4.0 – non-commercial).
 
 ## Repair
 

@@ -1,8 +1,8 @@
 {
-  "version": "2.9.8",
+  "version": "2.9.9",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "fc9c512e9692006168b880da80c3533658032b0d906718b9837ec6deddc70f73",
-  "notes": "Signed in (e.g. Premium) but YouTube offers no video: other YouTube clients are tried with the login first (and remembered); login_debug.txt for diagnosis",
+  "sha256": "73f1f25e0c153cbe8406c25e9550ac1421e7e79be57058d0eb55534516ecd8e3",
+  "notes": "AI upscaling only for Save frame / thumbnails with big models (UltraSharp, Siax, Nomos8kSC, HFA2k, Real-CUGAN Pro); preview source + stream quality switchable in the preview; header shows only the profile when signed in",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",

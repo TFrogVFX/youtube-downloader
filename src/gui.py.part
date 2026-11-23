@@ -133,6 +133,16 @@ QPushButton#chip {{ background: {c['panel2']}; border: 1px solid {c['border']}; 
     padding: 4px 12px; font-size: 12px; min-height: 16px; }}
 QPushButton#chip:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
 QPushButton#chip:disabled {{ color: {c['muted']}; }}
+QPushButton#chip[state="on"] {{ border-color: {c['accent']}; color: {c['accent']}; }}
+QPushButton#srcChip {{ background: transparent; border: none; color: {c['muted']}; padding: 2px 4px; font-size: 12px; }}
+QPushButton#srcChip:hover {{ color: {c['accent']}; }}
+QPushButton#srcChip:disabled {{ color: {c['muted']}; }}
+QMenu {{ background: {c['panel2']}; border: 1px solid {c['border']}; border-radius: 10px; padding: 6px; }}
+QMenu::item {{ padding: 6px 22px 6px 26px; border-radius: 6px; color: {c['text']}; }}
+QMenu::item:selected {{ background: {c['accent']}; color: {c['on_accent']}; }}
+QMenu::item:disabled {{ color: {c['muted']}; }}
+QMenu::separator {{ height: 1px; background: {c['border']}; margin: 5px 8px; }}
+QMenu::indicator {{ width: 12px; height: 12px; left: 8px; }}
 QFrame#segmented {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 12px; }}
 QFrame#segInd {{ background: {c['accent']}; border: none; border-radius: 9px; }}
 QPushButton#segBtn {{ background: transparent; border: none; color: {c['muted']}; padding: 9px 10px; font-weight: 600; }}
@@ -2559,6 +2569,8 @@ class SettingsDialog(QtWidgets.QDialog):
         latest = QtCore.Signal(str, object)
         prog = QtCore.Signal(str, float)
         done = QtCore.Signal(str, str)
+        mprog = QtCore.Signal(str, float)
+        mdone = QtCore.Signal(str, str)
 
     def _build_ai_rows(self, lay):
         """One line per upscaler: version, newer one on GitHub? Install / Update / Remove."""
@@ -2567,6 +2579,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.ai_sig.prog.connect(lambda k, v: self._ai_show(k, f"downloading … {v:.0f} %"))
         self.ai_sig.done.connect(self._ai_done)
         self.ai_rows, self.ai_latest, self.ai_busy = {}, {}, set()
+        self.mf_rows = {}
+        self.ai_sig.mprog.connect(lambda k, v: self._mf_show(k, f"downloading … {v:.0f} %"))
+        self.ai_sig.mdone.connect(self._mf_done)
         for key, e in ENGINES.items():
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(8)
@@ -2593,6 +2608,32 @@ class SettingsDialog(QtWidgets.QDialog):
             lay.addLayout(row)
             self.ai_rows[key] = (st, act, rem)
             self._ai_show(key)
+        for key, f in AI_FILES.items():
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            lab = next((k for k, v in AI_MODELS.items() if v[2] == key), f["name"])
+            name = tip(label(lab, "field"), f["name"], AI_MODELS.get(lab, ("", "", "", ""))[3]
+                       + " Runs with Real-ESRGAN.")
+            st = label("", "hint")
+            st.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+            col = QtWidgets.QVBoxLayout()
+            col.setSpacing(1)
+            col.addWidget(name)
+            col.addWidget(st)
+            act = QtWidgets.QPushButton("Download")
+            act.setObjectName("ghost")
+            act.setCursor(Qt.CursorShape.PointingHandCursor)
+            act.clicked.connect(lambda _=False, k=key: self._mf_install(k))
+            rem = QtWidgets.QPushButton("Remove")
+            rem.setObjectName("ghost")
+            rem.setCursor(Qt.CursorShape.PointingHandCursor)
+            rem.clicked.connect(lambda _=False, k=key: self._mf_remove(k))
+            row.addLayout(col, 1)
+            row.addWidget(act)
+            row.addWidget(rem)
+            lay.addLayout(row)
+            self.mf_rows[key] = (st, act, rem)
+            self._mf_show(key)
 
         def check():
             for k in ENGINES:
@@ -2661,6 +2702,42 @@ class SettingsDialog(QtWidgets.QDialog):
         else:
             self.main._on_log(f"✓ {ENGINES[key]['name']} {engine_version(key)} installed.")
             self._ai_show(key)
+        self.main._ai_changed()
+
+    def _mf_show(self, key, busy=None):
+        st, act, rem = self.mf_rows[key]
+        f = AI_FILES[key]
+        if busy:
+            st.setText(busy)
+            act.setVisible(False)
+            rem.setVisible(False)
+            return
+        ok = ai_file_ok(key)
+        st.setText(f"model · {f['mb']} MB on disk" if ok else f"not downloaded · ≈ {f['mb']} MB")
+        act.setVisible(not ok)
+        rem.setVisible(ok)
+
+    def _mf_install(self, key):
+        self._mf_show(key, "downloading …")
+
+        def work():
+            try:
+                install_ai_file(key, progress=lambda v: self.ai_sig.mprog.emit(key, v))
+                self.ai_sig.mdone.emit(key, "")
+            except Exception as ex:  # noqa: BLE001
+                self.ai_sig.mdone.emit(key, clean_error(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mf_done(self, key, err):
+        self._mf_show(key)
+        if err:
+            self.mf_rows[key][0].setText("✕ " + err.splitlines()[0][:160])
+            self.main._on_log(f"✕ {AI_FILES[key]['name']}: {err}")
+        self.main._ai_changed()
+
+    def _mf_remove(self, key):
+        remove_ai_file(key)
+        self._mf_show(key)
         self.main._ai_changed()
 
     def _ai_remove(self, key):
@@ -3064,8 +3141,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_still.clicked.connect(self._save_still)
         tr2.addSpacing(6)
         tr2.addWidget(self.btn_still)
+        self.ai_factor, self.ai_model = None, DEFAULT_AI_MODEL
+        self.btn_ai = QtWidgets.QPushButton("✦ AI upscale: off")
+        self.btn_ai.setObjectName("chip")
+        self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ai.clicked.connect(self._ai_menu)
+        tr2.addWidget(self.btn_ai)
         tr2.addStretch(1)
-        self.lbl_pv_src = label("", "ptime")
+        self.lbl_pv_src = QtWidgets.QPushButton("")
+        self.lbl_pv_src.setObjectName("srcChip")
+        self.lbl_pv_src.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_pv_src.clicked.connect(self._pv_src_menu)
         tr2.addWidget(self.lbl_pv_src)
         tv.addLayout(tr2)
         self.transport.hide()
@@ -3379,43 +3465,79 @@ class MainWindow(QtWidgets.QMainWindow):
         self.size_hint = label("", "hint")
         self.size_hint.setWordWrap(True)
         g.addWidget(self.size_hint, 4, 1, 1, 3)
-        h_ai = ("Makes the picture bigger with AI – for the video, Save frame and Save thumbnail. The first time, the "
-                "upscaler is downloaded (≈ 45 MB). Needs a graphics card with Vulkan (NVIDIA, AMD or Intel).")
-        h_model = "Which AI: normal footage or anime. Hover over the entries for details."
-        self.cb_ai = self._combo(AI_UPSCALES, "Upscale", h_ai)
-        self.cb_ai_model = self._combo(AI_MODELS, "AI model", h_model)
-        self.lbl_ai_model = self._field("AI model", "AI model", h_model)
-        self.cb_ai.currentTextChanged.connect(lambda _t: self._ai_changed())
-        self.cb_ai_model.currentTextChanged.connect(lambda _t: self._ai_changed())
-        g.addWidget(self._field("Upscale", "Upscale", h_ai), 5, 0)
-        g.addWidget(self.cb_ai, 5, 1, 1, 3)
-        g.addWidget(self.lbl_ai_model, 6, 0)
-        g.addWidget(self.cb_ai_model, 6, 1, 1, 3)
-        self.ai_hint = tip(label("", "hint"), "AI upscaling", "Videos take a while: every frame is redrawn by the AI. "
-                                                              "Pictures take a few seconds.")
-        g.addWidget(self.ai_hint, 7, 1, 1, 3)
+        g.setRowStretch(5, 1)       # spare height goes below, not between the rows
         return w
 
+    # ------------------------------------------------------------------ AI upscaling (pictures only)
     def _ai(self):
-        """{'factor', 'model'} or None – for the video, Save frame and Save thumbnail."""
-        f = AI_UPSCALES.get(self.cb_ai.currentText())
-        return {"factor": f, "model": self.cb_ai_model.currentText()} if f else None
+        """{'factor', 'model'} or None – for Save frame and Save thumbnail."""
+        return {"factor": self.ai_factor, "model": self.ai_model} if self.ai_factor else None
 
     def _ai_changed(self):
+        b = getattr(self, "btn_ai", None)
+        if b is None:
+            return
         ai = self._ai()
-        self.cb_ai_model.setVisible(bool(ai))
-        self.lbl_ai_model.setVisible(bool(ai))
+        b.setText(f"✦ AI {ai['factor']}× · {ai['model'].split(' –')[0]}" if ai else "✦ AI upscale: off")
+        set_state(b, "on" if ai else "")
+        self._ai_tip()
+
+    def _ai_tip(self):
+        ai = self._ai()
+        need = []
         if ai:
-            eng = AI_MODELS[ai["model"]][0]
-            got = engine_exe(eng) is not None
-            self.ai_hint.setText("Also for Save frame + thumbnail" + ("" if got else f" · first use loads ≈ "
-                                                                                  f"{ENGINES[eng]['mb']} MB"))
-        self.ai_hint.setVisible(bool(ai))
-        if hasattr(self, "tabstack"):
-            self._fit_stack(self.stack)
-            self._fit_stack(self.tabstack)
-        if hasattr(self, "_frame_info"):
-            self._frame_info()
+            plan = ai_plan(ai["model"], ai["factor"])
+            if not engine_exe(plan["engine"]):
+                need.append(f"{ENGINES[plan['engine']]['name']} ≈ {ENGINES[plan['engine']]['mb']} MB")
+            if plan["file"] and not ai_file_ok(plan["file"]):
+                need.append(f"model ≈ {AI_FILES[plan['file']]['mb']} MB")
+        tip(self.btn_ai, "AI upscaling for pictures",
+            "Makes Save frame and Save thumbnail bigger and sharper with AI (videos stay as they are). Click to pick "
+            "the size and the model." + (f" Downloaded once on first use: {', '.join(need)}." if need else "")
+            + " Needs a graphics card with Vulkan (NVIDIA, AMD or Intel).")
+
+    def _ai_menu(self):
+        m = QtWidgets.QMenu(self)
+        m.setToolTipsVisible(True)
+        hdr = m.addAction("Size")
+        hdr.setEnabled(False)
+        g1 = QtGui.QActionGroup(m)
+        for lab, f in AI_UPSCALES.items():
+            a = m.addAction(lab if f else "Off (normal size)")
+            a.setCheckable(True)
+            a.setChecked(f == self.ai_factor)
+            a.setActionGroup(g1)
+            a.triggered.connect(lambda _=False, f=f: self._set_ai(factor=f))
+        g2 = QtGui.QActionGroup(m)
+        for i, (lab, (eng, _model, fk, hlp)) in enumerate(AI_MODELS.items()):
+            if i in (0, 4):
+                m.addSeparator()
+                h = m.addAction("Photos, films, games" if i == 0 else "Anime, drawings")
+                h.setEnabled(False)
+            miss = (fk and not ai_file_ok(fk)) or not engine_exe(eng)
+            size = (AI_FILES[fk]["mb"] if fk and not ai_file_ok(fk) else 0) + \
+                   (0 if engine_exe(eng) else ENGINES[eng]["mb"])
+            a = m.addAction(lab + (f"   ↓ {size} MB" if miss else ""))
+            a.setToolTip(hlp)
+            a.setCheckable(True)
+            a.setChecked(lab == self.ai_model)
+            a.setActionGroup(g2)
+            a.triggered.connect(lambda _=False, lab=lab: self._set_ai(model=lab))
+        m.addSeparator()
+        m.addAction("Models and updates in Settings …").triggered.connect(self._settings)
+        m.exec(self.btn_ai.mapToGlobal(QtCore.QPoint(0, self.btn_ai.height() + 2)))
+
+    def _set_ai(self, factor=0, model=None):
+        if factor != 0:
+            self.ai_factor = factor
+        if model:
+            self.ai_model = model
+            if not self.ai_factor:
+                self.ai_factor = 4
+        self.cfg["ai_up"] = next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor)
+        self.cfg["ai_model"] = self.ai_model
+        save_cfg(self.cfg)
+        self._ai_changed()
 
     def _page_audio(self):
         w, g = self._grid()
@@ -4404,11 +4526,11 @@ class MainWindow(QtWidgets.QMainWindow):
         after a sign-in or when it's older than half a day."""
         if not login_state()["signed_in"]:
             self.account = {}
-            self.chip_account.set_account({})
+            self._head_account({})
             return
         acc = load_account()
         self.account = {"signed_in": True, **acc}
-        self.chip_account.set_account(self.account)
+        self._head_account(self.account)
         if not force and acc and time.time() - float(acc.get("checked") or 0) < 12 * 3600:
             return
         if getattr(self, "_acc_busy", False):
@@ -4444,13 +4566,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._on_log(f"YouTube account: {v['name']}" + (f" ({v['handle']})" if v.get("handle") else ""))
         else:
             self._on_log(f"Couldn't read name and picture of the YouTube account – {v}")
-        self.chip_account.set_account(self.account)
+        self._head_account(self.account)
         self._login_state_changed()
 
     def _login_state_changed(self):
         if not login_state()["signed_in"] and self.account:
             self.account = {}
-            self.chip_account.set_account({})
+            self._head_account({})
         dlg = getattr(self, "settings_dlg", None)
         if dlg is not None:
             dlg.show_login_state()
@@ -4473,7 +4595,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "vol": [tuple(q) for q in self.vol_pts] if mode in ("mp4", "mp3") else [],
             "subs": {"cues": self.sub_cues, "mode": None if sub_mode == "none" else sub_mode,
                      "lang": self.sub_lang, "style": dict(self.sub_style)} if self.sub_cues else None,
-            "ai": self._ai() if mode == "mp4" else None,
         }
         return fx
 
@@ -4494,9 +4615,12 @@ class MainWindow(QtWidgets.QMainWindow):
         pick(self.cb_quality, "quality", QUALITIES, DEFAULT_QUALITY)
         pick(self.cb_size, "size", SIZES, DEFAULT_SIZE)
         pick(self.cb_encoder, "encoder", ENCODERS, DEFAULT_ENCODER)
-        pick(self.cb_ai, "ai_up", AI_UPSCALES, "No upscaling")
-        pick(self.cb_ai_model, "ai_model", AI_MODELS, "Normal (Real-ESRGAN)")
+        self.ai_factor = AI_UPSCALES.get(c.get("ai_up"))
+        self.ai_model = c.get("ai_model") if c.get("ai_model") in AI_MODELS else DEFAULT_AI_MODEL
         self._ai_changed()
+        if hasattr(self, "tabstack"):
+            self._fit_stack(self.stack)
+            self._fit_stack(self.tabstack)
         pick(self.cb_afmt, "audio_format", AUDIO_FORMATS, DEFAULT_AUDIO)
         pick(self.cb_mp3, "mp3_quality", MP3_QUALITIES, DEFAULT_MP3)
         pick(self.cb_gif_w, "gif_width", GIF_WIDTHS, "480 px")
@@ -4537,7 +4661,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.update(
             quality=self.cb_quality.currentText(), size=self.cb_size.currentText(),
             encoder=self.cb_encoder.currentText(), mp3_quality=self.cb_mp3.currentText(),
-            ai_up=self.cb_ai.currentText(), ai_model=self.cb_ai_model.currentText(),
+            ai_up=next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor), ai_model=self.ai_model,
             codec=self.cb_codec.currentText(), audio_format=self.cb_afmt.currentText(),
             tooltips=self.tip_filter.enabled,
             gif_width=self.cb_gif_w.currentText(), gif_fps=self.cb_gif_fps.currentText(),
@@ -5068,6 +5192,72 @@ class MainWindow(QtWidgets.QMainWindow):
     def _pv_mode(self):
         return self.cfg.get("preview_mode", "download")
 
+    def _head_account(self, acc):
+        """Signed in: only the profile is in the header (a click opens the Settings); else the Settings button."""
+        self.chip_account.set_account(acc)
+        self.btn_settings.setVisible(not acc)
+
+    def _stream_q(self):
+        q = self.cfg.get("stream_q", "auto")
+        return q if q == "auto" else int(q)
+
+    def _cur_stream(self):
+        sts = self.info.get("streams") or {}
+        return sts.get(self._stream_q()) or sts.get("auto") or self.info.get("stream")
+
+    def _pv_src_menu(self):
+        """Click on 'streaming from YouTube' / 'preview copy': switch the preview right here."""
+        if self._pv_kind not in ("stream", "copy") or not self._is_info_current() or self.info.get("local"):
+            return
+        m = QtWidgets.QMenu(self)
+        sts = self.info.get("streams") or {}
+        h = m.addAction("Stream from YouTube")
+        h.setEnabled(False)
+        grp = QtGui.QActionGroup(m)
+        can = self._can_stream()
+        auto_h = ((sts.get("auto") or {}).get("video") or {}).get("height")
+        for q in ["auto", *[k for k in sts if k != "auto"]]:
+            a = m.addAction("Auto" + (f" ({auto_h}p)" if auto_h else "") if q == "auto" else f"{q}p")
+            a.setCheckable(True)
+            a.setChecked(self._pv_kind == "stream" and q == self._stream_q())
+            a.setEnabled(can)
+            a.setActionGroup(grp)
+            a.triggered.connect(lambda _=False, q=q: self._switch_preview("stream", q))
+        m.addSeparator()
+        a = m.addAction(f"Download small copy ({preview_height(self.info.get('duration'))}p)")
+        a.setCheckable(True)
+        a.setChecked(self._pv_kind == "copy")
+        a.setActionGroup(grp)
+        a.triggered.connect(lambda: self._switch_preview("download"))
+        m.exec(self.lbl_pv_src.mapToGlobal(QtCore.QPoint(0, self.lbl_pv_src.height() + 2)))
+
+    def _switch_preview(self, mode, q=None):
+        """Changes the preview source and quality, stays at the same spot."""
+        pos = self._player_pos() or 0.0
+        self.cfg["preview_mode"] = mode
+        if q is not None:
+            self.cfg["stream_q"] = q
+        save_cfg(self.cfg)
+        if getattr(self, "settings_dlg", None) is not None:
+            try:
+                self.settings_dlg.seg_pv.set_value(mode)
+            except Exception:  # noqa: BLE001 - dialog closed / no such control
+                pass
+        self._stop_playback()
+        self._resume_at = pos
+        url = self.info_url
+        if mode == "stream" and self._can_stream(url):
+            self._start_stream()
+        elif url in self._pv_cache and Path(self._pv_cache[url]).exists():
+            self._load_player(self._pv_cache[url], True, kind="copy")
+        else:
+            kept = find_preview(self.info)
+            if kept is not None:
+                self._pv_cache[url] = str(kept)
+                self._load_player(str(kept), True, kind="copy")
+            else:
+                self._load_preview()
+
     def _can_stream(self, url=None):
         url = url or self.info_url
         return bool(self.info.get("stream")) and url not in self._stream_failed
@@ -5114,7 +5304,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toggle_play()
 
     def _start_stream(self):
-        st = self.info.get("stream")
+        st = self._cur_stream()
         if not st:
             return self._load_preview()
         try:
@@ -5201,15 +5391,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport.show()
         self.vview.show_video(has_video)
         site = "YouTube"
-        self.lbl_pv_src.setText({"stream": f"streaming from {site}", "copy": "preview copy (360p)",
-                                 "file": "your file"}.get(kind, ""))
+        sh = ((self._cur_stream() or {}).get("video") or {}).get("height") if kind == "stream" else None
+        ch = preview_height(self.info.get("duration")) if kind == "copy" else None
+        self.lbl_pv_src.setText({"stream": f"streaming from {site}" + (f" · {sh}p" if sh else "") + "  ▾",
+                                 "copy": f"preview copy ({ch}p)  ▾", "file": "your file"}.get(kind, ""))
+        self.lbl_pv_src.setEnabled(kind != "file")
         tip(self.lbl_pv_src, "Preview source", {
             "stream": f"Played straight from {site} through the app – nothing is downloaded for the preview. "
-                      "Switch to a downloaded copy in Settings.",
-            "copy": "A small 360p copy, only for the preview – your download uses the quality you pick.",
+                      "Click to pick the quality or switch to a downloaded copy.",
+            "copy": "A small copy, only for the preview – your download uses the quality you pick. Click to "
+                    "stream from YouTube instead.",
             "file": "Your own file is played directly."}.get(kind, ""))
+        resume = getattr(self, "_resume_at", None)
+        self._resume_at = None
         rng = self._cur_range()
-        if rng and rng[0] > 0:
+        if resume:
+            self._seek_to(resume)
+        elif rng and rng[0] > 0:
             self._seek_to(rng[0])
 
     def _on_mstatus(self, st):

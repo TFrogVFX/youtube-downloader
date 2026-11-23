@@ -138,8 +138,7 @@ def fx_needed(kind, fx) -> bool:
     """Does this export need the extra encode step (crop, size, volume curve, subtitles in the picture)?"""
     if not fx:
         return False
-    ai = (fx.get("ai") or {}).get("factor")
-    if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and (fx.get("up") or ai))):
+    if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
         return True
     if kind in ("mp4", "mp3") and any(abs(float(p[1]) - 1.0) > 1e-4 for p in fx.get("vol") or []):
         return True
@@ -502,15 +501,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                 crops.append(crop_rect(boxes[k], inf["width"], inf["height"], aspect) if aspect else None)
             cw, ch = (crops[0][0], crops[0][1]) if aspect else (infos[0]["width"], infos[0]["height"])
             W, H = target_dims(cw, ch, fx.get("up") if kind == "mp4" else None, aspect)
-            ai = fx.get("ai") if kind == "mp4" else None
-            if ai and ai.get("factor"):
-                f = int(ai["factor"])
-                W, H = _even(cw * f), _even(ch * f)
-                for j, (p, cr) in enumerate(zip(ps, crops)):
-                    ps[j] = ai_upscale_video(p, cr, (W, H), ai.get("model"), f, tmp, f"{gi}_{j}", ffmpeg=ffmpeg,
-                                             ffprobe=ffprobe, emit=gemit)
-                    crops[j] = None
-                infos = [media_info(p, ffprobe) for p in ps]
             segs, off = [], 0.0
             for k, inf in zip(g, infos):
                 segs.append((clips[k][0], clips[k][1], off))
@@ -558,14 +548,78 @@ ENGINES = {
                "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
                       "realesrgan-ncnn-vulkan-20220424-windows.zip",
                "sha256": "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d",
-               "about": "normal footage + anime (fast)"},
+               "about": "UltraSharp, Siax, Nomos8kSC, HFA2k and the classic models"},
     "cugan": {"name": "Real-CUGAN", "repo": "nihui/realcugan-ncnn-vulkan", "exe": "realcugan-ncnn-vulkan",
               "asset": r"^realcugan-ncnn-vulkan-(\d{8})-windows\.zip$", "version": "20220728", "mb": 44,
               "url": "https://github.com/nihui/realcugan-ncnn-vulkan/releases/download/20220728/"
                      "realcugan-ncnn-vulkan-20220728-windows.zip",
               "sha256": "c6e08d46c11704b1e3a1ada9ddd591cb5005f52f132136c8633ba25def400e01",
-              "about": "anime (best)"},
+              "about": "anime – Real-CUGAN Pro"},
 }
+
+
+_UPS = "https://raw.githubusercontent.com/upscayl/upscayl/a00d55fee90e0f9435d5eaa86e76700df8199af8/resources/models/"
+_CUS = "https://raw.githubusercontent.com/upscayl/custom-models/4b6d2cfa59c7442af115dfc6e50fd8d7d40b96ef/models/"
+# Extra models for Real-ESRGAN (ncnn files, converted by the Upscayl project); downloaded when first used.
+AI_FILES = {
+    "ultrasharp": {"name": "UltraSharp", "model": "ultrasharp-4x", "base": _UPS, "mb": 32,
+                   "param": "0136ca83686809a8f17f7111f11b951e8db93610e24b7f4137c9ffe4dbc4a806",
+                   "bin": "fb3e279d40d4cddb44db4e684d59e68d0aa39852c8cc14dc3f23ccc7e6eee9c1"},
+    "siax": {"name": "Siax (large)", "model": "4x_NMKD-Siax_200k", "base": _CUS, "mb": 64,
+             "param": "519bffb4912e295155d3cb5d6a29639d217ccca55f80962d8f677ef777a65b7a",
+             "bin": "b2abdffa30fb15be752ac681e0c0edf8b543745c33a989aadc9d7d3394dd3110"},
+    "nomos": {"name": "Nomos8kSC", "model": "4xNomos8kSC", "base": _CUS, "mb": 32,
+              "param": "4576ed5c2fc5fa250d3c3d585ef02248f26abdfc1867088078f501fe71e5d61e",
+              "bin": "da16e3880d87b177b7c6b659bbd880f8a101b868eb9ebc08d69eaa6d3edc4517"},
+    "hfa2k": {"name": "HFA2k", "model": "4xHFA2k", "base": _CUS, "mb": 32,
+              "param": "4576ed5c2fc5fa250d3c3d585ef02248f26abdfc1867088078f501fe71e5d61e",
+              "bin": "8a135402b4f39286121b76abb47601a6b7b7e8d4f3e999a5aaa45ed277824fb4"},
+}
+MODELS_DIR = UPSCALE_DIR / "models"     # the folder name must contain "models" for realesrgan-ncnn-vulkan
+
+
+def ai_file_ok(key) -> bool:
+    m = AI_FILES[key]["model"]
+    return (MODELS_DIR / f"{m}.param").is_file() and (MODELS_DIR / f"{m}.bin").is_file()
+
+
+def install_ai_file(key, progress=None) -> None:
+    """Downloads one extra model (.param + .bin, both checked against their SHA-256)."""
+    import hashlib
+    import urllib.request
+    f = AI_FILES[key]
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    total = f["mb"] * 1048576
+    done = 0
+    for ext in ("param", "bin"):
+        dst = MODELS_DIR / f"{f['model']}.{ext}"
+        part = dst.with_suffix(f".{ext}.part")
+        h = hashlib.sha256()
+        req = urllib.request.Request(f["base"] + f"{f['model']}.{ext}", headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as out:
+                while True:
+                    chunk = r.read(1 << 18)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(min(99.0, done / total * 100))
+            if h.hexdigest() != f[ext]:
+                raise RuntimeError(f"The model {f['name']} is damaged (checksum does not match) – please try again.")
+            os.replace(part, dst)
+        finally:
+            part.unlink(missing_ok=True)
+    if progress:
+        progress(100.0)
+
+
+def remove_ai_file(key) -> None:
+    m = AI_FILES[key]["model"]
+    for ext in ("param", "bin"):
+        (MODELS_DIR / f"{m}.{ext}").unlink(missing_ok=True)
 
 
 def engine_dir(key) -> Path:
@@ -681,21 +735,20 @@ def ensure_engine(key, emit) -> Path:
     return install_engine(key, progress=lambda p: emit("progress", p))
 
 
-def ai_plan(model_label, factor, video) -> dict:
-    """What runs for this model and factor: {'engine', 'args', 'native', 'name'}."""
-    engine, kind = AI_MODELS.get(model_label, ("esrgan", "normal"))
+def ai_plan(model_label, factor, video=False) -> dict:
+    """What runs for this model and factor: {'engine', 'args', 'native', 'name', 'file'}."""
+    engine, model, file_key, _h = AI_MODELS.get(model_label) or AI_MODELS[DEFAULT_AI_MODEL]
+    name = model_label.split(" –")[0]
     if engine == "cugan":
-        native = 2 if factor <= 2 else 4
-        n = "-1" if native in (2, 3, 4) else "0"
-        return {"engine": "cugan", "native": native, "name": "Real-CUGAN",
-                "args": ["-s", str(native), "-n", n, "-m", "models-se"]}
-    if kind == "anime" and video:
-        native = 2 if factor <= 2 else 4
-        return {"engine": "esrgan", "native": native, "name": "Real-ESRGAN anime video",
-                "args": ["-n", "realesr-animevideov3", "-s", str(native), "-m", "models"]}
-    name = "realesrgan-x4plus-anime" if kind == "anime" else "realesrgan-x4plus"
-    return {"engine": "esrgan", "native": 4, "name": "Real-ESRGAN" + (" anime" if kind == "anime" else ""),
-            "args": ["-n", name, "-s", "4", "-m", "models"]}
+        if factor <= 2:
+            return {"engine": "cugan", "native": 2, "name": name, "file": None,
+                    "args": ["-s", "2", "-n", "-1", "-m", "models-pro"]}
+        return {"engine": "cugan", "native": 4, "name": name, "file": None,
+                "args": ["-s", "4", "-n", "-1", "-m", "models-se"]}
+    if file_key:
+        return {"engine": "esrgan", "native": 4, "name": name, "file": file_key,
+                "args": ["-n", model, "-s", "4", "-m", str(MODELS_DIR)]}
+    return {"engine": "esrgan", "native": 4, "name": name, "file": None, "args": ["-n", model, "-s", "4", "-m", "models"]}
 
 
 def run_engine(plan, src, dst, on_tick=None) -> None:
@@ -705,7 +758,8 @@ def run_engine(plan, src, dst, on_tick=None) -> None:
         raise RuntimeError(f"{ENGINES[plan['engine']]['name']} is not installed.")
     args = list(plan["args"])
     i = args.index("-m")
-    args[i + 1] = str(exe.parent / args[i + 1])
+    if not Path(args[i + 1]).is_absolute():
+        args[i + 1] = str(exe.parent / args[i + 1])
     cmd = [str(exe), "-i", str(src), "-o", str(dst), *args, "-f", "png"]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=str(exe.parent),
                             creationflags=NO_WINDOW)
@@ -729,8 +783,13 @@ def run_engine(plan, src, dst, on_tick=None) -> None:
 def ai_upscale_image(src, dst, factor, model_label, *, ffmpeg, emit) -> Path:
     """One picture -> AI upscaled to exactly `factor` × its size (PNG or JPG by the name of dst)."""
     import tempfile
-    plan = ai_plan(model_label, factor, video=False)
+    plan = ai_plan(model_label, factor)
     ensure_engine(plan["engine"], emit)
+    if plan["file"] and not ai_file_ok(plan["file"]):
+        f = AI_FILES[plan["file"]]
+        emit("log", f"Downloading the AI model {f['name']} (≈ {f['mb']} MB, only once) …")
+        emit("status", f"Downloading the AI model {f['name']} …")
+        install_ai_file(plan["file"], progress=lambda v: emit("progress", v))
     emit("status", f"AI upscaling {factor}× ({plan['name']}) …")
     emit("progress", None)
     with tempfile.TemporaryDirectory(prefix="ytclip_ai_") as td:
@@ -750,83 +809,6 @@ def ai_upscale_image(src, dst, factor, model_label, *, ffmpeg, emit) -> Path:
         if r.returncode != 0:
             raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
     return Path(dst)
-
-
-def ai_upscale_video(piece, crop, size, model_label, factor, tmp, tag, *, ffmpeg, ffprobe, emit) -> Path:
-    """One piece -> frames (cropped) -> AI upscaler in batches -> scaled to `size` and encoded again.
-    Batches keep the disk usage small (big PNG frames are deleted as soon as they are encoded)."""
-    plan = ai_plan(model_label, factor, video=True)
-    ensure_engine(plan["engine"], emit)
-    inf = media_info(piece, ffprobe)
-    W, H = size
-    cw, ch = (crop[0], crop[1]) if crop else (inf["width"], inf["height"])
-    scale = plan["native"]
-    fin = Path(tmp) / f"ai_in_{tag}"
-    fin.mkdir(parents=True, exist_ok=True)
-    emit("status", "Preparing frames for AI upscaling …")
-    emit("progress", None)
-    vf = [f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
-    r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(piece),
-                        *(["-vf", ",".join(vf)] if vf else []), "-fps_mode", "passthrough",
-                        str(fin / "%06d.png")], capture_output=True, creationflags=NO_WINDOW)
-    if r.returncode != 0:
-        raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-400:])
-    frames = sorted(fin.glob("*.png"))
-    total = len(frames)
-    if not total:
-        raise RuntimeError("No frames to upscale.")
-    per = max(1, (cw * scale) * (ch * scale) * 2)     # rough PNG size of one upscaled frame
-    batch = int(min(200, max(8, 1.5e9 // per)))
-    dst = Path(tmp) / f"ai_{tag}.mp4"
-    enc = subprocess.Popen(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", inf["rate"],
-         "-c:v", "png", "-i", "-", "-i", str(piece), "-map", "0:v:0", "-map", "1:a:0?",
-         "-vf", f"scale={W}:{H}:flags=lanczos,setsar=1", "-c:v", "libx264", "-preset", "medium",
-         "-crf", str(PIECE_CRF - 2), "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(dst)],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-    t0 = time.time()
-    done = 0
-    try:
-        for b0 in range(0, total, batch):
-            bin_ = Path(tmp) / f"ai_b_{tag}"
-            bout = Path(tmp) / f"ai_o_{tag}"
-            for d in (bin_, bout):
-                shutil.rmtree(d, ignore_errors=True)
-                d.mkdir()
-            chunk = frames[b0:b0 + batch]
-            for f in chunk:
-                os.replace(f, bin_ / f.name)
-
-            def tick(b0=b0, bout=bout):
-                k = b0 + len(list(bout.glob("*.png")))
-                el = time.time() - t0
-                eta = el / k * (total - k) if k else 0
-                emit("progress", k / total * 100)
-                emit("status", f"AI upscaling ({plan['name']}) · frame {k}/{total}"
-                               + (f" · {int(eta) // 60}:{int(eta) % 60:02d} left" if k else ""))
-            run_engine(plan, bin_, bout, tick)
-            for f in chunk:
-                out = bout / f.name
-                if not out.is_file():
-                    raise RuntimeError(f"AI upscaling stopped at frame {done + 1}.")
-                enc.stdin.write(out.read_bytes())
-                out.unlink()
-                done += 1
-            shutil.rmtree(bin_, ignore_errors=True)
-            shutil.rmtree(bout, ignore_errors=True)
-        enc.stdin.close()
-        rc = enc.wait()
-        if rc != 0:
-            raise RuntimeError("FFmpeg error:\n" + enc.stderr.read().decode("utf-8", "replace").strip()[-400:])
-    except BaseException:
-        try:
-            enc.kill()
-        except OSError:
-            pass
-        raise
-    finally:
-        shutil.rmtree(fin, ignore_errors=True)
-    return dst
 
 
 # ----------------------------------------------------------------------------- still frame

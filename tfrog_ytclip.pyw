@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.8"
+APP_VERSION = "2.9.9"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -96,12 +96,6 @@ AUDIO_HINTS = {"mp3": "With title, artist and cover art.",
 
 # ---- hover help (Settings → "Show help when hovering")
 ITEM_HELP = {
-    "No upscaling": "The picture keeps its size.",
-    "2× (AI)": "Twice as wide and high, with AI detail (e.g. 1080p -> 4K). Takes a while for videos.",
-    "4× (AI)": "Four times as wide and high, with AI detail. For small pictures – slow for videos.",
-    "Normal (Real-ESRGAN)": "For filmed things, games, photos. Removes compression blocks and adds detail.",
-    "Anime – fast (Real-ESRGAN)": "For anime / drawings – quick, clean lines.",
-    "Anime – best (Real-CUGAN)": "For anime / drawings – the sharpest lines and textures, slower.",
     # quality
     "Best available": "The highest resolution this video has.",
     "2160p (4K)": "Up to 3840 × 2160. Big files.",
@@ -155,13 +149,29 @@ ITEM_HELP = {
     "Light": "Bright theme for daylight.",
 }
 # ---- frame (crop)
-# AI upscaling (Output tab; also Save frame / Save thumbnail)
-AI_UPSCALES = {"No upscaling": None, "2× (AI)": 2, "4× (AI)": 4}
-AI_MODELS = {   # label -> (engine, model)
-    "Normal (Real-ESRGAN)": ("esrgan", "normal"),
-    "Anime – fast (Real-ESRGAN)": ("esrgan", "anime"),
-    "Anime – best (Real-CUGAN)": ("cugan", "se"),
+# AI upscaling for pictures (Save frame / Save thumbnail) – label -> (engine, model, file key or None, help)
+AI_UPSCALES = {"Off": None, "2×": 2, "4×": 4}
+AI_MODELS = {
+    "UltraSharp – photos, films": ("esrgan", "ultrasharp-4x", "ultrasharp",
+                                   "4x-UltraSharp (Kim2091): very sharp, lots of detail – the favourite for real "
+                                   "footage, games and photos."),
+    "Siax – natural detail (large)": ("esrgan", "4x_NMKD-Siax_200k", "siax",
+                                      "4x NMKD Siax (Nmkd), the big 64 MB model: natural, calm detail, good on faces "
+                                      "and skin."),
+    "Nomos8kSC – YouTube / compressed": ("esrgan", "4xNomos8kSC", "nomos",
+                                         "4xNomos8kSC (Phhofm): trained on blurry, compressed pictures – cleans "
+                                         "YouTube blocks and noise while it upscales."),
+    "Real-ESRGAN – classic": ("esrgan", "realesrgan-x4plus", None,
+                              "Real-ESRGAN x4plus (xinntao): the all-rounder, a bit softer."),
+    "Real-CUGAN Pro – anime best": ("cugan", "pro", None,
+                                    "Real-CUGAN Pro (Bilibili): the cleanest anime lines and flat colors. "
+                                    "2× uses the Pro model, 4× the SE model."),
+    "HFA2k – anime detailed": ("esrgan", "4xHFA2k", "hfa2k",
+                               "4xHFA2k (Phhofm): High Fidelity Anime – keeps fine lines, texture and grain."),
+    "Real-ESRGAN anime – fast": ("esrgan", "realesrgan-x4plus-anime", None,
+                                 "Real-ESRGAN x4plus anime: quick and clean."),
 }
+DEFAULT_AI_MODEL = "UltraSharp – photos, films"
 FREE = "free"            # "Custom": a box of any shape
 ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "Custom": FREE}
 # volume curve: how the volume goes from a point to the next one
@@ -1270,6 +1280,7 @@ def fetch_info(url: str) -> dict:
         "playlist": len(list(entries)) if entries is not None else 0,
         "fps": info.get("fps") or max((f.get("fps") or 0 for f in info.get("formats") or []), default=0) or None,
         "stream": pick_streams(info) if entries is None else None,
+        "streams": stream_choices(info) if entries is None else {},
     }
 
 
@@ -1712,9 +1723,28 @@ def _stream_fmt(f, info) -> dict:
             "height": f.get("height"), "fps": f.get("fps")}
 
 
-def pick_streams(info) -> dict | None:
+STREAM_QUALITIES = (360, 480, 720, 1080)
+
+
+def stream_choices(info) -> dict:
+    """The preview stream in a few qualities: {'auto': …, 360: …, 720: …} (only heights the video really has)."""
+    out = {"auto": pick_streams(info)}
+    if not out["auto"]:
+        return out
+    seen = set()
+    for q in STREAM_QUALITIES:
+        st = pick_streams(info, q)
+        h = st and st["video"].get("height")
+        if st and h and h not in seen and min(h, 9999) <= q:
+            seen.add(h)
+            out[q] = st
+    return out
+
+
+def pick_streams(info, target=None) -> dict | None:
     """Plain HTTP files of the video for the player: one with picture + sound if there is one (≤720p),
-    else a picture-only file (around 480p, H.264 preferred) plus a sound-only file."""
+    else a picture-only file (around 480p, H.264 preferred) plus a sound-only file. With `target` (a height):
+    the picture closest to it (not above), with a separate sound file if needed."""
     fmts = [f for f in info.get("formats") or []
             if f.get("url") and str(f.get("protocol") or "") in ("http", "https")
             and not f.get("fragments") and f.get("ext") in ("mp4", "webm", "m4a")]
@@ -1734,6 +1764,19 @@ def pick_streams(info) -> dict | None:
         return (abs(min(h, 720) - 480) if h else 9999, 0 if str(f.get("vcodec") or "").startswith("avc") else 1,
                 f.get("tbr") or 0)
 
+    if target:
+        vids = [f for f in fmts if has_v(f) and short(f) and short(f) <= target]
+        if not vids:
+            return None
+        top = max(short(f) for f in vids)
+        cands = [f for f in vids if short(f) == top]
+        v = min(cands, key=lambda f: (0 if has_a(f) else 1, 0 if str(f.get("vcodec") or "").startswith("avc") else 1,
+                                      f.get("tbr") or 0))
+        if has_a(v):
+            return {"video": _stream_fmt(v, info), "audio": None, "fps": v.get("fps")}
+        auds = [f for f in fmts if has_a(f) and not has_v(f)]
+        a = min(auds, key=lambda f: (0 if f.get("ext") == "m4a" else 1, abs((f.get("abr") or 128) - 128))) if auds else None
+        return {"video": _stream_fmt(v, info), "audio": _stream_fmt(a, info) if a else None, "fps": v.get("fps")}
     both = [f for f in fmts if has_v(f) and has_a(f) and short(f) <= 720]
     if both:
         best = min(both, key=vrank)
@@ -2017,8 +2060,7 @@ def fx_needed(kind, fx) -> bool:
     """Does this export need the extra encode step (crop, size, volume curve, subtitles in the picture)?"""
     if not fx:
         return False
-    ai = (fx.get("ai") or {}).get("factor")
-    if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and (fx.get("up") or ai))):
+    if kind in ("mp4", "gif") and (fx.get("aspect") or (kind == "mp4" and fx.get("up"))):
         return True
     if kind in ("mp4", "mp3") and any(abs(float(p[1]) - 1.0) > 1e-4 for p in fx.get("vol") or []):
         return True
@@ -2381,15 +2423,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                 crops.append(crop_rect(boxes[k], inf["width"], inf["height"], aspect) if aspect else None)
             cw, ch = (crops[0][0], crops[0][1]) if aspect else (infos[0]["width"], infos[0]["height"])
             W, H = target_dims(cw, ch, fx.get("up") if kind == "mp4" else None, aspect)
-            ai = fx.get("ai") if kind == "mp4" else None
-            if ai and ai.get("factor"):
-                f = int(ai["factor"])
-                W, H = _even(cw * f), _even(ch * f)
-                for j, (p, cr) in enumerate(zip(ps, crops)):
-                    ps[j] = ai_upscale_video(p, cr, (W, H), ai.get("model"), f, tmp, f"{gi}_{j}", ffmpeg=ffmpeg,
-                                             ffprobe=ffprobe, emit=gemit)
-                    crops[j] = None
-                infos = [media_info(p, ffprobe) for p in ps]
             segs, off = [], 0.0
             for k, inf in zip(g, infos):
                 segs.append((clips[k][0], clips[k][1], off))
@@ -2437,14 +2470,78 @@ ENGINES = {
                "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
                       "realesrgan-ncnn-vulkan-20220424-windows.zip",
                "sha256": "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d",
-               "about": "normal footage + anime (fast)"},
+               "about": "UltraSharp, Siax, Nomos8kSC, HFA2k and the classic models"},
     "cugan": {"name": "Real-CUGAN", "repo": "nihui/realcugan-ncnn-vulkan", "exe": "realcugan-ncnn-vulkan",
               "asset": r"^realcugan-ncnn-vulkan-(\d{8})-windows\.zip$", "version": "20220728", "mb": 44,
               "url": "https://github.com/nihui/realcugan-ncnn-vulkan/releases/download/20220728/"
                      "realcugan-ncnn-vulkan-20220728-windows.zip",
               "sha256": "c6e08d46c11704b1e3a1ada9ddd591cb5005f52f132136c8633ba25def400e01",
-              "about": "anime (best)"},
+              "about": "anime – Real-CUGAN Pro"},
 }
+
+
+_UPS = "https://raw.githubusercontent.com/upscayl/upscayl/a00d55fee90e0f9435d5eaa86e76700df8199af8/resources/models/"
+_CUS = "https://raw.githubusercontent.com/upscayl/custom-models/4b6d2cfa59c7442af115dfc6e50fd8d7d40b96ef/models/"
+# Extra models for Real-ESRGAN (ncnn files, converted by the Upscayl project); downloaded when first used.
+AI_FILES = {
+    "ultrasharp": {"name": "UltraSharp", "model": "ultrasharp-4x", "base": _UPS, "mb": 32,
+                   "param": "0136ca83686809a8f17f7111f11b951e8db93610e24b7f4137c9ffe4dbc4a806",
+                   "bin": "fb3e279d40d4cddb44db4e684d59e68d0aa39852c8cc14dc3f23ccc7e6eee9c1"},
+    "siax": {"name": "Siax (large)", "model": "4x_NMKD-Siax_200k", "base": _CUS, "mb": 64,
+             "param": "519bffb4912e295155d3cb5d6a29639d217ccca55f80962d8f677ef777a65b7a",
+             "bin": "b2abdffa30fb15be752ac681e0c0edf8b543745c33a989aadc9d7d3394dd3110"},
+    "nomos": {"name": "Nomos8kSC", "model": "4xNomos8kSC", "base": _CUS, "mb": 32,
+              "param": "4576ed5c2fc5fa250d3c3d585ef02248f26abdfc1867088078f501fe71e5d61e",
+              "bin": "da16e3880d87b177b7c6b659bbd880f8a101b868eb9ebc08d69eaa6d3edc4517"},
+    "hfa2k": {"name": "HFA2k", "model": "4xHFA2k", "base": _CUS, "mb": 32,
+              "param": "4576ed5c2fc5fa250d3c3d585ef02248f26abdfc1867088078f501fe71e5d61e",
+              "bin": "8a135402b4f39286121b76abb47601a6b7b7e8d4f3e999a5aaa45ed277824fb4"},
+}
+MODELS_DIR = UPSCALE_DIR / "models"     # the folder name must contain "models" for realesrgan-ncnn-vulkan
+
+
+def ai_file_ok(key) -> bool:
+    m = AI_FILES[key]["model"]
+    return (MODELS_DIR / f"{m}.param").is_file() and (MODELS_DIR / f"{m}.bin").is_file()
+
+
+def install_ai_file(key, progress=None) -> None:
+    """Downloads one extra model (.param + .bin, both checked against their SHA-256)."""
+    import hashlib
+    import urllib.request
+    f = AI_FILES[key]
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    total = f["mb"] * 1048576
+    done = 0
+    for ext in ("param", "bin"):
+        dst = MODELS_DIR / f"{f['model']}.{ext}"
+        part = dst.with_suffix(f".{ext}.part")
+        h = hashlib.sha256()
+        req = urllib.request.Request(f["base"] + f"{f['model']}.{ext}", headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as out:
+                while True:
+                    chunk = r.read(1 << 18)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(min(99.0, done / total * 100))
+            if h.hexdigest() != f[ext]:
+                raise RuntimeError(f"The model {f['name']} is damaged (checksum does not match) – please try again.")
+            os.replace(part, dst)
+        finally:
+            part.unlink(missing_ok=True)
+    if progress:
+        progress(100.0)
+
+
+def remove_ai_file(key) -> None:
+    m = AI_FILES[key]["model"]
+    for ext in ("param", "bin"):
+        (MODELS_DIR / f"{m}.{ext}").unlink(missing_ok=True)
 
 
 def engine_dir(key) -> Path:
@@ -2560,21 +2657,20 @@ def ensure_engine(key, emit) -> Path:
     return install_engine(key, progress=lambda p: emit("progress", p))
 
 
-def ai_plan(model_label, factor, video) -> dict:
-    """What runs for this model and factor: {'engine', 'args', 'native', 'name'}."""
-    engine, kind = AI_MODELS.get(model_label, ("esrgan", "normal"))
+def ai_plan(model_label, factor, video=False) -> dict:
+    """What runs for this model and factor: {'engine', 'args', 'native', 'name', 'file'}."""
+    engine, model, file_key, _h = AI_MODELS.get(model_label) or AI_MODELS[DEFAULT_AI_MODEL]
+    name = model_label.split(" –")[0]
     if engine == "cugan":
-        native = 2 if factor <= 2 else 4
-        n = "-1" if native in (2, 3, 4) else "0"
-        return {"engine": "cugan", "native": native, "name": "Real-CUGAN",
-                "args": ["-s", str(native), "-n", n, "-m", "models-se"]}
-    if kind == "anime" and video:
-        native = 2 if factor <= 2 else 4
-        return {"engine": "esrgan", "native": native, "name": "Real-ESRGAN anime video",
-                "args": ["-n", "realesr-animevideov3", "-s", str(native), "-m", "models"]}
-    name = "realesrgan-x4plus-anime" if kind == "anime" else "realesrgan-x4plus"
-    return {"engine": "esrgan", "native": 4, "name": "Real-ESRGAN" + (" anime" if kind == "anime" else ""),
-            "args": ["-n", name, "-s", "4", "-m", "models"]}
+        if factor <= 2:
+            return {"engine": "cugan", "native": 2, "name": name, "file": None,
+                    "args": ["-s", "2", "-n", "-1", "-m", "models-pro"]}
+        return {"engine": "cugan", "native": 4, "name": name, "file": None,
+                "args": ["-s", "4", "-n", "-1", "-m", "models-se"]}
+    if file_key:
+        return {"engine": "esrgan", "native": 4, "name": name, "file": file_key,
+                "args": ["-n", model, "-s", "4", "-m", str(MODELS_DIR)]}
+    return {"engine": "esrgan", "native": 4, "name": name, "file": None, "args": ["-n", model, "-s", "4", "-m", "models"]}
 
 
 def run_engine(plan, src, dst, on_tick=None) -> None:
@@ -2584,7 +2680,8 @@ def run_engine(plan, src, dst, on_tick=None) -> None:
         raise RuntimeError(f"{ENGINES[plan['engine']]['name']} is not installed.")
     args = list(plan["args"])
     i = args.index("-m")
-    args[i + 1] = str(exe.parent / args[i + 1])
+    if not Path(args[i + 1]).is_absolute():
+        args[i + 1] = str(exe.parent / args[i + 1])
     cmd = [str(exe), "-i", str(src), "-o", str(dst), *args, "-f", "png"]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=str(exe.parent),
                             creationflags=NO_WINDOW)
@@ -2608,8 +2705,13 @@ def run_engine(plan, src, dst, on_tick=None) -> None:
 def ai_upscale_image(src, dst, factor, model_label, *, ffmpeg, emit) -> Path:
     """One picture -> AI upscaled to exactly `factor` × its size (PNG or JPG by the name of dst)."""
     import tempfile
-    plan = ai_plan(model_label, factor, video=False)
+    plan = ai_plan(model_label, factor)
     ensure_engine(plan["engine"], emit)
+    if plan["file"] and not ai_file_ok(plan["file"]):
+        f = AI_FILES[plan["file"]]
+        emit("log", f"Downloading the AI model {f['name']} (≈ {f['mb']} MB, only once) …")
+        emit("status", f"Downloading the AI model {f['name']} …")
+        install_ai_file(plan["file"], progress=lambda v: emit("progress", v))
     emit("status", f"AI upscaling {factor}× ({plan['name']}) …")
     emit("progress", None)
     with tempfile.TemporaryDirectory(prefix="ytclip_ai_") as td:
@@ -2629,83 +2731,6 @@ def ai_upscale_image(src, dst, factor, model_label, *, ffmpeg, emit) -> Path:
         if r.returncode != 0:
             raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
     return Path(dst)
-
-
-def ai_upscale_video(piece, crop, size, model_label, factor, tmp, tag, *, ffmpeg, ffprobe, emit) -> Path:
-    """One piece -> frames (cropped) -> AI upscaler in batches -> scaled to `size` and encoded again.
-    Batches keep the disk usage small (big PNG frames are deleted as soon as they are encoded)."""
-    plan = ai_plan(model_label, factor, video=True)
-    ensure_engine(plan["engine"], emit)
-    inf = media_info(piece, ffprobe)
-    W, H = size
-    cw, ch = (crop[0], crop[1]) if crop else (inf["width"], inf["height"])
-    scale = plan["native"]
-    fin = Path(tmp) / f"ai_in_{tag}"
-    fin.mkdir(parents=True, exist_ok=True)
-    emit("status", "Preparing frames for AI upscaling …")
-    emit("progress", None)
-    vf = [f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
-    r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(piece),
-                        *(["-vf", ",".join(vf)] if vf else []), "-fps_mode", "passthrough",
-                        str(fin / "%06d.png")], capture_output=True, creationflags=NO_WINDOW)
-    if r.returncode != 0:
-        raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-400:])
-    frames = sorted(fin.glob("*.png"))
-    total = len(frames)
-    if not total:
-        raise RuntimeError("No frames to upscale.")
-    per = max(1, (cw * scale) * (ch * scale) * 2)     # rough PNG size of one upscaled frame
-    batch = int(min(200, max(8, 1.5e9 // per)))
-    dst = Path(tmp) / f"ai_{tag}.mp4"
-    enc = subprocess.Popen(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", inf["rate"],
-         "-c:v", "png", "-i", "-", "-i", str(piece), "-map", "0:v:0", "-map", "1:a:0?",
-         "-vf", f"scale={W}:{H}:flags=lanczos,setsar=1", "-c:v", "libx264", "-preset", "medium",
-         "-crf", str(PIECE_CRF - 2), "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(dst)],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-    t0 = time.time()
-    done = 0
-    try:
-        for b0 in range(0, total, batch):
-            bin_ = Path(tmp) / f"ai_b_{tag}"
-            bout = Path(tmp) / f"ai_o_{tag}"
-            for d in (bin_, bout):
-                shutil.rmtree(d, ignore_errors=True)
-                d.mkdir()
-            chunk = frames[b0:b0 + batch]
-            for f in chunk:
-                os.replace(f, bin_ / f.name)
-
-            def tick(b0=b0, bout=bout):
-                k = b0 + len(list(bout.glob("*.png")))
-                el = time.time() - t0
-                eta = el / k * (total - k) if k else 0
-                emit("progress", k / total * 100)
-                emit("status", f"AI upscaling ({plan['name']}) · frame {k}/{total}"
-                               + (f" · {int(eta) // 60}:{int(eta) % 60:02d} left" if k else ""))
-            run_engine(plan, bin_, bout, tick)
-            for f in chunk:
-                out = bout / f.name
-                if not out.is_file():
-                    raise RuntimeError(f"AI upscaling stopped at frame {done + 1}.")
-                enc.stdin.write(out.read_bytes())
-                out.unlink()
-                done += 1
-            shutil.rmtree(bin_, ignore_errors=True)
-            shutil.rmtree(bout, ignore_errors=True)
-        enc.stdin.close()
-        rc = enc.wait()
-        if rc != 0:
-            raise RuntimeError("FFmpeg error:\n" + enc.stderr.read().decode("utf-8", "replace").strip()[-400:])
-    except BaseException:
-        try:
-            enc.kill()
-        except OSError:
-            pass
-        raise
-    finally:
-        shutil.rmtree(fin, ignore_errors=True)
-    return dst
 
 
 # ----------------------------------------------------------------------------- still frame
@@ -4374,6 +4399,16 @@ QPushButton#chip {{ background: {c['panel2']}; border: 1px solid {c['border']}; 
     padding: 4px 12px; font-size: 12px; min-height: 16px; }}
 QPushButton#chip:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
 QPushButton#chip:disabled {{ color: {c['muted']}; }}
+QPushButton#chip[state="on"] {{ border-color: {c['accent']}; color: {c['accent']}; }}
+QPushButton#srcChip {{ background: transparent; border: none; color: {c['muted']}; padding: 2px 4px; font-size: 12px; }}
+QPushButton#srcChip:hover {{ color: {c['accent']}; }}
+QPushButton#srcChip:disabled {{ color: {c['muted']}; }}
+QMenu {{ background: {c['panel2']}; border: 1px solid {c['border']}; border-radius: 10px; padding: 6px; }}
+QMenu::item {{ padding: 6px 22px 6px 26px; border-radius: 6px; color: {c['text']}; }}
+QMenu::item:selected {{ background: {c['accent']}; color: {c['on_accent']}; }}
+QMenu::item:disabled {{ color: {c['muted']}; }}
+QMenu::separator {{ height: 1px; background: {c['border']}; margin: 5px 8px; }}
+QMenu::indicator {{ width: 12px; height: 12px; left: 8px; }}
 QFrame#segmented {{ background: {c['field']}; border: 1px solid {c['border']}; border-radius: 12px; }}
 QFrame#segInd {{ background: {c['accent']}; border: none; border-radius: 9px; }}
 QPushButton#segBtn {{ background: transparent; border: none; color: {c['muted']}; padding: 9px 10px; font-weight: 600; }}
@@ -6800,6 +6835,8 @@ class SettingsDialog(QtWidgets.QDialog):
         latest = QtCore.Signal(str, object)
         prog = QtCore.Signal(str, float)
         done = QtCore.Signal(str, str)
+        mprog = QtCore.Signal(str, float)
+        mdone = QtCore.Signal(str, str)
 
     def _build_ai_rows(self, lay):
         """One line per upscaler: version, newer one on GitHub? Install / Update / Remove."""
@@ -6808,6 +6845,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.ai_sig.prog.connect(lambda k, v: self._ai_show(k, f"downloading … {v:.0f} %"))
         self.ai_sig.done.connect(self._ai_done)
         self.ai_rows, self.ai_latest, self.ai_busy = {}, {}, set()
+        self.mf_rows = {}
+        self.ai_sig.mprog.connect(lambda k, v: self._mf_show(k, f"downloading … {v:.0f} %"))
+        self.ai_sig.mdone.connect(self._mf_done)
         for key, e in ENGINES.items():
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(8)
@@ -6834,6 +6874,32 @@ class SettingsDialog(QtWidgets.QDialog):
             lay.addLayout(row)
             self.ai_rows[key] = (st, act, rem)
             self._ai_show(key)
+        for key, f in AI_FILES.items():
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            lab = next((k for k, v in AI_MODELS.items() if v[2] == key), f["name"])
+            name = tip(label(lab, "field"), f["name"], AI_MODELS.get(lab, ("", "", "", ""))[3]
+                       + " Runs with Real-ESRGAN.")
+            st = label("", "hint")
+            st.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+            col = QtWidgets.QVBoxLayout()
+            col.setSpacing(1)
+            col.addWidget(name)
+            col.addWidget(st)
+            act = QtWidgets.QPushButton("Download")
+            act.setObjectName("ghost")
+            act.setCursor(Qt.CursorShape.PointingHandCursor)
+            act.clicked.connect(lambda _=False, k=key: self._mf_install(k))
+            rem = QtWidgets.QPushButton("Remove")
+            rem.setObjectName("ghost")
+            rem.setCursor(Qt.CursorShape.PointingHandCursor)
+            rem.clicked.connect(lambda _=False, k=key: self._mf_remove(k))
+            row.addLayout(col, 1)
+            row.addWidget(act)
+            row.addWidget(rem)
+            lay.addLayout(row)
+            self.mf_rows[key] = (st, act, rem)
+            self._mf_show(key)
 
         def check():
             for k in ENGINES:
@@ -6902,6 +6968,42 @@ class SettingsDialog(QtWidgets.QDialog):
         else:
             self.main._on_log(f"✓ {ENGINES[key]['name']} {engine_version(key)} installed.")
             self._ai_show(key)
+        self.main._ai_changed()
+
+    def _mf_show(self, key, busy=None):
+        st, act, rem = self.mf_rows[key]
+        f = AI_FILES[key]
+        if busy:
+            st.setText(busy)
+            act.setVisible(False)
+            rem.setVisible(False)
+            return
+        ok = ai_file_ok(key)
+        st.setText(f"model · {f['mb']} MB on disk" if ok else f"not downloaded · ≈ {f['mb']} MB")
+        act.setVisible(not ok)
+        rem.setVisible(ok)
+
+    def _mf_install(self, key):
+        self._mf_show(key, "downloading …")
+
+        def work():
+            try:
+                install_ai_file(key, progress=lambda v: self.ai_sig.mprog.emit(key, v))
+                self.ai_sig.mdone.emit(key, "")
+            except Exception as ex:  # noqa: BLE001
+                self.ai_sig.mdone.emit(key, clean_error(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mf_done(self, key, err):
+        self._mf_show(key)
+        if err:
+            self.mf_rows[key][0].setText("✕ " + err.splitlines()[0][:160])
+            self.main._on_log(f"✕ {AI_FILES[key]['name']}: {err}")
+        self.main._ai_changed()
+
+    def _mf_remove(self, key):
+        remove_ai_file(key)
+        self._mf_show(key)
         self.main._ai_changed()
 
     def _ai_remove(self, key):
@@ -7305,8 +7407,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_still.clicked.connect(self._save_still)
         tr2.addSpacing(6)
         tr2.addWidget(self.btn_still)
+        self.ai_factor, self.ai_model = None, DEFAULT_AI_MODEL
+        self.btn_ai = QtWidgets.QPushButton("✦ AI upscale: off")
+        self.btn_ai.setObjectName("chip")
+        self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ai.clicked.connect(self._ai_menu)
+        tr2.addWidget(self.btn_ai)
         tr2.addStretch(1)
-        self.lbl_pv_src = label("", "ptime")
+        self.lbl_pv_src = QtWidgets.QPushButton("")
+        self.lbl_pv_src.setObjectName("srcChip")
+        self.lbl_pv_src.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_pv_src.clicked.connect(self._pv_src_menu)
         tr2.addWidget(self.lbl_pv_src)
         tv.addLayout(tr2)
         self.transport.hide()
@@ -7620,43 +7731,79 @@ class MainWindow(QtWidgets.QMainWindow):
         self.size_hint = label("", "hint")
         self.size_hint.setWordWrap(True)
         g.addWidget(self.size_hint, 4, 1, 1, 3)
-        h_ai = ("Makes the picture bigger with AI – for the video, Save frame and Save thumbnail. The first time, the "
-                "upscaler is downloaded (≈ 45 MB). Needs a graphics card with Vulkan (NVIDIA, AMD or Intel).")
-        h_model = "Which AI: normal footage or anime. Hover over the entries for details."
-        self.cb_ai = self._combo(AI_UPSCALES, "Upscale", h_ai)
-        self.cb_ai_model = self._combo(AI_MODELS, "AI model", h_model)
-        self.lbl_ai_model = self._field("AI model", "AI model", h_model)
-        self.cb_ai.currentTextChanged.connect(lambda _t: self._ai_changed())
-        self.cb_ai_model.currentTextChanged.connect(lambda _t: self._ai_changed())
-        g.addWidget(self._field("Upscale", "Upscale", h_ai), 5, 0)
-        g.addWidget(self.cb_ai, 5, 1, 1, 3)
-        g.addWidget(self.lbl_ai_model, 6, 0)
-        g.addWidget(self.cb_ai_model, 6, 1, 1, 3)
-        self.ai_hint = tip(label("", "hint"), "AI upscaling", "Videos take a while: every frame is redrawn by the AI. "
-                                                              "Pictures take a few seconds.")
-        g.addWidget(self.ai_hint, 7, 1, 1, 3)
+        g.setRowStretch(5, 1)       # spare height goes below, not between the rows
         return w
 
+    # ------------------------------------------------------------------ AI upscaling (pictures only)
     def _ai(self):
-        """{'factor', 'model'} or None – for the video, Save frame and Save thumbnail."""
-        f = AI_UPSCALES.get(self.cb_ai.currentText())
-        return {"factor": f, "model": self.cb_ai_model.currentText()} if f else None
+        """{'factor', 'model'} or None – for Save frame and Save thumbnail."""
+        return {"factor": self.ai_factor, "model": self.ai_model} if self.ai_factor else None
 
     def _ai_changed(self):
+        b = getattr(self, "btn_ai", None)
+        if b is None:
+            return
         ai = self._ai()
-        self.cb_ai_model.setVisible(bool(ai))
-        self.lbl_ai_model.setVisible(bool(ai))
+        b.setText(f"✦ AI {ai['factor']}× · {ai['model'].split(' –')[0]}" if ai else "✦ AI upscale: off")
+        set_state(b, "on" if ai else "")
+        self._ai_tip()
+
+    def _ai_tip(self):
+        ai = self._ai()
+        need = []
         if ai:
-            eng = AI_MODELS[ai["model"]][0]
-            got = engine_exe(eng) is not None
-            self.ai_hint.setText("Also for Save frame + thumbnail" + ("" if got else f" · first use loads ≈ "
-                                                                                  f"{ENGINES[eng]['mb']} MB"))
-        self.ai_hint.setVisible(bool(ai))
-        if hasattr(self, "tabstack"):
-            self._fit_stack(self.stack)
-            self._fit_stack(self.tabstack)
-        if hasattr(self, "_frame_info"):
-            self._frame_info()
+            plan = ai_plan(ai["model"], ai["factor"])
+            if not engine_exe(plan["engine"]):
+                need.append(f"{ENGINES[plan['engine']]['name']} ≈ {ENGINES[plan['engine']]['mb']} MB")
+            if plan["file"] and not ai_file_ok(plan["file"]):
+                need.append(f"model ≈ {AI_FILES[plan['file']]['mb']} MB")
+        tip(self.btn_ai, "AI upscaling for pictures",
+            "Makes Save frame and Save thumbnail bigger and sharper with AI (videos stay as they are). Click to pick "
+            "the size and the model." + (f" Downloaded once on first use: {', '.join(need)}." if need else "")
+            + " Needs a graphics card with Vulkan (NVIDIA, AMD or Intel).")
+
+    def _ai_menu(self):
+        m = QtWidgets.QMenu(self)
+        m.setToolTipsVisible(True)
+        hdr = m.addAction("Size")
+        hdr.setEnabled(False)
+        g1 = QtGui.QActionGroup(m)
+        for lab, f in AI_UPSCALES.items():
+            a = m.addAction(lab if f else "Off (normal size)")
+            a.setCheckable(True)
+            a.setChecked(f == self.ai_factor)
+            a.setActionGroup(g1)
+            a.triggered.connect(lambda _=False, f=f: self._set_ai(factor=f))
+        g2 = QtGui.QActionGroup(m)
+        for i, (lab, (eng, _model, fk, hlp)) in enumerate(AI_MODELS.items()):
+            if i in (0, 4):
+                m.addSeparator()
+                h = m.addAction("Photos, films, games" if i == 0 else "Anime, drawings")
+                h.setEnabled(False)
+            miss = (fk and not ai_file_ok(fk)) or not engine_exe(eng)
+            size = (AI_FILES[fk]["mb"] if fk and not ai_file_ok(fk) else 0) + \
+                   (0 if engine_exe(eng) else ENGINES[eng]["mb"])
+            a = m.addAction(lab + (f"   ↓ {size} MB" if miss else ""))
+            a.setToolTip(hlp)
+            a.setCheckable(True)
+            a.setChecked(lab == self.ai_model)
+            a.setActionGroup(g2)
+            a.triggered.connect(lambda _=False, lab=lab: self._set_ai(model=lab))
+        m.addSeparator()
+        m.addAction("Models and updates in Settings …").triggered.connect(self._settings)
+        m.exec(self.btn_ai.mapToGlobal(QtCore.QPoint(0, self.btn_ai.height() + 2)))
+
+    def _set_ai(self, factor=0, model=None):
+        if factor != 0:
+            self.ai_factor = factor
+        if model:
+            self.ai_model = model
+            if not self.ai_factor:
+                self.ai_factor = 4
+        self.cfg["ai_up"] = next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor)
+        self.cfg["ai_model"] = self.ai_model
+        save_cfg(self.cfg)
+        self._ai_changed()
 
     def _page_audio(self):
         w, g = self._grid()
@@ -8645,11 +8792,11 @@ class MainWindow(QtWidgets.QMainWindow):
         after a sign-in or when it's older than half a day."""
         if not login_state()["signed_in"]:
             self.account = {}
-            self.chip_account.set_account({})
+            self._head_account({})
             return
         acc = load_account()
         self.account = {"signed_in": True, **acc}
-        self.chip_account.set_account(self.account)
+        self._head_account(self.account)
         if not force and acc and time.time() - float(acc.get("checked") or 0) < 12 * 3600:
             return
         if getattr(self, "_acc_busy", False):
@@ -8685,13 +8832,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._on_log(f"YouTube account: {v['name']}" + (f" ({v['handle']})" if v.get("handle") else ""))
         else:
             self._on_log(f"Couldn't read name and picture of the YouTube account – {v}")
-        self.chip_account.set_account(self.account)
+        self._head_account(self.account)
         self._login_state_changed()
 
     def _login_state_changed(self):
         if not login_state()["signed_in"] and self.account:
             self.account = {}
-            self.chip_account.set_account({})
+            self._head_account({})
         dlg = getattr(self, "settings_dlg", None)
         if dlg is not None:
             dlg.show_login_state()
@@ -8714,7 +8861,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "vol": [tuple(q) for q in self.vol_pts] if mode in ("mp4", "mp3") else [],
             "subs": {"cues": self.sub_cues, "mode": None if sub_mode == "none" else sub_mode,
                      "lang": self.sub_lang, "style": dict(self.sub_style)} if self.sub_cues else None,
-            "ai": self._ai() if mode == "mp4" else None,
         }
         return fx
 
@@ -8735,9 +8881,12 @@ class MainWindow(QtWidgets.QMainWindow):
         pick(self.cb_quality, "quality", QUALITIES, DEFAULT_QUALITY)
         pick(self.cb_size, "size", SIZES, DEFAULT_SIZE)
         pick(self.cb_encoder, "encoder", ENCODERS, DEFAULT_ENCODER)
-        pick(self.cb_ai, "ai_up", AI_UPSCALES, "No upscaling")
-        pick(self.cb_ai_model, "ai_model", AI_MODELS, "Normal (Real-ESRGAN)")
+        self.ai_factor = AI_UPSCALES.get(c.get("ai_up"))
+        self.ai_model = c.get("ai_model") if c.get("ai_model") in AI_MODELS else DEFAULT_AI_MODEL
         self._ai_changed()
+        if hasattr(self, "tabstack"):
+            self._fit_stack(self.stack)
+            self._fit_stack(self.tabstack)
         pick(self.cb_afmt, "audio_format", AUDIO_FORMATS, DEFAULT_AUDIO)
         pick(self.cb_mp3, "mp3_quality", MP3_QUALITIES, DEFAULT_MP3)
         pick(self.cb_gif_w, "gif_width", GIF_WIDTHS, "480 px")
@@ -8778,7 +8927,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.update(
             quality=self.cb_quality.currentText(), size=self.cb_size.currentText(),
             encoder=self.cb_encoder.currentText(), mp3_quality=self.cb_mp3.currentText(),
-            ai_up=self.cb_ai.currentText(), ai_model=self.cb_ai_model.currentText(),
+            ai_up=next(k for k, v in AI_UPSCALES.items() if v == self.ai_factor), ai_model=self.ai_model,
             codec=self.cb_codec.currentText(), audio_format=self.cb_afmt.currentText(),
             tooltips=self.tip_filter.enabled,
             gif_width=self.cb_gif_w.currentText(), gif_fps=self.cb_gif_fps.currentText(),
@@ -9309,6 +9458,72 @@ class MainWindow(QtWidgets.QMainWindow):
     def _pv_mode(self):
         return self.cfg.get("preview_mode", "download")
 
+    def _head_account(self, acc):
+        """Signed in: only the profile is in the header (a click opens the Settings); else the Settings button."""
+        self.chip_account.set_account(acc)
+        self.btn_settings.setVisible(not acc)
+
+    def _stream_q(self):
+        q = self.cfg.get("stream_q", "auto")
+        return q if q == "auto" else int(q)
+
+    def _cur_stream(self):
+        sts = self.info.get("streams") or {}
+        return sts.get(self._stream_q()) or sts.get("auto") or self.info.get("stream")
+
+    def _pv_src_menu(self):
+        """Click on 'streaming from YouTube' / 'preview copy': switch the preview right here."""
+        if self._pv_kind not in ("stream", "copy") or not self._is_info_current() or self.info.get("local"):
+            return
+        m = QtWidgets.QMenu(self)
+        sts = self.info.get("streams") or {}
+        h = m.addAction("Stream from YouTube")
+        h.setEnabled(False)
+        grp = QtGui.QActionGroup(m)
+        can = self._can_stream()
+        auto_h = ((sts.get("auto") or {}).get("video") or {}).get("height")
+        for q in ["auto", *[k for k in sts if k != "auto"]]:
+            a = m.addAction("Auto" + (f" ({auto_h}p)" if auto_h else "") if q == "auto" else f"{q}p")
+            a.setCheckable(True)
+            a.setChecked(self._pv_kind == "stream" and q == self._stream_q())
+            a.setEnabled(can)
+            a.setActionGroup(grp)
+            a.triggered.connect(lambda _=False, q=q: self._switch_preview("stream", q))
+        m.addSeparator()
+        a = m.addAction(f"Download small copy ({preview_height(self.info.get('duration'))}p)")
+        a.setCheckable(True)
+        a.setChecked(self._pv_kind == "copy")
+        a.setActionGroup(grp)
+        a.triggered.connect(lambda: self._switch_preview("download"))
+        m.exec(self.lbl_pv_src.mapToGlobal(QtCore.QPoint(0, self.lbl_pv_src.height() + 2)))
+
+    def _switch_preview(self, mode, q=None):
+        """Changes the preview source and quality, stays at the same spot."""
+        pos = self._player_pos() or 0.0
+        self.cfg["preview_mode"] = mode
+        if q is not None:
+            self.cfg["stream_q"] = q
+        save_cfg(self.cfg)
+        if getattr(self, "settings_dlg", None) is not None:
+            try:
+                self.settings_dlg.seg_pv.set_value(mode)
+            except Exception:  # noqa: BLE001 - dialog closed / no such control
+                pass
+        self._stop_playback()
+        self._resume_at = pos
+        url = self.info_url
+        if mode == "stream" and self._can_stream(url):
+            self._start_stream()
+        elif url in self._pv_cache and Path(self._pv_cache[url]).exists():
+            self._load_player(self._pv_cache[url], True, kind="copy")
+        else:
+            kept = find_preview(self.info)
+            if kept is not None:
+                self._pv_cache[url] = str(kept)
+                self._load_player(str(kept), True, kind="copy")
+            else:
+                self._load_preview()
+
     def _can_stream(self, url=None):
         url = url or self.info_url
         return bool(self.info.get("stream")) and url not in self._stream_failed
@@ -9355,7 +9570,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toggle_play()
 
     def _start_stream(self):
-        st = self.info.get("stream")
+        st = self._cur_stream()
         if not st:
             return self._load_preview()
         try:
@@ -9442,15 +9657,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport.show()
         self.vview.show_video(has_video)
         site = "YouTube"
-        self.lbl_pv_src.setText({"stream": f"streaming from {site}", "copy": "preview copy (360p)",
-                                 "file": "your file"}.get(kind, ""))
+        sh = ((self._cur_stream() or {}).get("video") or {}).get("height") if kind == "stream" else None
+        ch = preview_height(self.info.get("duration")) if kind == "copy" else None
+        self.lbl_pv_src.setText({"stream": f"streaming from {site}" + (f" · {sh}p" if sh else "") + "  ▾",
+                                 "copy": f"preview copy ({ch}p)  ▾", "file": "your file"}.get(kind, ""))
+        self.lbl_pv_src.setEnabled(kind != "file")
         tip(self.lbl_pv_src, "Preview source", {
             "stream": f"Played straight from {site} through the app – nothing is downloaded for the preview. "
-                      "Switch to a downloaded copy in Settings.",
-            "copy": "A small 360p copy, only for the preview – your download uses the quality you pick.",
+                      "Click to pick the quality or switch to a downloaded copy.",
+            "copy": "A small copy, only for the preview – your download uses the quality you pick. Click to "
+                    "stream from YouTube instead.",
             "file": "Your own file is played directly."}.get(kind, ""))
+        resume = getattr(self, "_resume_at", None)
+        self._resume_at = None
         rng = self._cur_range()
-        if rng and rng[0] > 0:
+        if resume:
+            self._seek_to(resume)
+        elif rng and rng[0] > 0:
             self._seek_to(rng[0])
 
     def _on_mstatus(self, st):

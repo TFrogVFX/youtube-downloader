@@ -1067,6 +1067,7 @@ def fetch_info(url: str) -> dict:
         "playlist": len(list(entries)) if entries is not None else 0,
         "fps": info.get("fps") or max((f.get("fps") or 0 for f in info.get("formats") or []), default=0) or None,
         "stream": pick_streams(info) if entries is None else None,
+        "streams": stream_choices(info) if entries is None else {},
     }
 
 

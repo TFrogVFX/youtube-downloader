@@ -37,9 +37,28 @@ def _stream_fmt(f, info) -> dict:
             "height": f.get("height"), "fps": f.get("fps")}
 
 
-def pick_streams(info) -> dict | None:
+STREAM_QUALITIES = (360, 480, 720, 1080)
+
+
+def stream_choices(info) -> dict:
+    """The preview stream in a few qualities: {'auto': …, 360: …, 720: …} (only heights the video really has)."""
+    out = {"auto": pick_streams(info)}
+    if not out["auto"]:
+        return out
+    seen = set()
+    for q in STREAM_QUALITIES:
+        st = pick_streams(info, q)
+        h = st and st["video"].get("height")
+        if st and h and h not in seen and min(h, 9999) <= q:
+            seen.add(h)
+            out[q] = st
+    return out
+
+
+def pick_streams(info, target=None) -> dict | None:
     """Plain HTTP files of the video for the player: one with picture + sound if there is one (≤720p),
-    else a picture-only file (around 480p, H.264 preferred) plus a sound-only file."""
+    else a picture-only file (around 480p, H.264 preferred) plus a sound-only file. With `target` (a height):
+    the picture closest to it (not above), with a separate sound file if needed."""
     fmts = [f for f in info.get("formats") or []
             if f.get("url") and str(f.get("protocol") or "") in ("http", "https")
             and not f.get("fragments") and f.get("ext") in ("mp4", "webm", "m4a")]
@@ -59,6 +78,19 @@ def pick_streams(info) -> dict | None:
         return (abs(min(h, 720) - 480) if h else 9999, 0 if str(f.get("vcodec") or "").startswith("avc") else 1,
                 f.get("tbr") or 0)
 
+    if target:
+        vids = [f for f in fmts if has_v(f) and short(f) and short(f) <= target]
+        if not vids:
+            return None
+        top = max(short(f) for f in vids)
+        cands = [f for f in vids if short(f) == top]
+        v = min(cands, key=lambda f: (0 if has_a(f) else 1, 0 if str(f.get("vcodec") or "").startswith("avc") else 1,
+                                      f.get("tbr") or 0))
+        if has_a(v):
+            return {"video": _stream_fmt(v, info), "audio": None, "fps": v.get("fps")}
+        auds = [f for f in fmts if has_a(f) and not has_v(f)]
+        a = min(auds, key=lambda f: (0 if f.get("ext") == "m4a" else 1, abs((f.get("abr") or 128) - 128))) if auds else None
+        return {"video": _stream_fmt(v, info), "audio": _stream_fmt(a, info) if a else None, "fps": v.get("fps")}
     both = [f for f in fmts if has_v(f) and has_a(f) and short(f) <= 720]
     if both:
         best = min(both, key=vrank)

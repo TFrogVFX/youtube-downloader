@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.8"
+APP_VERSION = "2.9.9"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -96,12 +96,6 @@ AUDIO_HINTS = {"mp3": "With title, artist and cover art.",
 
 # ---- hover help (Settings → "Show help when hovering")
 ITEM_HELP = {
-    "No upscaling": "The picture keeps its size.",
-    "2× (AI)": "Twice as wide and high, with AI detail (e.g. 1080p -> 4K). Takes a while for videos.",
-    "4× (AI)": "Four times as wide and high, with AI detail. For small pictures – slow for videos.",
-    "Normal (Real-ESRGAN)": "For filmed things, games, photos. Removes compression blocks and adds detail.",
-    "Anime – fast (Real-ESRGAN)": "For anime / drawings – quick, clean lines.",
-    "Anime – best (Real-CUGAN)": "For anime / drawings – the sharpest lines and textures, slower.",
     # quality
     "Best available": "The highest resolution this video has.",
     "2160p (4K)": "Up to 3840 × 2160. Big files.",
@@ -155,13 +149,29 @@ ITEM_HELP = {
     "Light": "Bright theme for daylight.",
 }
 # ---- frame (crop)
-# AI upscaling (Output tab; also Save frame / Save thumbnail)
-AI_UPSCALES = {"No upscaling": None, "2× (AI)": 2, "4× (AI)": 4}
-AI_MODELS = {   # label -> (engine, model)
-    "Normal (Real-ESRGAN)": ("esrgan", "normal"),
-    "Anime – fast (Real-ESRGAN)": ("esrgan", "anime"),
-    "Anime – best (Real-CUGAN)": ("cugan", "se"),
+# AI upscaling for pictures (Save frame / Save thumbnail) – label -> (engine, model, file key or None, help)
+AI_UPSCALES = {"Off": None, "2×": 2, "4×": 4}
+AI_MODELS = {
+    "UltraSharp – photos, films": ("esrgan", "ultrasharp-4x", "ultrasharp",
+                                   "4x-UltraSharp (Kim2091): very sharp, lots of detail – the favourite for real "
+                                   "footage, games and photos."),
+    "Siax – natural detail (large)": ("esrgan", "4x_NMKD-Siax_200k", "siax",
+                                      "4x NMKD Siax (Nmkd), the big 64 MB model: natural, calm detail, good on faces "
+                                      "and skin."),
+    "Nomos8kSC – YouTube / compressed": ("esrgan", "4xNomos8kSC", "nomos",
+                                         "4xNomos8kSC (Phhofm): trained on blurry, compressed pictures – cleans "
+                                         "YouTube blocks and noise while it upscales."),
+    "Real-ESRGAN – classic": ("esrgan", "realesrgan-x4plus", None,
+                              "Real-ESRGAN x4plus (xinntao): the all-rounder, a bit softer."),
+    "Real-CUGAN Pro – anime best": ("cugan", "pro", None,
+                                    "Real-CUGAN Pro (Bilibili): the cleanest anime lines and flat colors. "
+                                    "2× uses the Pro model, 4× the SE model."),
+    "HFA2k – anime detailed": ("esrgan", "4xHFA2k", "hfa2k",
+                               "4xHFA2k (Phhofm): High Fidelity Anime – keeps fine lines, texture and grain."),
+    "Real-ESRGAN anime – fast": ("esrgan", "realesrgan-x4plus-anime", None,
+                                 "Real-ESRGAN x4plus anime: quick and clean."),
 }
+DEFAULT_AI_MODEL = "UltraSharp – photos, films"
 FREE = "free"            # "Custom": a box of any shape
 ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "Custom": FREE}
 # volume curve: how the volume goes from a point to the next one
