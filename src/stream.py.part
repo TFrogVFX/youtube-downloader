@@ -5,6 +5,26 @@
 STREAM_CHUNK = 2 * 1024 * 1024   # bytes per request to YouTube (big open requests get throttled)
 
 
+_NET: dict = {"ydl": None, "key": None}
+_NET_LOCK = threading.Lock()
+
+
+def _net_ydl():
+    """One yt-dlp instance for the proxy's requests: the same network code, login, proxy settings and certificates
+    as yt-dlp's own downloads – on some PCs YouTube refuses everything else (403)."""
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        return None
+    key = repr(sorted((k, str(v)) for k, v in YDL_EXTRA.items()))
+    with _NET_LOCK:
+        if _NET["ydl"] is None or _NET["key"] != key:
+            # the old one is just dropped: closing it would write its cookies back (e.g. after signing out)
+            _NET["ydl"] = YoutubeDL({"quiet": True, "no_warnings": True, "logger": _Silent(), **YDL_EXTRA})
+            _NET["key"] = key
+        return _NET["ydl"]
+
+
 def _stream_fmt(f, info) -> dict:
     hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
             if k.lower() not in ("accept-encoding", "range")}
@@ -63,6 +83,7 @@ class StreamProxy:
         proxy = self
         self.items: dict[str, dict] = {}
         self._n = 0
+        self.last_error = ""      # what YouTube answered when a request failed (for the log)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -96,9 +117,18 @@ class StreamProxy:
 
     @staticmethod
     def _open(item, a, b):
+        hdrs = {**item["headers"], "Range": f"bytes={a}-{b}", "Accept-Encoding": "identity"}
+        ydl = _net_ydl()
+        if ydl is not None:
+            from yt_dlp.networking import Request
+            hdrs.pop("Cookie", None)        # yt-dlp adds the cookies itself (same as for its own downloads)
+            return ydl.urlopen(Request(item["url"], headers=hdrs, extensions={"timeout": 20}))
         import urllib.request
-        req = urllib.request.Request(item["url"], headers={**item["headers"], "Range": f"bytes={a}-{b}"})
-        return urllib.request.urlopen(req, timeout=20)
+        return urllib.request.urlopen(urllib.request.Request(item["url"], headers=hdrs), timeout=20)
+
+    def _fail(self, ex) -> None:
+        msg = clean_error(ex).splitlines()[0][:200] if str(ex) else type(ex).__name__
+        self.last_error = msg
 
     def _size(self, item) -> int:
         if not item.get("size"):
@@ -114,7 +144,8 @@ class StreamProxy:
             return
         try:
             total = self._size(item)
-        except Exception:  # noqa: BLE001 - expired link, no internet …
+        except Exception as ex:  # noqa: BLE001 - expired link, no internet, 403 …
+            self._fail(ex)
             h.send_error(502)
             return
         m = re.match(r"bytes=(\d*)-(\d*)", h.headers.get("Range") or "")
@@ -142,19 +173,30 @@ class StreamProxy:
         if head:
             return
         pos = start
-        try:
-            while pos <= end:
-                b = min(end, pos + STREAM_CHUNK - 1)
-                with self._open(item, pos, b) as r:
-                    while True:
+        while pos <= end:
+            b = min(end, pos + STREAM_CHUNK - 1)
+            try:
+                r = self._open(item, pos, b)
+            except Exception as ex:  # noqa: BLE001 - YouTube said no (403 …), no internet
+                self._fail(ex)
+                break
+            client_gone = False
+            with r:
+                while True:
+                    try:
                         data = r.read(65536)
-                        if not data:
-                            break
+                    except Exception as ex:  # noqa: BLE001
+                        self._fail(ex)
+                        data = b""
+                    if not data:
+                        break
+                    try:
                         h.wfile.write(data)
-                        pos += len(data)
-                if pos <= b:          # YouTube sent less than asked -> stop cleanly
-                    break
-        except OSError:               # the player jumped elsewhere or stopped - normal
-            pass
+                    except OSError:      # the player jumped elsewhere or stopped - normal
+                        client_gone = True
+                        break
+                    pos += len(data)
+            if client_gone or pos <= b:  # YouTube sent less than asked -> stop cleanly
+                break
         if pos <= end:
             h.close_connection = True

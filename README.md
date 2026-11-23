@@ -6,10 +6,10 @@ Windows app for YouTube: download a clip (time range, frame-accurate), the audio
 - Several clips: join them or save one file per clip, YouTube chapters → clips
 - Codecs: H.264, H.265, ProRes 422 / HQ, target size in MB, NVIDIA encoder
 - Frame: crop to 9:16, 1:1, 3:4 or 16:9 with a box you can drag (Shorts, Reels)
-- Upscale to 1080p / 1440p / 4K or 2× – 4×, normal or with AI (Real-ESRGAN, own ncnn models possible)
+- Upscale to 1080p / 1440p / 4K or 2× – 4×
 - Volume curve (fades, ducking, muting), save the frame you see as PNG
 - Subtitles: load (YouTube, your file, .srt / .vtt / .ass), edit, own font, colors, place anywhere, burn in or add as track
-- History of all links, themes and accent colors, hover help
+- History of all links, own folders for the history and the small preview copies, themes and accent colors, hover help
 
 ## Install
 

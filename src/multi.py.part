@@ -38,6 +38,69 @@ def preview_video(url, outdir, *, ffmpeg, emit, duration=None) -> Path:
     return Path(files[0])
 
 
+PREVIEW_RX = re.compile(r".* \[([\w-]+)\] preview \d+p\.(mp4|mkv|webm)$", re.I)
+
+
+def preview_dir() -> Path:
+    return Path(PATHS["preview"])
+
+
+def preview_name(info) -> str:
+    """'<title> [<id>] preview 360p' – readable, and the app finds it again by the id."""
+    title = safe_name(info.get("title") or "video")[:80].strip() or "video"
+    vid = re.sub(r"[^\w-]+", "", str(info.get("id") or "")) or "x"
+    return f"{title} [{vid}] preview {preview_height(info.get('duration'))}p"
+
+
+def preview_files(root=None) -> list:
+    root = Path(root or preview_dir())
+    try:
+        return [f for f in root.iterdir() if f.is_file() and PREVIEW_RX.match(f.name)]
+    except OSError:
+        return []
+
+
+def find_preview(info, root=None):
+    vid = re.sub(r"[^\w-]+", "", str(info.get("id") or ""))
+    if not vid:
+        return None
+    for f in preview_files(root):
+        if PREVIEW_RX.match(f.name).group(1) == vid and f.stat().st_size > 0:
+            return f
+    return None
+
+
+def preview_cleanup(keep: bool, root=None) -> int:
+    """Leftovers of unfinished downloads always go; the copies themselves only if they are not to be kept.
+    Only files the app made are touched (the folder can be one of the user's own). -> files removed."""
+    root = Path(root or preview_dir())
+    n = 0
+    if root.is_dir():
+        for d in root.iterdir():
+            if d.is_dir() and (d.name.startswith(".dl_") or (root == DEFAULT_PATHS["preview"] and
+                                                              re.fullmatch(r"p\d+", d.name))):
+                shutil.rmtree(d, ignore_errors=True)
+    if not keep:
+        for f in preview_files(root):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:      # still open in the player
+                pass
+    return n
+
+
+def preview_stats(root=None) -> dict:
+    fs = preview_files(root)
+    return {"files": len(fs), "bytes": sum(f.stat().st_size for f in fs)}
+
+
+def fmt_bytes(n) -> str:
+    n = float(n or 0)
+    return f"{n / 1073741824:.1f} GB" if n >= 1073741824 else f"{n / 1048576:.0f} MB" if n >= 1048576 \
+        else f"{n / 1024:.0f} KB"
+
+
 # ----------------------------------------------------------------------------- several clips
 
 def _sub_emit(emit, k, n, label):

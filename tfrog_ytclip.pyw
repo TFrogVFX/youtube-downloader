@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.7.2"
+APP_VERSION = "2.8.0"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -143,20 +143,13 @@ ITEM_HELP = {
     "Smaller (128 colors)": "Smaller file, slight banding in gradients.",
     "Smallest (64 colors)": "Smallest file, visible banding.",
     # upscaling
-    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",
+    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",  # enlarging: Lanczos
     "2×": "Twice as wide and high.",
     "3×": "Three times as wide and high.",
     "4×": "Four times as wide and high.",
     "To 1080p": "Short side 1080 px: 1920 × 1080, or 1080 × 1920 for a 9:16 crop (Reels / Shorts / TikTok).",
     "To 1440p": "Short side 1440 px: 2560 × 1440, or 1440 × 2560 for 9:16.",
     "To 4K (2160p)": "Short side 2160 px: 3840 × 2160, or 2160 × 3840 for 9:16.",
-    "Standard (fast)": "Normal scaling (Lanczos) – instant, a bit soft when enlarging a lot.",
-    "AI · real footage": "Real-ESRGAN x4plus: invents fine detail. Slow (about 0.3–2 s per frame on a graphics card) – "
-                         "best for stills and short clips.",
-    "AI · anime video": "Real-ESRGAN anime video model: clean lines, fast, steady from frame to frame.",
-    "AI · anime stills": "Real-ESRGAN x4plus-anime: the sharpest anime model, slower – great for single frames.",
-    "Load own model …": "Add a Real-ESRGAN compatible ncnn model (a .param + .bin pair, e.g. 4x-UltraSharp from the "
-                "Upscayl model collection).",
     # theme
     "Dark": "Neutral dark grey.",
     "Midnight": "Dark blue.",
@@ -167,15 +160,8 @@ ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "3:4": 
 # upscaling (Output tab): target of the result -> ("x", factor) or ("short", short side in px)
 UPSCALES = {"Off": None, "2×": ("x", 2), "3×": ("x", 3), "4×": ("x", 4), "To 1080p": ("short", 1080),
             "To 1440p": ("short", 1440), "To 4K (2160p)": ("short", 2160)}
-# built-in models: label -> (kind, Real-ESRGAN model name, native scale; None = the model can do 2/3/4)
-MODELS = {"Standard (fast)": ("std", None, None),
-          "AI · real footage": ("esr", "realesrgan-x4plus", 4),
-          "AI · anime video": ("esr", "realesr-animevideov3", None),
-          "AI · anime stills": ("esr", "realesrgan-x4plus-anime", 4)}
-MODEL_LOAD = "Load own model …"
 # volume curve: how the volume goes from a point to the next one
 EASES = {"Linear": "linear", "Easy ease": "ease", "Ease in": "in", "Ease out": "out", "Hold": "hold"}
-CUSTOM_MODELS_DIR = APP_DIR / "models"
 FONTS_DIR = APP_DIR / "fonts"
 SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
              "bold": True, "pos": None}
@@ -183,14 +169,10 @@ COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies), taken f
 SIGNIN_DIR = APP_DIR / "signin"                 # own browser profile for the sign-in (your normal one stays untouched)
 LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&hl=en"
              "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3D%252F")
-UPSCALER_DIR = APP_DIR / "upscaler"
-UPSCALER_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
-                "realesrgan-ncnn-vulkan-20220424-windows.zip")
-UPSCALER_SHA256 = "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d"
-UPSCALER_MB = 45
-HISTORY_FILE = APP_DIR / "history.json"
-HISTORY_DIR = APP_DIR / "history"
 HISTORY_MAX = 500
+# where the history (links + small pictures) and the small preview copies are kept – changeable in Settings
+DEFAULT_PATHS = {"history": APP_DIR / "history", "preview": APP_DIR / "preview"}
+PATHS = dict(DEFAULT_PATHS)
 SUB_TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 
 LOCAL_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".m2ts", ".mts", ".flv", ".wmv", ".mpg",
@@ -209,7 +191,7 @@ ACCENTS = [("Lime", "#c4f240"), ("Mint", "#3ddc97"), ("Cyan", "#22d3ee"), ("Blue
            ("Violet", "#a78bfa"), ("Pink", "#ff5fa2"), ("Red", "#ff4d4d"), ("Orange", "#ff9f43"),
            ("Yellow", "#ffd43b")]
 DEFAULT_THEME = "Dark"
-DEFAULT_ACCENT = "#c4f240"
+DEFAULT_ACCENT = "#ff4d4d"
 WARN_COLOR = "#f0b429"
 ERR_COLOR = "#ff6b6b"
 
@@ -1264,6 +1246,69 @@ def preview_video(url, outdir, *, ffmpeg, emit, duration=None) -> Path:
     return Path(files[0])
 
 
+PREVIEW_RX = re.compile(r".* \[([\w-]+)\] preview \d+p\.(mp4|mkv|webm)$", re.I)
+
+
+def preview_dir() -> Path:
+    return Path(PATHS["preview"])
+
+
+def preview_name(info) -> str:
+    """'<title> [<id>] preview 360p' – readable, and the app finds it again by the id."""
+    title = safe_name(info.get("title") or "video")[:80].strip() or "video"
+    vid = re.sub(r"[^\w-]+", "", str(info.get("id") or "")) or "x"
+    return f"{title} [{vid}] preview {preview_height(info.get('duration'))}p"
+
+
+def preview_files(root=None) -> list:
+    root = Path(root or preview_dir())
+    try:
+        return [f for f in root.iterdir() if f.is_file() and PREVIEW_RX.match(f.name)]
+    except OSError:
+        return []
+
+
+def find_preview(info, root=None):
+    vid = re.sub(r"[^\w-]+", "", str(info.get("id") or ""))
+    if not vid:
+        return None
+    for f in preview_files(root):
+        if PREVIEW_RX.match(f.name).group(1) == vid and f.stat().st_size > 0:
+            return f
+    return None
+
+
+def preview_cleanup(keep: bool, root=None) -> int:
+    """Leftovers of unfinished downloads always go; the copies themselves only if they are not to be kept.
+    Only files the app made are touched (the folder can be one of the user's own). -> files removed."""
+    root = Path(root or preview_dir())
+    n = 0
+    if root.is_dir():
+        for d in root.iterdir():
+            if d.is_dir() and (d.name.startswith(".dl_") or (root == DEFAULT_PATHS["preview"] and
+                                                              re.fullmatch(r"p\d+", d.name))):
+                shutil.rmtree(d, ignore_errors=True)
+    if not keep:
+        for f in preview_files(root):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:      # still open in the player
+                pass
+    return n
+
+
+def preview_stats(root=None) -> dict:
+    fs = preview_files(root)
+    return {"files": len(fs), "bytes": sum(f.stat().st_size for f in fs)}
+
+
+def fmt_bytes(n) -> str:
+    n = float(n or 0)
+    return f"{n / 1073741824:.1f} GB" if n >= 1073741824 else f"{n / 1048576:.0f} MB" if n >= 1048576 \
+        else f"{n / 1024:.0f} KB"
+
+
 # ----------------------------------------------------------------------------- several clips
 
 def _sub_emit(emit, k, n, label):
@@ -1521,6 +1566,26 @@ def export_multi(kind, src, clips, outdir, *, local, join, name, params, ffmpeg,
 STREAM_CHUNK = 2 * 1024 * 1024   # bytes per request to YouTube (big open requests get throttled)
 
 
+_NET: dict = {"ydl": None, "key": None}
+_NET_LOCK = threading.Lock()
+
+
+def _net_ydl():
+    """One yt-dlp instance for the proxy's requests: the same network code, login, proxy settings and certificates
+    as yt-dlp's own downloads – on some PCs YouTube refuses everything else (403)."""
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        return None
+    key = repr(sorted((k, str(v)) for k, v in YDL_EXTRA.items()))
+    with _NET_LOCK:
+        if _NET["ydl"] is None or _NET["key"] != key:
+            # the old one is just dropped: closing it would write its cookies back (e.g. after signing out)
+            _NET["ydl"] = YoutubeDL({"quiet": True, "no_warnings": True, "logger": _Silent(), **YDL_EXTRA})
+            _NET["key"] = key
+        return _NET["ydl"]
+
+
 def _stream_fmt(f, info) -> dict:
     hdrs = {k: v for k, v in dict(f.get("http_headers") or info.get("http_headers") or {}).items()
             if k.lower() not in ("accept-encoding", "range")}
@@ -1579,6 +1644,7 @@ class StreamProxy:
         proxy = self
         self.items: dict[str, dict] = {}
         self._n = 0
+        self.last_error = ""      # what YouTube answered when a request failed (for the log)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -1612,9 +1678,18 @@ class StreamProxy:
 
     @staticmethod
     def _open(item, a, b):
+        hdrs = {**item["headers"], "Range": f"bytes={a}-{b}", "Accept-Encoding": "identity"}
+        ydl = _net_ydl()
+        if ydl is not None:
+            from yt_dlp.networking import Request
+            hdrs.pop("Cookie", None)        # yt-dlp adds the cookies itself (same as for its own downloads)
+            return ydl.urlopen(Request(item["url"], headers=hdrs, extensions={"timeout": 20}))
         import urllib.request
-        req = urllib.request.Request(item["url"], headers={**item["headers"], "Range": f"bytes={a}-{b}"})
-        return urllib.request.urlopen(req, timeout=20)
+        return urllib.request.urlopen(urllib.request.Request(item["url"], headers=hdrs), timeout=20)
+
+    def _fail(self, ex) -> None:
+        msg = clean_error(ex).splitlines()[0][:200] if str(ex) else type(ex).__name__
+        self.last_error = msg
 
     def _size(self, item) -> int:
         if not item.get("size"):
@@ -1630,7 +1705,8 @@ class StreamProxy:
             return
         try:
             total = self._size(item)
-        except Exception:  # noqa: BLE001 - expired link, no internet …
+        except Exception as ex:  # noqa: BLE001 - expired link, no internet, 403 …
+            self._fail(ex)
             h.send_error(502)
             return
         m = re.match(r"bytes=(\d*)-(\d*)", h.headers.get("Range") or "")
@@ -1658,20 +1734,31 @@ class StreamProxy:
         if head:
             return
         pos = start
-        try:
-            while pos <= end:
-                b = min(end, pos + STREAM_CHUNK - 1)
-                with self._open(item, pos, b) as r:
-                    while True:
+        while pos <= end:
+            b = min(end, pos + STREAM_CHUNK - 1)
+            try:
+                r = self._open(item, pos, b)
+            except Exception as ex:  # noqa: BLE001 - YouTube said no (403 …), no internet
+                self._fail(ex)
+                break
+            client_gone = False
+            with r:
+                while True:
+                    try:
                         data = r.read(65536)
-                        if not data:
-                            break
+                    except Exception as ex:  # noqa: BLE001
+                        self._fail(ex)
+                        data = b""
+                    if not data:
+                        break
+                    try:
                         h.wfile.write(data)
-                        pos += len(data)
-                if pos <= b:          # YouTube sent less than asked -> stop cleanly
-                    break
-        except OSError:               # the player jumped elsewhere or stopped - normal
-            pass
+                    except OSError:      # the player jumped elsewhere or stopped - normal
+                        client_gone = True
+                        break
+                    pos += len(data)
+            if client_gone or pos <= b:  # YouTube sent less than asked -> stop cleanly
+                break
         if pos <= end:
             h.close_connection = True
 
@@ -2106,7 +2193,7 @@ def _clip_names(outdir, name, labels, join, ext, base):
 
 
 def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx, ffmpeg, ffprobe, emit, info=None):
-    """Clips -> pieces in a good intermediate quality -> crop / scale (AI upscale) / volume curve / subtitles
+    """Clips -> pieces in a good intermediate quality -> crop / scale / volume curve / subtitles
     in one more encode. join: all clips in one file, else one file per clip."""
     n = len(clips)
     ext = _kind_ext(kind, params)
@@ -2123,7 +2210,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
     elif kind == "gif" and mode == "track":
         mode = "burn"
     vol = fx.get("vol") or []
-    model = fx.get("model") or {"kind": "std"}
     steps = n + len(groups)
     step = [0]
 
@@ -2165,12 +2251,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                 crops.append(crop_rect(boxes[k], inf["width"], inf["height"], aspect) if aspect else None)
             cw, ch = (crops[0][0], crops[0][1]) if aspect else (infos[0]["width"], infos[0]["height"])
             W, H = target_dims(cw, ch, fx.get("up") if kind == "mp4" else None, aspect)
-            if kind == "mp4" and model.get("kind") == "esr" and W > cw * 1.05:
-                for j, (p, cr) in enumerate(zip(ps, crops)):
-                    ps[j] = ai_upscale_video(p, cr, (W, H), model, tmp, f"{gi}_{j}", ffmpeg=ffmpeg,
-                                             ffprobe=ffprobe, emit=gemit)
-                    crops[j] = None
-                infos = [media_info(p, ffprobe) for p in ps]
             segs, off = [], 0.0
             for k, inf in zip(g, infos):
                 segs.append((clips[k][0], clips[k][1], off))
@@ -2207,238 +2287,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ----------------------------------------------------------------------------- AI upscaler (Real-ESRGAN)
-
-def upscaler_exe() -> Path | None:
-    for name in ("realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan"):
-        p = UPSCALER_DIR / name
-        if p.is_file() and (UPSCALER_DIR / "models").is_dir():
-            return p
-    return None
-
-
-def install_upscaler(progress=None) -> Path:
-    """Downloads Real-ESRGAN (ncnn / Vulkan – runs on NVIDIA, AMD and Intel graphics, no CUDA needed)."""
-    import hashlib
-    import urllib.request
-    import zipfile
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    zpath = APP_DIR / "upscaler_download.zip"
-    h = hashlib.sha256()
-    req = urllib.request.Request(UPSCALER_URL, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r, open(zpath, "wb") as f:
-            total = int(r.headers.get("Content-Length") or 0) or UPSCALER_MB * 1048576
-            done = 0
-            while True:
-                chunk = r.read(1 << 18)
-                if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
-                done += len(chunk)
-                if progress:
-                    progress(min(99.0, done / total * 100))
-        if h.hexdigest() != UPSCALER_SHA256:
-            raise RuntimeError("The download is damaged (checksum does not match) – please try again.")
-        tmp = UPSCALER_DIR.with_name("upscaler_new")
-        shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
-        with zipfile.ZipFile(zpath) as z:
-            for m in z.infolist():
-                nm = m.filename.replace("\\", "/")
-                if nm.endswith("/") or ".." in nm:
-                    continue
-                if nm.startswith("models/") or nm.lower().endswith((".exe", ".dll")):
-                    out = tmp / nm
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    with z.open(m) as src, open(out, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-        shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
-        os.replace(tmp, UPSCALER_DIR)
-    finally:
-        zpath.unlink(missing_ok=True)
-    if progress:
-        progress(100.0)
-    exe = upscaler_exe()
-    if not exe:
-        raise RuntimeError("The upscaler could not be installed.")
-    return exe
-
-
-def remove_upscaler() -> None:
-    shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
-
-
-def list_custom_models() -> list:
-    """Own models: [{'name', 'scale'}] (files: CUSTOM_MODELS_DIR/<name>.param + .bin)."""
-    try:
-        items = json.loads((CUSTOM_MODELS_DIR / "models.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    return [x for x in items if isinstance(x, dict) and (CUSTOM_MODELS_DIR / f"{x.get('name')}.param").is_file()
-            and (CUSTOM_MODELS_DIR / f"{x.get('name')}.bin").is_file()]
-
-
-def import_model(param_path, scale=None) -> dict:
-    """Copies an ncnn model (.param + .bin next to it) into the app. The scale is read from the name
-    (4x-UltraSharp, RealESRGAN_x2plus …) if not given, else 4."""
-    src = Path(param_path)
-    if src.suffix.lower() == ".bin":
-        src = src.with_suffix(".param")
-    binf = src.with_suffix(".bin")
-    if not src.is_file() or not binf.is_file():
-        raise RuntimeError("A model needs two files with the same name: NAME.param and NAME.bin.")
-    head = src.read_text(encoding="utf-8", errors="replace")[:200]
-    if not head.strip().startswith("7767517"):
-        raise RuntimeError("This is not an ncnn model (.param). Real-ESRGAN needs ncnn models, not .pth / .onnx.")
-    name = re.sub(r"[^\w.+-]+", "-", src.stem).strip("-") or "model"
-    if "realesr-animevideov3" in name or name in {m[1] for m in MODELS.values()}:
-        name += "-own"
-    if not scale:
-        m = re.search(r"(?i)(?:^|[^a-z0-9])(?:x([1-8])|([1-8])x)(?=[^a-z0-9]|plus|$)", src.stem)
-        scale = int(m.group(1) or m.group(2)) if m else 4
-    CUSTOM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, CUSTOM_MODELS_DIR / f"{name}.param")
-    shutil.copyfile(binf, CUSTOM_MODELS_DIR / f"{name}.bin")
-    items = [x for x in list_custom_models() if x["name"] != name] + [{"name": name, "scale": int(scale)}]
-    (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
-    return {"name": name, "scale": int(scale)}
-
-
-def remove_model(name) -> None:
-    for ext in (".param", ".bin"):
-        (CUSTOM_MODELS_DIR / f"{name}{ext}").unlink(missing_ok=True)
-    items = [x for x in list_custom_models() if x["name"] != name]
-    if CUSTOM_MODELS_DIR.is_dir():
-        (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
-
-
-def model_spec(label) -> dict:
-    """Menu entry -> {'kind': 'std'} or {'kind': 'esr', 'name', 'scale', 'dir'}."""
-    if label in MODELS:
-        kind, name, scale = MODELS[label]
-        return {"kind": kind, "name": name, "scale": scale, "dir": None, "label": label}
-    for x in list_custom_models():
-        if label == f"Own · {x['name']}":
-            return {"kind": "esr", "name": x["name"], "scale": x["scale"], "dir": str(CUSTOM_MODELS_DIR),
-                    "label": label}
-    return {"kind": "std", "label": label}
-
-
-def _esr_model(model, need):
-    """-> (model name, scale, folder). The anime video model can do 2×/3×/4×, the others their own scale."""
-    if isinstance(model, str):     # old style: "real" / "anime"
-        model = model_spec("AI · anime video" if model == "anime" else "AI · real footage")
-    name = model.get("name") or "realesrgan-x4plus"
-    if name == "realesr-animevideov3":
-        scale = 2 if need <= 2 else 3 if need <= 3 else 4
-    else:
-        scale = int(model.get("scale") or 4)
-    return name, scale, model.get("dir")
-
-
-def _run_esr(src_dir, out_dir, model, scale, on_tick=None, model_dir=None):
-    exe = upscaler_exe()
-    if not exe:
-        raise RuntimeError("The AI upscaler is not installed – Settings → AI upscaler → Install.")
-    cmd = [str(exe), "-i", str(src_dir), "-o", str(out_dir), "-n", model, "-s", str(scale), "-f", "png",
-           "-m", str(model_dir or exe.parent / "models")]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=str(exe.parent),
-                            creationflags=NO_WINDOW)
-    err: list[bytes] = []
-    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
-    reader.start()
-    while proc.poll() is None:
-        if on_tick:
-            on_tick()
-        time.sleep(0.4)
-    reader.join(5)
-    if proc.returncode != 0:
-        lines = [x for x in b"".join(err).decode("utf-8", "replace").splitlines()
-                 if x.strip() and not re.match(r"^\s*\d+(\.\d+)?%\s*$", x)]
-        tail = "\n".join(lines[-4:])
-        hint = (" Your graphics card needs Vulkan support (current NVIDIA / AMD / Intel driver)."
-                if re.search(r"vulkan|gpu|device", tail, re.I) or not tail else "")
-        raise RuntimeError(f"AI upscaling failed.{hint}" + (f"\n{tail}" if tail else ""))
-
-
-def ai_upscale_video(piece, crop, size, model, tmp, tag, *, ffmpeg, ffprobe, emit) -> Path:
-    """One piece -> frames (cropped) -> Real-ESRGAN in batches -> scaled to `size` and encoded again.
-    Batches keep the disk usage small (big PNG frames are deleted as soon as they are encoded)."""
-    inf = media_info(piece, ffprobe)
-    W, H = size
-    cw, ch = (crop[0], crop[1]) if crop else (inf["width"], inf["height"])
-    name, scale, mdir = _esr_model(model, max(W / cw, H / ch))
-    label_ = (model.get("label") if isinstance(model, dict) else "") or name
-    fin = Path(tmp) / f"esr_in_{tag}"
-    fin.mkdir(parents=True, exist_ok=True)
-    emit("status", "Preparing frames for AI upscaling …")
-    emit("progress", None)
-    vf = [f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
-    r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(piece),
-                        *(["-vf", ",".join(vf)] if vf else []), "-fps_mode", "passthrough",
-                        str(fin / "%06d.png")], capture_output=True, creationflags=NO_WINDOW)
-    if r.returncode != 0:
-        raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-400:])
-    frames = sorted(fin.glob("*.png"))
-    total = len(frames)
-    if not total:
-        raise RuntimeError("No frames to upscale.")
-    per = max(1, (cw * scale) * (ch * scale) * 2)     # rough PNG size of one upscaled frame
-    batch = int(min(200, max(8, 1.5e9 // per)))
-    dst = Path(tmp) / f"esr_{tag}.mp4"
-    enc = subprocess.Popen(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", inf["rate"],
-         "-c:v", "png", "-i", "-", "-i", str(piece), "-map", "0:v:0", "-map", "1:a:0?",
-         "-vf", f"scale={W}:{H}:flags=lanczos,setsar=1", "-c:v", "libx264", "-preset", "medium",
-         "-crf", str(PIECE_CRF - 2), "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(dst)],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-    t0 = time.time()
-    done = 0
-    try:
-        for b0 in range(0, total, batch):
-            bin_ = Path(tmp) / f"esr_b_{tag}"
-            bout = Path(tmp) / f"esr_o_{tag}"
-            for d in (bin_, bout):
-                shutil.rmtree(d, ignore_errors=True)
-                d.mkdir()
-            chunk = frames[b0:b0 + batch]
-            for f in chunk:
-                os.replace(f, bin_ / f.name)
-
-            def tick(b0=b0, bout=bout):
-                k = b0 + len(list(bout.glob("*.png")))
-                el = time.time() - t0
-                eta = el / k * (total - k) if k else 0
-                emit("progress", k / total * 100)
-                emit("status", f"AI upscaling ({label_}) · "
-                               f"frame {k}/{total}" + (f" · {int(eta) // 60}:{int(eta) % 60:02d} left" if k else ""))
-            _run_esr(bin_, bout, name, scale, tick, mdir)
-            for f in chunk:
-                out = bout / f.name
-                if not out.is_file():
-                    raise RuntimeError(f"AI upscaling stopped at frame {done + 1}.")
-                enc.stdin.write(out.read_bytes())
-                out.unlink()
-                done += 1
-            shutil.rmtree(bin_, ignore_errors=True)
-            shutil.rmtree(bout, ignore_errors=True)
-        enc.stdin.close()
-        rc = enc.wait()
-        if rc != 0:
-            raise RuntimeError("FFmpeg error:\n" + enc.stderr.read().decode("utf-8", "replace").strip()[-400:])
-    except BaseException:
-        try:
-            enc.kill()
-        except OSError:
-            pass
-        raise
-    finally:
-        shutil.rmtree(fin, ignore_errors=True)
-    return dst
-
-
 # ----------------------------------------------------------------------------- still frame
 
 def _cookie_header(s) -> str:
@@ -2452,16 +2300,57 @@ def _cookie_header(s) -> str:
     return "; ".join(out)
 
 
+def _still_format(height, direct=False) -> dict:
+    """Best picture up to `height`, H.264 / MP4 first (quick to seek). direct: only plain files (no HLS / DASH
+    playlists) – the local proxy can only pass those on."""
+    lim = f"[height<={height}]" if height else ""
+    alts = [f"bv*{lim}", f"b{lim}"] + (["bv*", "b"] if lim else [])
+    if direct:
+        alts = [x + "[protocol^=http][protocol!*=dash]" for x in alts] + alts
+    fmt = "/".join(alts)
+    return {"format": fmt, "format_sort": [f"res:{height}" if height else "res", "fps", "vcodec:h264", "ext:mp4"]}
+
+
 def media_url(url, height=None) -> dict:
     """The best picture up to `height` as a stream item (address + the HTTP headers yt-dlp uses) – for single
-    frames. Prefers H.264 / MP4 (quick to seek)."""
-    fmt = f"bv*[height<={height}]/b[height<={height}]/bv*/b" if height else "bv*/b"
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "format": fmt,
-            "format_sort": [f"res:{height}" if height else "res", "fps", "vcodec:h264", "ext:mp4"],
-            "logger": _Silent(), **YDL_EXTRA}
+    frames."""
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+            "logger": _Silent(), **_still_format(height, direct=True), **YDL_EXTRA}
     info = ydl_extract(opts, url, download=False)
     f = (info.get("requested_formats") or [info])[0]
     return _stream_fmt(f, info)
+
+
+def section_file(url, height, seek, outdir, *, ffmpeg, emit) -> Path:
+    """Second way for single frames: yt-dlp cuts a short piece starting exactly at `seek` (the same way clips are
+    downloaded), stored lossless -> its first frame is the wanted one."""
+    opts = _base_opts(outdir, "", True, emit, name="frame_piece")
+    opts.update({**_still_format(height), "overwrites": True,
+                 "download_ranges": make_ranges(seek, seek + 0.5),
+                 "force_keyframes_at_cuts": True,
+                 "external_downloader_args": {"ffmpeg_o": ["-map", "0:v:0", "-c:v", "libx264", "-preset", "ultrafast",
+                                                            "-qp", "0", "-an", "-sn", "-f", "mp4"]}})
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    info = ydl_extract(opts, url, download=True)
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("No piece was downloaded.")
+    return Path(files[0])
+
+
+def picture_file(url, height, outdir, *, ffmpeg, emit) -> Path:
+    """Last way for single frames: yt-dlp downloads the whole picture-only file (no sound) – works wherever
+    downloads work."""
+    opts = _base_opts(outdir, "", False, emit, name="frame_source")
+    opts.update({**_still_format(height), "overwrites": True})
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    info = ydl_extract(opts, url, download=True)
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("The video could not be downloaded.")
+    return Path(files[0])
 
 
 def _png_size(path):
@@ -2471,42 +2360,65 @@ def _png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
-def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model=None, ffmpeg, ffprobe, emit,
-                 short=None, enlarge=None) -> Path:
-    """The frame shown in the preview at time t, in full quality, as PNG (with crop / size / AI upscaling)."""
+def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, ffmpeg, ffprobe, emit,
+                 short=None) -> Path:
+    """The frame shown in the preview at time t, in full quality, as PNG (with crop / size)."""
     import tempfile
     fps = fps if fps and fps > 1 else 30.0
     frame = int(t * fps + 1e-3)
     seek = max(0.0, frame / fps - 0.5 / fps)        # first frame at or after this = the frame on screen
-    proxy = None
     with tempfile.TemporaryDirectory(prefix="ytclip_still_") as td:
         raw = Path(td) / "frame.png"
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
-        if local:
-            inp = str(src)
-        else:
-            # YouTube refuses FFmpeg's own big requests (403) – the small local proxy fetches the needed parts
-            # in pieces with yt-dlp's headers, exactly like the preview player
-            emit("status", "Finding the full-quality video …")
-            proxy = StreamProxy()
-            inp = proxy.add(media_url(src, height))
-        emit("status", "Grabbing the frame …")
-        cmd += ["-ss", f"{seek:.4f}", "-i", inp, "-frames:v", "1", "-update", "1", str(raw)]
-        try:
+
+        def grab(inp, at=None):
+            at = seek if at is None else at
+            cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *(["-ss", f"{at:.4f}"] if at else []),
+                   "-i", str(inp), "-frames:v", "1", "-update", "1", str(raw)]
             r = subprocess.run(cmd, capture_output=True, timeout=300, creationflags=NO_WINDOW)
-        finally:
-            if proxy is not None:
+            ok = r.returncode == 0 and raw.is_file() and raw.stat().st_size > 0
+            return ok, r.stderr.decode("utf-8", "replace").strip()
+
+        def why(err, extra=""):
+            last = (err.splitlines()[-1] if err else "") or "no picture"
+            return f"{extra}; {last}" if extra else last
+
+        if local:
+            emit("status", "Grabbing the frame …")
+            ok, err = grab(src)
+        else:
+            # 1) YouTube refuses FFmpeg's own requests (403) – the small local proxy fetches only the needed parts
+            #    in pieces through yt-dlp's network code, like the preview player (fast, nothing downloaded)
+            emit("status", "Finding the full-quality video …")
+            item = media_url(src, height)
+            proxy = StreamProxy()
+            try:
+                emit("status", "Grabbing the frame …")
+                ok, err = grab(proxy.add(item))
+            finally:
                 proxy.close()
-        if r.returncode != 0 or not raw.is_file():
-            raise RuntimeError("Could not grab the frame:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+            if not ok:
+                # 2) a half-second piece, cut by yt-dlp like a clip download
+                emit("log", f"Reading the frame straight from YouTube didn't work ({why(err, proxy.last_error)}) – "
+                            "downloading a short piece instead.")
+                emit("status", "Downloading a short piece for the frame …")
+                emit("progress", None)
+                try:
+                    ok, err = grab(section_file(src, height, seek, Path(td) / "piece", ffmpeg=ffmpeg, emit=emit), 0)
+                except Exception as ex:  # noqa: BLE001
+                    ok, err = False, clean_error(ex)
+            if not ok:
+                # 3) the whole picture-only file (slow for long videos, but works wherever downloads work)
+                emit("log", f"The short piece didn't work either ({why(err)}) – downloading the picture-only file.")
+                emit("status", "Downloading the video (picture only) for the frame …")
+                emit("progress", None)
+                ok, err = grab(picture_file(src, height, Path(td) / "src", ffmpeg=ffmpeg, emit=emit))
+        if not ok:
+            raise RuntimeError("Could not grab the frame:\n" + err[-300:])
         W, H = _png_size(raw)
         crop = crop_rect(box, W, H, aspect) if aspect else None
         cw, ch = (crop[0], crop[1]) if crop else (W, H)
         if up is None and short:
             up = ("short", short)
-        if model is None and enlarge in ("real", "anime"):
-            model = model_spec("AI · anime video" if enlarge == "anime" else "AI · real footage")
-        model = model or {"kind": "std"}
         ow, oh = target_dims(cw, ch, up, aspect)
         img = raw
         if crop:
@@ -2514,18 +2426,6 @@ def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model
             subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-vf",
                             f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}", str(img)],
                            check=True, capture_output=True, creationflags=NO_WINDOW)
-        if model.get("kind") == "esr" and ow > cw * 1.05:
-            emit("status", "AI upscaling the frame …")
-            emit("progress", None)
-            din, dout = Path(td) / "esr_in", Path(td) / "esr_out"
-            din.mkdir()
-            dout.mkdir()
-            shutil.copy(img, din / "f.png")
-            name, scale, mdir = _esr_model(model, max(ow / cw, oh / ch))
-            _run_esr(din, dout, name, scale, model_dir=mdir)
-            img = dout / "f.png"
-            if not img.is_file():
-                raise RuntimeError("AI upscaling produced no image.")
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(img)]
         if _png_size(img) != (ow, oh):
             cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
@@ -2537,27 +2437,44 @@ def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model
 
 # ----------------------------------------------------------------------------- history of links
 
-def history_load() -> list:
+def history_dir() -> Path:
+    return Path(PATHS["history"])
+
+
+def _history_file(root=None) -> Path:
+    return Path(root or history_dir()) / "history.json"
+
+
+def _thumbs(root=None) -> Path:
+    return Path(root or history_dir()) / "thumbnails"
+
+
+def _is_thumb(p: Path) -> bool:
+    return p.suffix.lower() == ".jpg" and re.fullmatch(r"[0-9a-f]{16}", p.stem) is not None
+
+
+def history_load(root=None) -> list:
     try:
-        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        data = json.loads(_history_file(root).read_text(encoding="utf-8"))
         return [x for x in data if isinstance(x, dict) and x.get("url")]
     except (OSError, ValueError):
         return []
 
 
-def _history_save(items) -> None:
+def _history_save(items, root=None) -> None:
     try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = HISTORY_FILE.with_suffix(".tmp")
+        f = _history_file(root)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
         tmp.write_text(json.dumps(items[:HISTORY_MAX], indent=1, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, HISTORY_FILE)
+        os.replace(tmp, f)
     except OSError:
         pass
 
 
 def history_thumb_path(url) -> Path:
     import hashlib
-    return HISTORY_DIR / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
+    return _thumbs() / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
 
 
 def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
@@ -2567,8 +2484,8 @@ def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
              "site": {"Youtube": "YouTube", "YoutubeTab": "YouTube"}.get(info.get("site") or "", info.get("site") or "")}
     if thumb_jpg:
         try:
-            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
             p = history_thumb_path(url)
+            p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(thumb_jpg)
             entry["thumb"] = p.name
         except OSError:
@@ -2576,7 +2493,7 @@ def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
     items.insert(0, entry)
     for old in items[HISTORY_MAX:]:
         if old.get("thumb"):
-            (HISTORY_DIR / old["thumb"]).unlink(missing_ok=True)
+            (_thumbs() / old["thumb"]).unlink(missing_ok=True)
     _history_save(items)
 
 
@@ -2584,13 +2501,81 @@ def history_remove(url) -> None:
     items = history_load()
     for x in items:
         if x.get("url") == url and x.get("thumb"):
-            (HISTORY_DIR / x["thumb"]).unlink(missing_ok=True)
+            (_thumbs() / x["thumb"]).unlink(missing_ok=True)
     _history_save([x for x in items if x.get("url") != url])
 
 
+def _clear_history_at(root) -> None:
+    """Removes only what the app wrote (history.json + its small pictures) – the folder may be the user's own."""
+    _history_file(root).unlink(missing_ok=True)
+    Path(_history_file(root).with_suffix(".tmp")).unlink(missing_ok=True)
+    th = _thumbs(root)
+    if th.is_dir():
+        for f in th.iterdir():
+            if _is_thumb(f):
+                f.unlink(missing_ok=True)
+        try:
+            th.rmdir()
+        except OSError:
+            pass
+
+
 def history_clear() -> None:
-    shutil.rmtree(HISTORY_DIR, ignore_errors=True)
-    HISTORY_FILE.unlink(missing_ok=True)
+    _clear_history_at(history_dir())
+
+
+def history_stats(root=None) -> dict:
+    items = history_load(root)
+    th = _thumbs(root)
+    size = sum(f.stat().st_size for f in th.iterdir() if _is_thumb(f)) if th.is_dir() else 0
+    f = _history_file(root)
+    return {"links": len(items), "bytes": size + (f.stat().st_size if f.is_file() else 0)}
+
+
+def history_migrate() -> None:
+    """Up to 2.7: APP_DIR/history.json + the pictures loose in APP_DIR/history -> everything in one folder."""
+    root = DEFAULT_PATHS["history"]
+    old = APP_DIR / "history.json"
+    try:
+        if old.is_file() and not _history_file(root).exists():
+            root.mkdir(parents=True, exist_ok=True)
+            os.replace(old, _history_file(root))
+        if root.is_dir():
+            for f in root.iterdir():
+                if _is_thumb(f):
+                    _thumbs(root).mkdir(exist_ok=True)
+                    os.replace(f, _thumbs(root) / f.name)
+    except OSError:
+        pass
+
+
+def history_move(new_root) -> int:
+    """Moves the history (links + pictures) into another folder; a history already there is merged.
+    -> number of links in the new folder."""
+    old_root, new_root = history_dir(), Path(new_root)
+    if old_root.resolve() == new_root.resolve():
+        return len(history_load())
+    new_root.mkdir(parents=True, exist_ok=True)
+    mine, there = history_load(old_root), history_load(new_root)
+    urls = {x["url"] for x in there}
+    merged = sorted(there + [x for x in mine if x["url"] not in urls], key=lambda x: -float(x.get("added") or 0))
+    for x in mine:
+        if x.get("thumb") and (_thumbs(old_root) / x["thumb"]).is_file():
+            dst = _thumbs(new_root) / x["thumb"]
+            if not dst.exists():
+                dst.parent.mkdir(exist_ok=True)
+                shutil.move(str(_thumbs(old_root) / x["thumb"]), str(dst))
+    _history_save(merged, new_root)
+    _clear_history_at(old_root)
+    PATHS["history"] = new_root
+    return len(merged[:HISTORY_MAX])
+
+
+def remove_old_upscaler() -> None:
+    """The AI upscaler is gone since 2.8 – its download (≈ 45 MB) and added models are removed once."""
+    for name in ("upscaler", "upscaler_new", "models"):
+        shutil.rmtree(APP_DIR / name, ignore_errors=True)
+    (APP_DIR / "upscaler_download.zip").unlink(missing_ok=True)
 
 
 # ---- YouTube login (own sign-in window -> cookies.txt for yt-dlp)
@@ -4267,7 +4252,7 @@ class HistoryDialog(QtWidgets.QDialog):
             it.setToolTip(x["url"])
             pix = None
             if x.get("thumb"):
-                pm = QtGui.QPixmap(str(HISTORY_DIR / x["thumb"]))
+                pm = QtGui.QPixmap(str(history_dir() / "thumbnails" / x["thumb"]))
                 if not pm.isNull():
                     pix = QtGui.QPixmap(128, 72)
                     pix.fill(QtGui.QColor(0, 0, 0, 0))
@@ -4688,6 +4673,106 @@ def section(text):
     return label(text.upper(), "section")
 
 
+class PathLabel(QtWidgets.QLabel):
+    """A folder path in one line, shortened in the middle when there is no room (full path on hover)."""
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("muted")
+        self._full = ""
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(60)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+    def set_path(self, text):
+        self._full = str(text)
+        tip(self, "Folder", self._full)
+        self._elide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self):
+        self.setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideMiddle, max(40, self.width())))
+
+
+class MuteButton(QtWidgets.QAbstractButton):
+    """Speaker next to the preview volume: 0, 1 or 2 sound waves for the level, crossed out when silent."""
+    def __init__(self):
+        super().__init__()
+        self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
+        self.level = 80
+        self.setFixedSize(30, 30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def set_colors(self, c):
+        self.c = c
+        self.update()
+
+    def set_level(self, v):
+        self.level = int(v)
+        self.update()
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.update()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self.update()
+
+    def paintEvent(self, _e):
+        c = self.c
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        hover = self.underMouse() and self.isEnabled()
+        if hover:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(c["panel2"]))
+            p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(1, 1, -1, -1), 8, 8)
+        col = QtGui.QColor(c["text"] if hover else c["muted"])
+        if not self.isEnabled():
+            col = QtGui.QColor(c["border"])
+        p.translate(self.width() / 2 - 9, self.height() / 2 - 8)     # icon box 18 × 16
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        body = QtGui.QPainterPath()
+        body.addRoundedRect(QtCore.QRectF(0.5, 5.2, 4.2, 5.6), 1.2, 1.2)
+        body.addPolygon(QtGui.QPolygonF([QtCore.QPointF(3.6, 5.4), QtCore.QPointF(8.6, 1.4),
+                                         QtCore.QPointF(8.6, 14.6), QtCore.QPointF(3.6, 10.6)]))
+        p.drawPath(body.simplified())
+        pen = QtGui.QPen(col, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if self.level <= 0:
+            pen.setColor(QtGui.QColor(c["accent"]) if self.isEnabled() else col)
+            p.setPen(pen)
+            p.drawLine(QtCore.QPointF(11.6, 5.2), QtCore.QPointF(17.2, 10.8))
+            p.drawLine(QtCore.QPointF(17.2, 5.2), QtCore.QPointF(11.6, 10.8))
+        else:
+            p.setPen(pen)
+            waves = [3.4] + ([6.6] if self.level >= 50 else [])
+            for r in waves:
+                p.drawArc(QtCore.QRectF(8.6 - r, 8 - r, 2 * r, 2 * r), -50 * 16, 100 * 16)
+        p.end()
+
+
+def _dir_buttons(on_open, on_change, on_default):
+    row = QtWidgets.QHBoxLayout()
+    row.setSpacing(6)
+    b_open = tip(QtWidgets.QPushButton("Open folder"), "Open folder", "Shows the folder in Explorer.")
+    b_change = tip(QtWidgets.QPushButton("Change …"), "Change folder",
+                   "Pick another folder – what is saved now moves along.")
+    b_def = tip(QtWidgets.QPushButton("Default"), "Default folder", "Back to the app's own folder (moves along).")
+    b_def.setObjectName("ghost")
+    for b, fn in ((b_open, on_open), (b_change, on_change), (b_def, on_default)):
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.clicked.connect(fn)
+        row.addWidget(b)
+    return row, b_def
+
+
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent, theme, accent, tips_on, apply, apply_tips, auto_pv=True, apply_pv=None,
                  pv_mode="stream", apply_mode=None):
@@ -4762,11 +4847,20 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cb_hist.setChecked(bool(parent.cfg.get("history", True)))
         self.cb_hist.toggled.connect(self._hist_toggled)
         lay.addWidget(self.cb_hist)
-        hr = QtWidgets.QHBoxLayout()
+        pr = QtWidgets.QHBoxLayout()
+        pr.setSpacing(8)
+        self.lbl_hist_dir = PathLabel()
+        self.lbl_hist_info = label("", "muted")
+        pr.addWidget(self.lbl_hist_dir, 1)
+        pr.addWidget(self.lbl_hist_info)
+        lay.addLayout(pr)
+        hr, self.btn_hist_def = _dir_buttons(lambda: self._open_dir("history"), lambda: self._change_dir("history"),
+                                             lambda: self._default_dir("history"))
+        hr.addStretch(1)
         self.btn_hist_clear = tip(QtWidgets.QPushButton("Clear history"), "Clear history", "Removes all saved links.")
+        self.btn_hist_clear.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_hist_clear.clicked.connect(self._hist_clear)
         hr.addWidget(self.btn_hist_clear)
-        hr.addStretch(1)
         lay.addLayout(hr)
         lay.addStretch(1)
 
@@ -4791,6 +4885,30 @@ class SettingsDialog(QtWidgets.QDialog):
         if apply_pv:
             self.cb_pv.toggled.connect(apply_pv)
         right.addWidget(self.cb_pv)
+        self.cb_keep = QtWidgets.QCheckBox("Keep the downloaded small copies (open at once next time)")
+        self.cb_keep.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_keep, "Keep small copies", "Off: the small preview copies are deleted when you close the app. "
+                                               "On: they stay in the folder below and are used again when you open "
+                                               "the same video (also from the history).")
+        self.cb_keep.setChecked(parent._keep_pv())
+        self.cb_keep.toggled.connect(self._keep_toggled)
+        right.addWidget(self.cb_keep)
+        pr = QtWidgets.QHBoxLayout()
+        pr.setSpacing(8)
+        self.lbl_pv_dir = PathLabel()
+        self.lbl_pv_info = label("", "muted")
+        pr.addWidget(self.lbl_pv_dir, 1)
+        pr.addWidget(self.lbl_pv_info)
+        right.addLayout(pr)
+        vr, self.btn_pv_def = _dir_buttons(lambda: self._open_dir("preview"), lambda: self._change_dir("preview"),
+                                           lambda: self._default_dir("preview"))
+        vr.addStretch(1)
+        self.btn_pv_clear = tip(QtWidgets.QPushButton("Delete copies"), "Delete copies",
+                                "Deletes the small preview copies in this folder now (not your downloads).")
+        self.btn_pv_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pv_clear.clicked.connect(self._pv_clear)
+        vr.addWidget(self.btn_pv_clear)
+        right.addLayout(vr)
         if not PLAYER_OK:
             self.seg_pv.setEnabled(False)
             self.cb_pv.setEnabled(False)
@@ -4815,40 +4933,13 @@ class SettingsDialog(QtWidgets.QDialog):
         lr.addWidget(self.btn_cookies)
         lr.addStretch(1)
         right.addLayout(lr)
-        right.addSpacing(4)
-        right.addWidget(section("AI upscaler"))
-        self.lbl_esr = label("", "muted")
-        self.lbl_esr.setWordWrap(True)
-        right.addWidget(self.lbl_esr)
-        er = QtWidgets.QHBoxLayout()
-        self.btn_esr = QtWidgets.QPushButton()
-        self.btn_esr.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_esr.clicked.connect(self._esr_clicked)
-        er.addWidget(self.btn_esr)
-        er.addStretch(1)
-        right.addLayout(er)
-        mr = QtWidgets.QHBoxLayout()
-        mr.setSpacing(6)
-        mr.addWidget(label("Own models", "field"))
-        self.cb_own = QtWidgets.QComboBox()
-        tip(self.cb_own, "Own models", "Models you added under Output → Upscale → Model → Load own model.")
-        mr.addWidget(self.cb_own, 1)
-        self.btn_own_add = QtWidgets.QPushButton("Add …")
-        self.btn_own_del = QtWidgets.QPushButton("Remove")
-        for b in (self.btn_own_add, self.btn_own_del):
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            mr.addWidget(b)
-        self.btn_own_add.clicked.connect(self._own_add)
-        self.btn_own_del.clicked.connect(self._own_del)
-        right.addLayout(mr)
         right.addStretch(1)
-        self.refresh_esr()
-        self._fill_own()
         self.show_login_state()
+        self.refresh_dirs()
 
         bot = QtWidgets.QHBoxLayout()
         reset = tip(QtWidgets.QPushButton("Reset to default"), "Reset to default",
-                    "Dark theme, lime accent and hover help on.")
+                    "Dark theme, red accent and hover help on.")
         reset.setObjectName("ghost")
         reset.clicked.connect(self._reset)
         done = QtWidgets.QPushButton("Done")
@@ -4913,58 +5004,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.main._on_log("✓ YouTube login loaded from a cookies file.")
         self.show_login_state()
 
-    def refresh_esr(self):
-        busy = self.main._esr_job is not None
-        exe = upscaler_exe()
-        if busy:
-            self.lbl_esr.setText("Downloading …")
-            self.btn_esr.setText("Installing …")
-            self.btn_esr.setEnabled(False)
-        elif exe:
-            self.lbl_esr.setText("✓ Real-ESRGAN is installed (photo + anime models). Pick it under Output → Upscale → "
-                                 "Model.")
-            self.btn_esr.setText("Remove")
-            self.btn_esr.setEnabled(True)
-        else:
-            self.lbl_esr.setText(f"Real-ESRGAN enlarges pictures with AI on your graphics card (NVIDIA, AMD, Intel). "
-                                 f"One download of ≈ {UPSCALER_MB} MB.")
-            self.btn_esr.setText("Install")
-            self.btn_esr.setEnabled(True)
-        tip(self.btn_esr, "AI upscaler", "Downloaded from the official Real-ESRGAN page on GitHub.")
-
-    def _fill_own(self):
-        self.cb_own.clear()
-        own = list_custom_models()
-        for x in own:
-            self.cb_own.addItem(f"{x['name']}  ({x['scale']}×)", x["name"])
-        if not own:
-            self.cb_own.addItem("none yet")
-        self.cb_own.setEnabled(bool(own))
-        self.btn_own_del.setEnabled(bool(own))
-
-    def _own_add(self):
-        m = self.main
-        idx = m.cb_model.findText(MODEL_LOAD)
-        m.cb_model.setCurrentIndex(idx)
-        m._model_picked(idx)
-        self._fill_own()
-
-    def _own_del(self):
-        name = self.cb_own.currentData()
-        if name and QtWidgets.QMessageBox.question(self, "Remove model", f"Remove the model “{name}”?") \
-                == QtWidgets.QMessageBox.StandardButton.Yes:
-            remove_model(name)
-            self.main._fill_models()
-            self.main._frame_info()
-            self._fill_own()
-
-    def _esr_clicked(self):
-        if upscaler_exe():
-            remove_upscaler()
-        else:
-            self.main._install_upscaler()
-        self.refresh_esr()
-
     def _hist_toggled(self, on):
         self.main.cfg["history"] = bool(on)
         save_cfg(self.main.cfg)
@@ -4973,6 +5012,58 @@ class SettingsDialog(QtWidgets.QDialog):
         if QtWidgets.QMessageBox.question(self, "Clear history", "Remove all links from the history?") \
                 == QtWidgets.QMessageBox.StandardButton.Yes:
             history_clear()
+            self.refresh_dirs()
+
+    # ---- folders of the history and the small preview copies
+    def refresh_dirs(self):
+        hs = history_stats()
+        self.lbl_hist_dir.set_path(history_dir())
+        self.lbl_hist_info.setText(f"{hs['links']} link{'s' if hs['links'] != 1 else ''} · {fmt_bytes(hs['bytes'])}")
+        self.btn_hist_def.setVisible(bool(self.main.cfg.get("history_dir")))
+        self.btn_hist_clear.setEnabled(hs["links"] > 0)
+        ps = preview_stats()
+        self.lbl_pv_dir.set_path(preview_dir())
+        self.lbl_pv_info.setText(f"{ps['files']} cop{'ies' if ps['files'] != 1 else 'y'} · {fmt_bytes(ps['bytes'])}")
+        self.btn_pv_def.setVisible(bool(self.main.cfg.get("preview_dir")))
+        self.btn_pv_clear.setEnabled(ps["files"] > 0)
+
+    def _open_dir(self, key):
+        d = history_dir() if key == "history" else preview_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            return QtWidgets.QMessageBox.warning(self, "Folder", clean_error(ex))
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(d)))
+
+    def _change_dir(self, key):
+        cur = history_dir() if key == "history" else preview_dir()
+        what = "the history" if key == "history" else "the small preview copies"
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Folder for {what}",
+                                                          str(cur if cur.exists() else Path.home()))
+        if path:
+            self.main._set_dir(key, path)
+            self.refresh_dirs()
+
+    def _default_dir(self, key):
+        self.main._set_dir(key, None)
+        self.refresh_dirs()
+
+    def _keep_toggled(self, on):
+        self.main.cfg["keep_previews"] = bool(on)
+        save_cfg(self.main.cfg)
+
+    def _pv_clear(self):
+        st = preview_stats()
+        if QtWidgets.QMessageBox.question(
+                self, "Delete copies", f"Delete the {st['files']} small preview cop{'ies' if st['files'] != 1 else 'y'} "
+                                       f"({fmt_bytes(st['bytes'])})?") != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        n = preview_cleanup(False)
+        left = preview_stats()["files"]
+        self.main._pv_cache = {k: v for k, v in self.main._pv_cache.items() if Path(v).exists()}
+        self.main._on_log(f"Deleted {n} preview cop{'ies' if n != 1 else 'y'}."
+                          + (f" {left} still open in the player – deleted when the app closes." if left else ""))
+        self.refresh_dirs()
 
     def _reset(self):
         self.seg.set_value(DEFAULT_THEME, animate=True)
@@ -5031,8 +5122,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_out = None
         self._pv_state = ""            # "", "offer", "loading", "error", "ready"
         self._pv_cache: dict[str, str] = {}
-        self._pv_dir = APP_DIR / "preview"
-        shutil.rmtree(self._pv_dir, ignore_errors=True)
+        for key in ("history", "preview"):
+            d = self.cfg.get(f"{key}_dir")
+            PATHS[key] = Path(d) if d else DEFAULT_PATHS[key]
+        history_migrate()
+        preview_cleanup(self._keep_pv())
+        if not self.cfg.get("upscaler_removed"):
+            threading.Thread(target=remove_old_upscaler, daemon=True).start()
+            self.cfg["upscaler_removed"] = True
         self._clip_stop = None
         self._seek_target = None
         self._pos_hint = (None, 0.0)     # last position we jumped to + when (for fast frame steps)
@@ -5050,7 +5147,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sub_items: list = []
         self._sub_req = 0
         self.lines_dlg = None
-        self._esr_job = None
         self._login_noted = False
         self._signin = None
         self._resetting = False
@@ -5081,6 +5177,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build()
         self._apply_sub_style_ui()
         self.theme = self.cfg.get("theme") if self.cfg.get("theme") in THEMES else DEFAULT_THEME
+        if not self.cfg.get("accent_v28") and str(self.cfg.get("accent", "")).lower() == "#c4f240":
+            self.cfg["accent"] = DEFAULT_ACCENT          # the old default (lime) -> the new one (red)
+        self.cfg["accent_v28"] = True
         self.accent = self.cfg.get("accent") or DEFAULT_ACCENT
         self.apply_theme(self.theme, self.accent, save=False)
         self._load_settings()
@@ -5197,10 +5296,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Position", "Drag to move through the video.")
         self.seek.setRange(0, 0)
         self.seek.sliderMoved.connect(lambda v: self._seek_to(v / 1000))
-        self.vol = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Volume", "")
+        self.vol = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Volume",
+                       "How loud the preview plays (only for listening – the download keeps its sound; change that "
+                       "in the Volume tab).")
         self.vol.setRange(0, 100)
         self.vol.setFixedWidth(64)
         self.vol.valueChanged.connect(self._on_volume)
+        self.btn_mute = tip(MuteButton(), "Mute", "Click to mute the preview, click again to get the volume back "
+                                                  "it had before (key M).")
+        self.btn_mute.clicked.connect(self._toggle_mute)
+        self._vol_restore = 80              # level the speaker button goes back to after muting
+        self._vol_settle = QtCore.QTimer(self)
+        self._vol_settle.setSingleShot(True)
+        self._vol_settle.setInterval(700)
+        self._vol_settle.timeout.connect(self._remember_vol)
         trl.addWidget(self.btn_prev_f)
         trl.addWidget(self.btn_play)
         trl.addWidget(self.btn_next_f)
@@ -5209,7 +5318,8 @@ class MainWindow(QtWidgets.QMainWindow):
         trl.addWidget(self.lbl_ptime)
         trl.addSpacing(4)
         trl.addWidget(self.seek, 1)
-        trl.addSpacing(4)
+        trl.addSpacing(2)
+        trl.addWidget(self.btn_mute)
         trl.addWidget(self.vol)
         tv.addLayout(trl)
         tr2 = QtWidgets.QHBoxLayout()
@@ -5228,7 +5338,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tr2.addWidget(b_)
         self.btn_still = tip(QtWidgets.QPushButton("↓ Save frame"), "Save frame",
                              "Saves the frame you see as a PNG in full quality (not the preview quality) – with the "
-                             "crop, size and AI upscaling from the Frame tab.")
+                             "crop from the Frame tab and the size from Output → Upscale.")
         self.btn_still.setObjectName("chip")
         self.btn_still.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_still.clicked.connect(self._save_still)
@@ -5379,7 +5489,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = TabBar([("out", "Output"), ("frame", "Frame"), ("volume", "Volume"), ("subs", "Subtitles")])
         self.tabs.set_tips({
             "out": ("Output", "Codec, quality and size of the file."),
-            "frame": ("Frame", "Crop to 9:16, 1:1 … (for TikTok, Reels, Shorts), output size and AI upscaling."),
+            "frame": ("Frame", "Crop to 9:16, 1:1 … (for TikTok, Reels, Shorts) and the output size."),
             "volume": ("Volume", "Make parts of the clip quieter or louder – fades, ducking, muting."),
             "subs": ("Subtitles", "Load the video's subtitles (or your own file), read them, burn them into the "
                                   "picture or save them as .srt.")})
@@ -5483,7 +5593,7 @@ class MainWindow(QtWidgets.QMainWindow):
         foot.addWidget(brand, 0, Qt.AlignmentFlag.AlignBottom)
         v.addLayout(foot)
         for key, fn in (("Space", self._toggle_play), ("I", self._set_in), ("O", self._set_out),
-                        (",", lambda: self._step(-1)), (".", lambda: self._step(1))):
+                        (",", lambda: self._step(-1)), (".", lambda: self._step(1)), ("M", self._toggle_mute)):
             sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(fn)
 
@@ -5551,33 +5661,13 @@ class MainWindow(QtWidgets.QMainWindow):
         g.addWidget(self.size_hint, 4, 1, 1, 3)
         h_up = ("Makes the picture bigger (or sets the size of a 9:16 / 1:1 crop). 'To 1080p' = short side 1080 px, "
                 "e.g. 1080 × 1920 for Reels / Shorts.")
-        h_model = ("How it is enlarged: normal scaling, or AI (Real-ESRGAN on the graphics card). You can also load "
-                   "your own ncnn models.")
         self.cb_up = self._combo(UPSCALES, "Upscale", h_up)
         self.cb_up.currentTextChanged.connect(lambda _t: self._frame_info())
-        self.cb_model = self._combo(list(MODELS), "Model", h_model)
-        self.cb_model.activated.connect(self._model_picked)
-        self.cb_model.currentTextChanged.connect(lambda _t: self._frame_info())
-        self._fill_models()
         g.addWidget(self._field("Upscale", "Upscale", h_up), 5, 0)
-        ur = QtWidgets.QHBoxLayout()
-        ur.setSpacing(8)
-        ur.addWidget(self.cb_up, 2)
-        ur.addWidget(self.cb_model, 3)
-        g.addLayout(ur, 5, 1, 1, 3)
+        g.addWidget(self.cb_up, 5, 1, 1, 3)
         self.up_hint = label("", "hint")
         self.up_hint.setWordWrap(True)
         g.addWidget(self.up_hint, 6, 1, 1, 3)
-        er = QtWidgets.QHBoxLayout()
-        self.btn_esr = tip(QtWidgets.QPushButton(f"Install AI upscaler (≈ {UPSCALER_MB} MB)"), "AI upscaler",
-                           "Real-ESRGAN – runs on the graphics card (NVIDIA, AMD or Intel, no extra setup). "
-                           "Downloaded once from its official GitHub page.")
-        self.btn_esr.setObjectName("chip")
-        self.btn_esr.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_esr.clicked.connect(lambda: self._install_upscaler())
-        er.addWidget(self.btn_esr)
-        er.addStretch(1)
-        g.addLayout(er, 7, 1, 1, 3)
         return w
 
     def _page_audio(self):
@@ -5945,51 +6035,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ow, oh = target_dims(cw, ch, up, aspect)
         return cw, ch, ow, oh
 
-    def _model(self):
-        return model_spec(self.cb_model.currentText())
-
-    def _ai_wanted(self):
-        return self._model().get("kind") == "esr"
-
-    def _fill_models(self, select=None):
-        cur = select or self.cb_model.currentText()
-        self.cb_model.blockSignals(True)
-        self.cb_model.clear()
-        labels = list(MODELS) + [f"Own · {x['name']}" for x in list_custom_models()]
-        for lab in labels:
-            self.cb_model.addItem(lab)
-        self.cb_model.addItem(MODEL_LOAD)
-        for i in range(self.cb_model.count()):
-            t = self.cb_model.itemText(i)
-            h = ITEM_HELP.get(t) or ("Your own model (ncnn). Remove it in Settings → AI upscaler."
-                                     if t.startswith("Own · ") else "")
-            if h:
-                self.cb_model.setItemData(i, tip_html(t, h), Qt.ItemDataRole.ToolTipRole)
-        self.cb_model.setCurrentText(cur if cur in labels else labels[0])
-        self.cb_model.blockSignals(False)
-        self._last_model = self.cb_model.currentText()
-
-    def _model_picked(self, idx):
-        if self.cb_model.itemText(idx) != MODEL_LOAD:
-            self._last_model = self.cb_model.currentText()
-            return
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load a model (.param – the .bin with the same name must be next to it)",
-            self.cfg.get("last_model_dir") or str(Path.home()), "ncnn models (*.param *.bin);;All files (*.*)")
-        if not path:
-            self.cb_model.setCurrentText(getattr(self, "_last_model", list(MODELS)[0]))
-            return
-        self.cfg["last_model_dir"] = str(Path(path).parent)
-        try:
-            m = import_model(path)
-        except Exception as ex:  # noqa: BLE001
-            self.cb_model.setCurrentText(getattr(self, "_last_model", list(MODELS)[0]))
-            return self._on_error(clean_error(ex))
-        self._fill_models(select=f"Own · {m['name']}")
-        self._on_log(f"✓ Model added: {m['name']} ({m['scale']}×)")
-        self._on_status(f"Model “{m['name']}” added ({m['scale']}×).")
-        self._frame_info()
-
     def _frame_info(self):
         mode = self.seg.value()
         is_mp4 = mode == "mp4"
@@ -5997,8 +6042,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_center.setVisible(bool(self._aspect()) and self.canvas is not None)
         aspect = self._aspect()
         dims = self._frame_dims() if mode != "mp3" else None
-        ai = self._ai_wanted() and is_mp4 and UPSCALES.get(self.cb_up.currentText()) is not None
-        need_ai = False
         if mode == "mp3":
             ftxt = "Audio has no picture – switch to Video or GIF to crop."
             utxt = ""
@@ -6008,9 +6051,7 @@ class MainWindow(QtWidgets.QMainWindow):
             utxt = ""
             if is_mp4 and (ow, oh) != (cw, ch):
                 f = ow / cw
-                need_ai = ai and f > 1.02
-                utxt = f"{cw} × {ch}  →  {ow} × {oh}" + (
-                    f"  ·  {f:.1f}× " + ("with AI" if need_ai else "(standard)") if f > 1.02 else "  ·  scaled down")
+                utxt = f"{cw} × {ch}  →  {ow} × {oh}" + (f"  ·  {f:.1f}×" if f > 1.02 else "  ·  scaled down")
                 ftxt += f"  →  result {ow} × {oh} (Output → Upscale)"
             elif not is_mp4:
                 ftxt += "  ·  the GIF width is set in Output"
@@ -6019,18 +6060,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             ftxt = "Paste a link or open a file – the sizes appear here." if aspect else ""
             utxt = ""
-            need_ai = ai
-        installed = upscaler_exe() is not None
-        busy = self._esr_job is not None
-        self.btn_esr.setVisible(is_mp4 and self._ai_wanted() and (not installed or busy))
-        self.btn_esr.setEnabled(not busy)
-        if is_mp4 and self._ai_wanted() and not installed and not busy:
-            utxt = (utxt + "  ·  " if utxt else "") + "the AI upscaler is not installed yet"
-        self.cb_model.setEnabled(UPSCALES.get(self.cb_up.currentText()) is not None)
         self.frame_hint.setText(ftxt)
         self.up_hint.setText(utxt)
         self.up_hint.setVisible(bool(utxt))
-        set_state(self.up_hint, "warn" if (need_ai and not installed) else "")
         self._badges()
 
     def _badges(self):
@@ -6296,7 +6328,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lines_dlg.show()
         self.lines_dlg.raise_()
 
-    # ------------------------------------------------------------------ chapters / history / still / upscaler
+    # ------------------------------------------------------------------ chapters / history / still
     def _chapters(self):
         ch = self.info.get("chapters") if self._is_info_current() else None
         if not ch or self.busy:
@@ -6347,12 +6379,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.info.get("local") and not self.info.get("has_video", True):
             return
-        model = self._model() if self.seg.value() == "mp4" else {"kind": "std"}
-        dims = self._frame_dims()
-        if model.get("kind") == "esr" and dims and dims[2] > dims[0] * 1.05 and upscaler_exe() is None:
-            if not self._ask_install():
-                return
-            return self._install_upscaler(then=self._save_still)
         t = self._player_pos() or 0.0
         self._stop_playback()
         outdir = Path(self.outdir.text().strip() or Path.home() / "Downloads")
@@ -6380,59 +6406,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not local:
                     self.update_done.wait()
                 f = export_still(src, t, fps, dst, local=local, height=height, aspect=aspect, box=box, up=up,
-                                 model=model, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, emit=self.emit)
+                                 ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, emit=self.emit)
                 self.emit("done", [str(f)])
             except Exception as ex:  # noqa: BLE001
                 self.emit("error", clean_error(ex))
         threading.Thread(target=work, daemon=True).start()
-
-    def _ask_install(self):
-        return QtWidgets.QMessageBox.question(
-            self, "AI upscaler",
-            f"The AI upscaler (Real-ESRGAN, ≈ {UPSCALER_MB} MB) isn't installed yet.\n\nDownload and install it now? "
-            "It runs on your graphics card.") == QtWidgets.QMessageBox.StandardButton.Yes
-
-    def _install_upscaler(self, then=None):
-        if self._esr_job is not None:
-            return
-        self._esr_job = then or (lambda: None)
-        self._frame_info()
-        self._on_status("Downloading the AI upscaler …")
-        self._on_progress(0)
-
-        def work():
-            try:
-                install_upscaler(lambda pct: self.emit("esr", ("progress", pct)))
-                self.emit("esr", ("done", None))
-            except Exception as ex:  # noqa: BLE001
-                self.emit("esr", ("error", clean_error(ex)))
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_esr(self, val):
-        kind, v = val
-        if kind == "progress":
-            if not self.busy:
-                self._on_progress(v)
-                self._on_status(f"Downloading the AI upscaler … {v:.0f} %")
-            self.btn_esr.setText(f"Downloading … {v:.0f} %")
-            return
-        job, self._esr_job = self._esr_job, None
-        self.btn_esr.setEnabled(True)
-        self.btn_esr.setText(f"Install AI upscaler (≈ {UPSCALER_MB} MB)")
-        self._frame_info()
-        dlg = getattr(self, "settings_dlg", None)
-        if dlg is not None:
-            dlg.refresh_esr()
-        if kind == "error":
-            self._on_error("AI upscaler: " + v)
-            return
-        self._on_log("✓ AI upscaler installed.")
-        if not self.busy:
-            self._on_progress(100)
-            self._on_status("✓  AI upscaler installed.")
-            set_state(self.status, "ok")
-        if job:
-            job()
 
     def _sign_in(self):
         """Opens the default browser (own profile) on the YouTube sign-in; the login is picked up by itself."""
@@ -6522,7 +6500,6 @@ class MainWindow(QtWidgets.QMainWindow):
         fx = {
             "aspect": aspect, "boxes": boxes,
             "up": UPSCALES.get(self.cb_up.currentText()) if mode == "mp4" else None,
-            "model": self._model(),
             "vol": [tuple(q) for q in self.vol_pts] if mode in ("mp4", "mp3") else [],
             "subs": {"cues": self.sub_cues, "mode": None if sub_mode == "none" else sub_mode,
                      "lang": self.sub_lang, "style": dict(self.sub_style)} if self.sub_cues else None,
@@ -6555,10 +6532,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_thumb.setChecked(bool(c.get("save_thumb", False)))
         self.outdir.setText(c.get("outdir") or str(Path.home() / "Downloads"))
         self.vol.setValue(int(c.get("volume", 80)))
+        self._vol_restore = self.vol.value() or int(c.get("vol_restore") or 80)
+        self._vol_settle.stop()
+        self.btn_mute.set_level(self.vol.value())
         self.seg_join.set_value("separate" if c.get("join") == "separate" else "join")
         pick(self.cb_up, "upscale", UPSCALES, "Off")
-        if c.get("model"):
-            self._fill_models(select=c.get("model"))
         self.seg_aspect.set_value(c.get("aspect") if c.get("aspect") in ASPECTS else "Off")
         self.seg_submode.set_value(c.get("sub_mode") if c.get("sub_mode") in ("none", "burn", "track") else "none")
         self.cb_srt.setChecked(bool(c.get("save_srt", False)))
@@ -6591,8 +6569,8 @@ class MainWindow(QtWidgets.QMainWindow):
             gif_width=self.cb_gif_w.currentText(), gif_fps=self.cb_gif_fps.currentText(),
             gif_colors=self.cb_gif_col.currentText(), outdir=self.outdir.text().strip(),
             mode=self.seg.value(), theme=self.theme, accent=self.accent, save_thumb=self.cb_thumb.isChecked(),
-            volume=self.vol.value(), join=self.seg_join.value(),
-            aspect=self.seg_aspect.value(), upscale=self.cb_up.currentText(), model=self.cb_model.currentText(),
+            volume=self.vol.value(), vol_restore=self._vol_restore, join=self.seg_join.value(),
+            aspect=self.seg_aspect.value(), upscale=self.cb_up.currentText(),
             sub_mode=self.seg_submode.value(), save_srt=self.cb_srt.isChecked(),
             geometry=bytes(self.saveGeometry().toBase64()).decode())
         try:
@@ -6608,6 +6586,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.set_colors(c)
         self.thumb.set_colors(c)
         self.lane.set_colors(c)
+        self.btn_mute.set_colors(c)
         if self.canvas is not None:
             self.canvas.set_colors(c)
         set_dark_titlebar(self, c["dark"])
@@ -6628,6 +6607,42 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_auto_preview(self, on):
         self.cfg["auto_preview"] = bool(on)
+        save_cfg(self.cfg)
+
+    def _keep_pv(self) -> bool:
+        return bool(self.cfg.get("keep_previews", False))
+
+    def _set_dir(self, key, path):
+        """New folder for the history or the small preview copies (None = default); what is there moves along."""
+        new = Path(path) if path else DEFAULT_PATHS[key]
+        old = Path(PATHS[key])
+        if key == "history":
+            try:
+                n = history_move(new)
+            except OSError as ex:
+                return self._on_error(f"The history could not be moved: {clean_error(ex)}")
+            self._on_log(f"History is now kept in {new} ({n} link{'s' if n != 1 else ''}).")
+        else:
+            try:
+                new.mkdir(parents=True, exist_ok=True)
+            except OSError as ex:
+                return self._on_error(f"Invalid folder: {clean_error(ex)}")
+            PATHS["preview"] = new
+            files = preview_files(old) if old.resolve() != new.resolve() else []
+            self._on_log(f"Small preview copies are now kept in {new}.")
+            if files:
+                def move():
+                    done = 0
+                    for f in files:
+                        try:
+                            shutil.move(str(f), str(new / f.name))
+                            done += 1
+                        except OSError:          # still open in the player
+                            pass
+                    self.emit("log", f"Moved {done} of {len(files)} preview cop{'ies' if len(files) != 1 else 'y'} "
+                                     "to the new folder.")
+                threading.Thread(target=move, daemon=True).start()
+        self.cfg[f"{key}_dir"] = str(new) if path else ""
         save_cfg(self.cfg)
 
     def _settings(self):
@@ -7088,6 +7103,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if url in self._pv_cache and Path(self._pv_cache[url]).exists():
             self._load_player(self._pv_cache[url], True, kind="copy")
             return
+        kept = find_preview(info)
+        if kept is not None:              # copy from an earlier time (Settings → keep the small copies)
+            self._pv_cache[url] = str(kept)
+            self._load_player(str(kept), True, kind="copy")
+            return
         auto = self.cfg.get("auto_preview", True)
         dur = info.get("duration") or 0
         if self._pv_mode() == "stream" and self._can_stream(url):
@@ -7136,9 +7156,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thumb.set_overlay("Loading video preview …", 0.0)
         self.vview.show_video(False)
         self.transport.hide()
-        outdir = self._pv_dir / f"p{req}"
+        root = preview_dir()
+        outdir = root / f".dl_{req}"
         ffmpeg = self.ffmpeg
         dur = self.info.get("duration") if self._is_info_current() else None
+        name = preview_name({**self.info, "duration": dur}) if self._is_info_current() else f"video [p{req}] preview 360p"
 
         def em(kind, val=None):
             if kind == "progress" and val is not None:
@@ -7147,9 +7169,17 @@ class MainWindow(QtWidgets.QMainWindow):
         def work():
             try:
                 self.update_done.wait()
-                path = preview_video(url, outdir, ffmpeg=ffmpeg, emit=em, duration=dur)
+                tmp = preview_video(url, outdir, ffmpeg=ffmpeg, emit=em, duration=dur)
+                path = root / (name + tmp.suffix)
+                try:
+                    os.replace(tmp, path)
+                except OSError:          # an older copy with this name is still open -> use the new one as it is
+                    path = tmp
+                else:
+                    shutil.rmtree(outdir, ignore_errors=True)
                 self.emit("pv_ready", (req, url, str(path)))
             except Exception as ex:  # noqa: BLE001
+                shutil.rmtree(outdir, ignore_errors=True)
                 self.emit("pv_err", (req, clean_error(ex)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -7212,7 +7242,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         msg = self.player.errorString()
         if self._pv_kind == "stream" and self._is_info_current():
-            self._on_log(f"Streaming the preview failed ({msg}) – downloading a small copy instead.")
+            yt = self._proxy.last_error if self._proxy is not None else ""
+            self._on_log(f"Streaming the preview failed ({msg}{'; YouTube: ' + yt if yt else ''}) – downloading a "
+                         "small copy instead.")
             self._stream_failed.add(self.info_url)
             self.player.setSource(QtCore.QUrl())
             if self.aplayer is not None:
@@ -7270,7 +7302,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.aplayer.pause()
 
     def _on_volume(self, v):
+        self.btn_mute.set_level(v)
+        self._vol_settle.start()            # remember the level once it stays put (not the steps on the way to 0)
         self._apply_gain(force=True)
+
+    def _remember_vol(self):
+        if self.vol.value() > 0 and not self.vol.isSliderDown():
+            self._vol_restore = self.vol.value()
+
+    def _toggle_mute(self):
+        v = self.vol.value()
+        if v > 0:
+            self._vol_settle.stop()
+            self._vol_restore = v
+            self.vol.setValue(0)
+        else:
+            self.vol.setValue(self._vol_restore if self._vol_restore > 0 else 80)
+            self._vol_settle.stop()
 
     def _toggle_play(self):
         if not self._has_media():
@@ -7698,8 +7746,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if fx_needed(mode, fx):
             if not self._is_info_current() or not dur:
                 return self._on_error("Wait until the video info is loaded (needed for crop, volume and subtitles).")
-            if not self._check_ai():
-                return
             return self._start_multi(url, single=((s or 0.0), e if e is not None else dur), name=name)
         lp = local_path(url)
         if lp and self._is_local():
@@ -7754,17 +7800,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if srt:
             kw["_srt"] = ([((s or 0.0), e if e is not None else (dur or 1e9))], srt, True)
         threading.Thread(target=self._worker, args=(fn, args, name, thumb, bool(lp), kw), daemon=True).start()
-
-    def _check_ai(self):
-        """AI enlarging picked but the upscaler is missing -> offer to install it (then start again)."""
-        if self.seg.value() != "mp4" or not self._ai_wanted():
-            return True
-        dims = self._frame_dims()
-        if not dims or dims[2] <= dims[0] * 1.05 or upscaler_exe() is not None:
-            return True
-        if self._ask_install():
-            self._install_upscaler(then=self.start)
-        return False
 
     def _is_info_current(self):
         return bool(self.info) and self.info_url == self.url.text().strip()
@@ -7828,8 +7863,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._on_error(f"Invalid folder: {ex}")
         ext = self._ext(mode)
         fx = self._fx(mode)
-        if fx_needed(mode, fx) and not single and not self._check_ai():
-            return
         if single:
             name = name or unique_name(outdir, self._default_name(*single) or "clip", ext)
         else:
@@ -8131,7 +8164,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pl.setSource(QtCore.QUrl())
         if self._proxy is not None:
             self._proxy.close()
-        shutil.rmtree(self._pv_dir, ignore_errors=True)
+        preview_cleanup(self._keep_pv())
         e.accept()
         QtCore.QTimer.singleShot(0, lambda: os._exit(0))
 

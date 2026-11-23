@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.7.2"
+APP_VERSION = "2.8.0"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -143,20 +143,13 @@ ITEM_HELP = {
     "Smaller (128 colors)": "Smaller file, slight banding in gradients.",
     "Smallest (64 colors)": "Smallest file, visible banding.",
     # upscaling
-    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",
+    "Off": "Keeps the size (of the video, or of the crop from the Frame tab).",  # enlarging: Lanczos
     "2×": "Twice as wide and high.",
     "3×": "Three times as wide and high.",
     "4×": "Four times as wide and high.",
     "To 1080p": "Short side 1080 px: 1920 × 1080, or 1080 × 1920 for a 9:16 crop (Reels / Shorts / TikTok).",
     "To 1440p": "Short side 1440 px: 2560 × 1440, or 1440 × 2560 for 9:16.",
     "To 4K (2160p)": "Short side 2160 px: 3840 × 2160, or 2160 × 3840 for 9:16.",
-    "Standard (fast)": "Normal scaling (Lanczos) – instant, a bit soft when enlarging a lot.",
-    "AI · real footage": "Real-ESRGAN x4plus: invents fine detail. Slow (about 0.3–2 s per frame on a graphics card) – "
-                         "best for stills and short clips.",
-    "AI · anime video": "Real-ESRGAN anime video model: clean lines, fast, steady from frame to frame.",
-    "AI · anime stills": "Real-ESRGAN x4plus-anime: the sharpest anime model, slower – great for single frames.",
-    "Load own model …": "Add a Real-ESRGAN compatible ncnn model (a .param + .bin pair, e.g. 4x-UltraSharp from the "
-                "Upscayl model collection).",
     # theme
     "Dark": "Neutral dark grey.",
     "Midnight": "Dark blue.",
@@ -167,15 +160,8 @@ ASPECTS = {"Off": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "3:4": 
 # upscaling (Output tab): target of the result -> ("x", factor) or ("short", short side in px)
 UPSCALES = {"Off": None, "2×": ("x", 2), "3×": ("x", 3), "4×": ("x", 4), "To 1080p": ("short", 1080),
             "To 1440p": ("short", 1440), "To 4K (2160p)": ("short", 2160)}
-# built-in models: label -> (kind, Real-ESRGAN model name, native scale; None = the model can do 2/3/4)
-MODELS = {"Standard (fast)": ("std", None, None),
-          "AI · real footage": ("esr", "realesrgan-x4plus", 4),
-          "AI · anime video": ("esr", "realesr-animevideov3", None),
-          "AI · anime stills": ("esr", "realesrgan-x4plus-anime", 4)}
-MODEL_LOAD = "Load own model …"
 # volume curve: how the volume goes from a point to the next one
 EASES = {"Linear": "linear", "Easy ease": "ease", "Ease in": "in", "Ease out": "out", "Hold": "hold"}
-CUSTOM_MODELS_DIR = APP_DIR / "models"
 FONTS_DIR = APP_DIR / "fonts"
 SUB_STYLE = {"font": "Arial", "font_file": "", "size": 100, "color": "#ffffff", "outline": "#000000",
              "bold": True, "pos": None}
@@ -183,14 +169,10 @@ COOKIE_FILE = APP_DIR / "youtube_login.txt"   # YouTube login (cookies), taken f
 SIGNIN_DIR = APP_DIR / "signin"                 # own browser profile for the sign-in (your normal one stays untouched)
 LOGIN_URL = ("https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&hl=en"
              "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3D%252F")
-UPSCALER_DIR = APP_DIR / "upscaler"
-UPSCALER_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
-                "realesrgan-ncnn-vulkan-20220424-windows.zip")
-UPSCALER_SHA256 = "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d"
-UPSCALER_MB = 45
-HISTORY_FILE = APP_DIR / "history.json"
-HISTORY_DIR = APP_DIR / "history"
 HISTORY_MAX = 500
+# where the history (links + small pictures) and the small preview copies are kept – changeable in Settings
+DEFAULT_PATHS = {"history": APP_DIR / "history", "preview": APP_DIR / "preview"}
+PATHS = dict(DEFAULT_PATHS)
 SUB_TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 
 LOCAL_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".m2ts", ".mts", ".flv", ".wmv", ".mpg",
@@ -209,7 +191,7 @@ ACCENTS = [("Lime", "#c4f240"), ("Mint", "#3ddc97"), ("Cyan", "#22d3ee"), ("Blue
            ("Violet", "#a78bfa"), ("Pink", "#ff5fa2"), ("Red", "#ff4d4d"), ("Orange", "#ff9f43"),
            ("Yellow", "#ffd43b")]
 DEFAULT_THEME = "Dark"
-DEFAULT_ACCENT = "#c4f240"
+DEFAULT_ACCENT = "#ff4d4d"
 WARN_COLOR = "#f0b429"
 ERR_COLOR = "#ff6b6b"
 

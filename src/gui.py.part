@@ -1304,7 +1304,7 @@ class HistoryDialog(QtWidgets.QDialog):
             it.setToolTip(x["url"])
             pix = None
             if x.get("thumb"):
-                pm = QtGui.QPixmap(str(HISTORY_DIR / x["thumb"]))
+                pm = QtGui.QPixmap(str(history_dir() / "thumbnails" / x["thumb"]))
                 if not pm.isNull():
                     pix = QtGui.QPixmap(128, 72)
                     pix.fill(QtGui.QColor(0, 0, 0, 0))
@@ -1725,6 +1725,106 @@ def section(text):
     return label(text.upper(), "section")
 
 
+class PathLabel(QtWidgets.QLabel):
+    """A folder path in one line, shortened in the middle when there is no room (full path on hover)."""
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("muted")
+        self._full = ""
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(60)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+    def set_path(self, text):
+        self._full = str(text)
+        tip(self, "Folder", self._full)
+        self._elide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self):
+        self.setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideMiddle, max(40, self.width())))
+
+
+class MuteButton(QtWidgets.QAbstractButton):
+    """Speaker next to the preview volume: 0, 1 or 2 sound waves for the level, crossed out when silent."""
+    def __init__(self):
+        super().__init__()
+        self.c = theme_colors(DEFAULT_THEME, DEFAULT_ACCENT)
+        self.level = 80
+        self.setFixedSize(30, 30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def set_colors(self, c):
+        self.c = c
+        self.update()
+
+    def set_level(self, v):
+        self.level = int(v)
+        self.update()
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.update()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self.update()
+
+    def paintEvent(self, _e):
+        c = self.c
+        p = QtGui.QPainter(self)
+        p.setRenderHint(AA)
+        hover = self.underMouse() and self.isEnabled()
+        if hover:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(c["panel2"]))
+            p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(1, 1, -1, -1), 8, 8)
+        col = QtGui.QColor(c["text"] if hover else c["muted"])
+        if not self.isEnabled():
+            col = QtGui.QColor(c["border"])
+        p.translate(self.width() / 2 - 9, self.height() / 2 - 8)     # icon box 18 × 16
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        body = QtGui.QPainterPath()
+        body.addRoundedRect(QtCore.QRectF(0.5, 5.2, 4.2, 5.6), 1.2, 1.2)
+        body.addPolygon(QtGui.QPolygonF([QtCore.QPointF(3.6, 5.4), QtCore.QPointF(8.6, 1.4),
+                                         QtCore.QPointF(8.6, 14.6), QtCore.QPointF(3.6, 10.6)]))
+        p.drawPath(body.simplified())
+        pen = QtGui.QPen(col, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if self.level <= 0:
+            pen.setColor(QtGui.QColor(c["accent"]) if self.isEnabled() else col)
+            p.setPen(pen)
+            p.drawLine(QtCore.QPointF(11.6, 5.2), QtCore.QPointF(17.2, 10.8))
+            p.drawLine(QtCore.QPointF(17.2, 5.2), QtCore.QPointF(11.6, 10.8))
+        else:
+            p.setPen(pen)
+            waves = [3.4] + ([6.6] if self.level >= 50 else [])
+            for r in waves:
+                p.drawArc(QtCore.QRectF(8.6 - r, 8 - r, 2 * r, 2 * r), -50 * 16, 100 * 16)
+        p.end()
+
+
+def _dir_buttons(on_open, on_change, on_default):
+    row = QtWidgets.QHBoxLayout()
+    row.setSpacing(6)
+    b_open = tip(QtWidgets.QPushButton("Open folder"), "Open folder", "Shows the folder in Explorer.")
+    b_change = tip(QtWidgets.QPushButton("Change …"), "Change folder",
+                   "Pick another folder – what is saved now moves along.")
+    b_def = tip(QtWidgets.QPushButton("Default"), "Default folder", "Back to the app's own folder (moves along).")
+    b_def.setObjectName("ghost")
+    for b, fn in ((b_open, on_open), (b_change, on_change), (b_def, on_default)):
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.clicked.connect(fn)
+        row.addWidget(b)
+    return row, b_def
+
+
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent, theme, accent, tips_on, apply, apply_tips, auto_pv=True, apply_pv=None,
                  pv_mode="stream", apply_mode=None):
@@ -1799,11 +1899,20 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cb_hist.setChecked(bool(parent.cfg.get("history", True)))
         self.cb_hist.toggled.connect(self._hist_toggled)
         lay.addWidget(self.cb_hist)
-        hr = QtWidgets.QHBoxLayout()
+        pr = QtWidgets.QHBoxLayout()
+        pr.setSpacing(8)
+        self.lbl_hist_dir = PathLabel()
+        self.lbl_hist_info = label("", "muted")
+        pr.addWidget(self.lbl_hist_dir, 1)
+        pr.addWidget(self.lbl_hist_info)
+        lay.addLayout(pr)
+        hr, self.btn_hist_def = _dir_buttons(lambda: self._open_dir("history"), lambda: self._change_dir("history"),
+                                             lambda: self._default_dir("history"))
+        hr.addStretch(1)
         self.btn_hist_clear = tip(QtWidgets.QPushButton("Clear history"), "Clear history", "Removes all saved links.")
+        self.btn_hist_clear.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_hist_clear.clicked.connect(self._hist_clear)
         hr.addWidget(self.btn_hist_clear)
-        hr.addStretch(1)
         lay.addLayout(hr)
         lay.addStretch(1)
 
@@ -1828,6 +1937,30 @@ class SettingsDialog(QtWidgets.QDialog):
         if apply_pv:
             self.cb_pv.toggled.connect(apply_pv)
         right.addWidget(self.cb_pv)
+        self.cb_keep = QtWidgets.QCheckBox("Keep the downloaded small copies (open at once next time)")
+        self.cb_keep.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_keep, "Keep small copies", "Off: the small preview copies are deleted when you close the app. "
+                                               "On: they stay in the folder below and are used again when you open "
+                                               "the same video (also from the history).")
+        self.cb_keep.setChecked(parent._keep_pv())
+        self.cb_keep.toggled.connect(self._keep_toggled)
+        right.addWidget(self.cb_keep)
+        pr = QtWidgets.QHBoxLayout()
+        pr.setSpacing(8)
+        self.lbl_pv_dir = PathLabel()
+        self.lbl_pv_info = label("", "muted")
+        pr.addWidget(self.lbl_pv_dir, 1)
+        pr.addWidget(self.lbl_pv_info)
+        right.addLayout(pr)
+        vr, self.btn_pv_def = _dir_buttons(lambda: self._open_dir("preview"), lambda: self._change_dir("preview"),
+                                           lambda: self._default_dir("preview"))
+        vr.addStretch(1)
+        self.btn_pv_clear = tip(QtWidgets.QPushButton("Delete copies"), "Delete copies",
+                                "Deletes the small preview copies in this folder now (not your downloads).")
+        self.btn_pv_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pv_clear.clicked.connect(self._pv_clear)
+        vr.addWidget(self.btn_pv_clear)
+        right.addLayout(vr)
         if not PLAYER_OK:
             self.seg_pv.setEnabled(False)
             self.cb_pv.setEnabled(False)
@@ -1852,40 +1985,13 @@ class SettingsDialog(QtWidgets.QDialog):
         lr.addWidget(self.btn_cookies)
         lr.addStretch(1)
         right.addLayout(lr)
-        right.addSpacing(4)
-        right.addWidget(section("AI upscaler"))
-        self.lbl_esr = label("", "muted")
-        self.lbl_esr.setWordWrap(True)
-        right.addWidget(self.lbl_esr)
-        er = QtWidgets.QHBoxLayout()
-        self.btn_esr = QtWidgets.QPushButton()
-        self.btn_esr.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_esr.clicked.connect(self._esr_clicked)
-        er.addWidget(self.btn_esr)
-        er.addStretch(1)
-        right.addLayout(er)
-        mr = QtWidgets.QHBoxLayout()
-        mr.setSpacing(6)
-        mr.addWidget(label("Own models", "field"))
-        self.cb_own = QtWidgets.QComboBox()
-        tip(self.cb_own, "Own models", "Models you added under Output → Upscale → Model → Load own model.")
-        mr.addWidget(self.cb_own, 1)
-        self.btn_own_add = QtWidgets.QPushButton("Add …")
-        self.btn_own_del = QtWidgets.QPushButton("Remove")
-        for b in (self.btn_own_add, self.btn_own_del):
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            mr.addWidget(b)
-        self.btn_own_add.clicked.connect(self._own_add)
-        self.btn_own_del.clicked.connect(self._own_del)
-        right.addLayout(mr)
         right.addStretch(1)
-        self.refresh_esr()
-        self._fill_own()
         self.show_login_state()
+        self.refresh_dirs()
 
         bot = QtWidgets.QHBoxLayout()
         reset = tip(QtWidgets.QPushButton("Reset to default"), "Reset to default",
-                    "Dark theme, lime accent and hover help on.")
+                    "Dark theme, red accent and hover help on.")
         reset.setObjectName("ghost")
         reset.clicked.connect(self._reset)
         done = QtWidgets.QPushButton("Done")
@@ -1950,58 +2056,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.main._on_log("✓ YouTube login loaded from a cookies file.")
         self.show_login_state()
 
-    def refresh_esr(self):
-        busy = self.main._esr_job is not None
-        exe = upscaler_exe()
-        if busy:
-            self.lbl_esr.setText("Downloading …")
-            self.btn_esr.setText("Installing …")
-            self.btn_esr.setEnabled(False)
-        elif exe:
-            self.lbl_esr.setText("✓ Real-ESRGAN is installed (photo + anime models). Pick it under Output → Upscale → "
-                                 "Model.")
-            self.btn_esr.setText("Remove")
-            self.btn_esr.setEnabled(True)
-        else:
-            self.lbl_esr.setText(f"Real-ESRGAN enlarges pictures with AI on your graphics card (NVIDIA, AMD, Intel). "
-                                 f"One download of ≈ {UPSCALER_MB} MB.")
-            self.btn_esr.setText("Install")
-            self.btn_esr.setEnabled(True)
-        tip(self.btn_esr, "AI upscaler", "Downloaded from the official Real-ESRGAN page on GitHub.")
-
-    def _fill_own(self):
-        self.cb_own.clear()
-        own = list_custom_models()
-        for x in own:
-            self.cb_own.addItem(f"{x['name']}  ({x['scale']}×)", x["name"])
-        if not own:
-            self.cb_own.addItem("none yet")
-        self.cb_own.setEnabled(bool(own))
-        self.btn_own_del.setEnabled(bool(own))
-
-    def _own_add(self):
-        m = self.main
-        idx = m.cb_model.findText(MODEL_LOAD)
-        m.cb_model.setCurrentIndex(idx)
-        m._model_picked(idx)
-        self._fill_own()
-
-    def _own_del(self):
-        name = self.cb_own.currentData()
-        if name and QtWidgets.QMessageBox.question(self, "Remove model", f"Remove the model “{name}”?") \
-                == QtWidgets.QMessageBox.StandardButton.Yes:
-            remove_model(name)
-            self.main._fill_models()
-            self.main._frame_info()
-            self._fill_own()
-
-    def _esr_clicked(self):
-        if upscaler_exe():
-            remove_upscaler()
-        else:
-            self.main._install_upscaler()
-        self.refresh_esr()
-
     def _hist_toggled(self, on):
         self.main.cfg["history"] = bool(on)
         save_cfg(self.main.cfg)
@@ -2010,6 +2064,58 @@ class SettingsDialog(QtWidgets.QDialog):
         if QtWidgets.QMessageBox.question(self, "Clear history", "Remove all links from the history?") \
                 == QtWidgets.QMessageBox.StandardButton.Yes:
             history_clear()
+            self.refresh_dirs()
+
+    # ---- folders of the history and the small preview copies
+    def refresh_dirs(self):
+        hs = history_stats()
+        self.lbl_hist_dir.set_path(history_dir())
+        self.lbl_hist_info.setText(f"{hs['links']} link{'s' if hs['links'] != 1 else ''} · {fmt_bytes(hs['bytes'])}")
+        self.btn_hist_def.setVisible(bool(self.main.cfg.get("history_dir")))
+        self.btn_hist_clear.setEnabled(hs["links"] > 0)
+        ps = preview_stats()
+        self.lbl_pv_dir.set_path(preview_dir())
+        self.lbl_pv_info.setText(f"{ps['files']} cop{'ies' if ps['files'] != 1 else 'y'} · {fmt_bytes(ps['bytes'])}")
+        self.btn_pv_def.setVisible(bool(self.main.cfg.get("preview_dir")))
+        self.btn_pv_clear.setEnabled(ps["files"] > 0)
+
+    def _open_dir(self, key):
+        d = history_dir() if key == "history" else preview_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            return QtWidgets.QMessageBox.warning(self, "Folder", clean_error(ex))
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(d)))
+
+    def _change_dir(self, key):
+        cur = history_dir() if key == "history" else preview_dir()
+        what = "the history" if key == "history" else "the small preview copies"
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Folder for {what}",
+                                                          str(cur if cur.exists() else Path.home()))
+        if path:
+            self.main._set_dir(key, path)
+            self.refresh_dirs()
+
+    def _default_dir(self, key):
+        self.main._set_dir(key, None)
+        self.refresh_dirs()
+
+    def _keep_toggled(self, on):
+        self.main.cfg["keep_previews"] = bool(on)
+        save_cfg(self.main.cfg)
+
+    def _pv_clear(self):
+        st = preview_stats()
+        if QtWidgets.QMessageBox.question(
+                self, "Delete copies", f"Delete the {st['files']} small preview cop{'ies' if st['files'] != 1 else 'y'} "
+                                       f"({fmt_bytes(st['bytes'])})?") != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        n = preview_cleanup(False)
+        left = preview_stats()["files"]
+        self.main._pv_cache = {k: v for k, v in self.main._pv_cache.items() if Path(v).exists()}
+        self.main._on_log(f"Deleted {n} preview cop{'ies' if n != 1 else 'y'}."
+                          + (f" {left} still open in the player – deleted when the app closes." if left else ""))
+        self.refresh_dirs()
 
     def _reset(self):
         self.seg.set_value(DEFAULT_THEME, animate=True)
@@ -2068,8 +2174,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_out = None
         self._pv_state = ""            # "", "offer", "loading", "error", "ready"
         self._pv_cache: dict[str, str] = {}
-        self._pv_dir = APP_DIR / "preview"
-        shutil.rmtree(self._pv_dir, ignore_errors=True)
+        for key in ("history", "preview"):
+            d = self.cfg.get(f"{key}_dir")
+            PATHS[key] = Path(d) if d else DEFAULT_PATHS[key]
+        history_migrate()
+        preview_cleanup(self._keep_pv())
+        if not self.cfg.get("upscaler_removed"):
+            threading.Thread(target=remove_old_upscaler, daemon=True).start()
+            self.cfg["upscaler_removed"] = True
         self._clip_stop = None
         self._seek_target = None
         self._pos_hint = (None, 0.0)     # last position we jumped to + when (for fast frame steps)
@@ -2087,7 +2199,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sub_items: list = []
         self._sub_req = 0
         self.lines_dlg = None
-        self._esr_job = None
         self._login_noted = False
         self._signin = None
         self._resetting = False
@@ -2118,6 +2229,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build()
         self._apply_sub_style_ui()
         self.theme = self.cfg.get("theme") if self.cfg.get("theme") in THEMES else DEFAULT_THEME
+        if not self.cfg.get("accent_v28") and str(self.cfg.get("accent", "")).lower() == "#c4f240":
+            self.cfg["accent"] = DEFAULT_ACCENT          # the old default (lime) -> the new one (red)
+        self.cfg["accent_v28"] = True
         self.accent = self.cfg.get("accent") or DEFAULT_ACCENT
         self.apply_theme(self.theme, self.accent, save=False)
         self._load_settings()
@@ -2234,10 +2348,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Position", "Drag to move through the video.")
         self.seek.setRange(0, 0)
         self.seek.sliderMoved.connect(lambda v: self._seek_to(v / 1000))
-        self.vol = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Volume", "")
+        self.vol = tip(QtWidgets.QSlider(Qt.Orientation.Horizontal), "Volume",
+                       "How loud the preview plays (only for listening – the download keeps its sound; change that "
+                       "in the Volume tab).")
         self.vol.setRange(0, 100)
         self.vol.setFixedWidth(64)
         self.vol.valueChanged.connect(self._on_volume)
+        self.btn_mute = tip(MuteButton(), "Mute", "Click to mute the preview, click again to get the volume back "
+                                                  "it had before (key M).")
+        self.btn_mute.clicked.connect(self._toggle_mute)
+        self._vol_restore = 80              # level the speaker button goes back to after muting
+        self._vol_settle = QtCore.QTimer(self)
+        self._vol_settle.setSingleShot(True)
+        self._vol_settle.setInterval(700)
+        self._vol_settle.timeout.connect(self._remember_vol)
         trl.addWidget(self.btn_prev_f)
         trl.addWidget(self.btn_play)
         trl.addWidget(self.btn_next_f)
@@ -2246,7 +2370,8 @@ class MainWindow(QtWidgets.QMainWindow):
         trl.addWidget(self.lbl_ptime)
         trl.addSpacing(4)
         trl.addWidget(self.seek, 1)
-        trl.addSpacing(4)
+        trl.addSpacing(2)
+        trl.addWidget(self.btn_mute)
         trl.addWidget(self.vol)
         tv.addLayout(trl)
         tr2 = QtWidgets.QHBoxLayout()
@@ -2265,7 +2390,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tr2.addWidget(b_)
         self.btn_still = tip(QtWidgets.QPushButton("↓ Save frame"), "Save frame",
                              "Saves the frame you see as a PNG in full quality (not the preview quality) – with the "
-                             "crop, size and AI upscaling from the Frame tab.")
+                             "crop from the Frame tab and the size from Output → Upscale.")
         self.btn_still.setObjectName("chip")
         self.btn_still.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_still.clicked.connect(self._save_still)
@@ -2416,7 +2541,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = TabBar([("out", "Output"), ("frame", "Frame"), ("volume", "Volume"), ("subs", "Subtitles")])
         self.tabs.set_tips({
             "out": ("Output", "Codec, quality and size of the file."),
-            "frame": ("Frame", "Crop to 9:16, 1:1 … (for TikTok, Reels, Shorts), output size and AI upscaling."),
+            "frame": ("Frame", "Crop to 9:16, 1:1 … (for TikTok, Reels, Shorts) and the output size."),
             "volume": ("Volume", "Make parts of the clip quieter or louder – fades, ducking, muting."),
             "subs": ("Subtitles", "Load the video's subtitles (or your own file), read them, burn them into the "
                                   "picture or save them as .srt.")})
@@ -2520,7 +2645,7 @@ class MainWindow(QtWidgets.QMainWindow):
         foot.addWidget(brand, 0, Qt.AlignmentFlag.AlignBottom)
         v.addLayout(foot)
         for key, fn in (("Space", self._toggle_play), ("I", self._set_in), ("O", self._set_out),
-                        (",", lambda: self._step(-1)), (".", lambda: self._step(1))):
+                        (",", lambda: self._step(-1)), (".", lambda: self._step(1)), ("M", self._toggle_mute)):
             sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(fn)
 
@@ -2588,33 +2713,13 @@ class MainWindow(QtWidgets.QMainWindow):
         g.addWidget(self.size_hint, 4, 1, 1, 3)
         h_up = ("Makes the picture bigger (or sets the size of a 9:16 / 1:1 crop). 'To 1080p' = short side 1080 px, "
                 "e.g. 1080 × 1920 for Reels / Shorts.")
-        h_model = ("How it is enlarged: normal scaling, or AI (Real-ESRGAN on the graphics card). You can also load "
-                   "your own ncnn models.")
         self.cb_up = self._combo(UPSCALES, "Upscale", h_up)
         self.cb_up.currentTextChanged.connect(lambda _t: self._frame_info())
-        self.cb_model = self._combo(list(MODELS), "Model", h_model)
-        self.cb_model.activated.connect(self._model_picked)
-        self.cb_model.currentTextChanged.connect(lambda _t: self._frame_info())
-        self._fill_models()
         g.addWidget(self._field("Upscale", "Upscale", h_up), 5, 0)
-        ur = QtWidgets.QHBoxLayout()
-        ur.setSpacing(8)
-        ur.addWidget(self.cb_up, 2)
-        ur.addWidget(self.cb_model, 3)
-        g.addLayout(ur, 5, 1, 1, 3)
+        g.addWidget(self.cb_up, 5, 1, 1, 3)
         self.up_hint = label("", "hint")
         self.up_hint.setWordWrap(True)
         g.addWidget(self.up_hint, 6, 1, 1, 3)
-        er = QtWidgets.QHBoxLayout()
-        self.btn_esr = tip(QtWidgets.QPushButton(f"Install AI upscaler (≈ {UPSCALER_MB} MB)"), "AI upscaler",
-                           "Real-ESRGAN – runs on the graphics card (NVIDIA, AMD or Intel, no extra setup). "
-                           "Downloaded once from its official GitHub page.")
-        self.btn_esr.setObjectName("chip")
-        self.btn_esr.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_esr.clicked.connect(lambda: self._install_upscaler())
-        er.addWidget(self.btn_esr)
-        er.addStretch(1)
-        g.addLayout(er, 7, 1, 1, 3)
         return w
 
     def _page_audio(self):
@@ -2982,51 +3087,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ow, oh = target_dims(cw, ch, up, aspect)
         return cw, ch, ow, oh
 
-    def _model(self):
-        return model_spec(self.cb_model.currentText())
-
-    def _ai_wanted(self):
-        return self._model().get("kind") == "esr"
-
-    def _fill_models(self, select=None):
-        cur = select or self.cb_model.currentText()
-        self.cb_model.blockSignals(True)
-        self.cb_model.clear()
-        labels = list(MODELS) + [f"Own · {x['name']}" for x in list_custom_models()]
-        for lab in labels:
-            self.cb_model.addItem(lab)
-        self.cb_model.addItem(MODEL_LOAD)
-        for i in range(self.cb_model.count()):
-            t = self.cb_model.itemText(i)
-            h = ITEM_HELP.get(t) or ("Your own model (ncnn). Remove it in Settings → AI upscaler."
-                                     if t.startswith("Own · ") else "")
-            if h:
-                self.cb_model.setItemData(i, tip_html(t, h), Qt.ItemDataRole.ToolTipRole)
-        self.cb_model.setCurrentText(cur if cur in labels else labels[0])
-        self.cb_model.blockSignals(False)
-        self._last_model = self.cb_model.currentText()
-
-    def _model_picked(self, idx):
-        if self.cb_model.itemText(idx) != MODEL_LOAD:
-            self._last_model = self.cb_model.currentText()
-            return
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load a model (.param – the .bin with the same name must be next to it)",
-            self.cfg.get("last_model_dir") or str(Path.home()), "ncnn models (*.param *.bin);;All files (*.*)")
-        if not path:
-            self.cb_model.setCurrentText(getattr(self, "_last_model", list(MODELS)[0]))
-            return
-        self.cfg["last_model_dir"] = str(Path(path).parent)
-        try:
-            m = import_model(path)
-        except Exception as ex:  # noqa: BLE001
-            self.cb_model.setCurrentText(getattr(self, "_last_model", list(MODELS)[0]))
-            return self._on_error(clean_error(ex))
-        self._fill_models(select=f"Own · {m['name']}")
-        self._on_log(f"✓ Model added: {m['name']} ({m['scale']}×)")
-        self._on_status(f"Model “{m['name']}” added ({m['scale']}×).")
-        self._frame_info()
-
     def _frame_info(self):
         mode = self.seg.value()
         is_mp4 = mode == "mp4"
@@ -3034,8 +3094,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_center.setVisible(bool(self._aspect()) and self.canvas is not None)
         aspect = self._aspect()
         dims = self._frame_dims() if mode != "mp3" else None
-        ai = self._ai_wanted() and is_mp4 and UPSCALES.get(self.cb_up.currentText()) is not None
-        need_ai = False
         if mode == "mp3":
             ftxt = "Audio has no picture – switch to Video or GIF to crop."
             utxt = ""
@@ -3045,9 +3103,7 @@ class MainWindow(QtWidgets.QMainWindow):
             utxt = ""
             if is_mp4 and (ow, oh) != (cw, ch):
                 f = ow / cw
-                need_ai = ai and f > 1.02
-                utxt = f"{cw} × {ch}  →  {ow} × {oh}" + (
-                    f"  ·  {f:.1f}× " + ("with AI" if need_ai else "(standard)") if f > 1.02 else "  ·  scaled down")
+                utxt = f"{cw} × {ch}  →  {ow} × {oh}" + (f"  ·  {f:.1f}×" if f > 1.02 else "  ·  scaled down")
                 ftxt += f"  →  result {ow} × {oh} (Output → Upscale)"
             elif not is_mp4:
                 ftxt += "  ·  the GIF width is set in Output"
@@ -3056,18 +3112,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             ftxt = "Paste a link or open a file – the sizes appear here." if aspect else ""
             utxt = ""
-            need_ai = ai
-        installed = upscaler_exe() is not None
-        busy = self._esr_job is not None
-        self.btn_esr.setVisible(is_mp4 and self._ai_wanted() and (not installed or busy))
-        self.btn_esr.setEnabled(not busy)
-        if is_mp4 and self._ai_wanted() and not installed and not busy:
-            utxt = (utxt + "  ·  " if utxt else "") + "the AI upscaler is not installed yet"
-        self.cb_model.setEnabled(UPSCALES.get(self.cb_up.currentText()) is not None)
         self.frame_hint.setText(ftxt)
         self.up_hint.setText(utxt)
         self.up_hint.setVisible(bool(utxt))
-        set_state(self.up_hint, "warn" if (need_ai and not installed) else "")
         self._badges()
 
     def _badges(self):
@@ -3333,7 +3380,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lines_dlg.show()
         self.lines_dlg.raise_()
 
-    # ------------------------------------------------------------------ chapters / history / still / upscaler
+    # ------------------------------------------------------------------ chapters / history / still
     def _chapters(self):
         ch = self.info.get("chapters") if self._is_info_current() else None
         if not ch or self.busy:
@@ -3384,12 +3431,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.info.get("local") and not self.info.get("has_video", True):
             return
-        model = self._model() if self.seg.value() == "mp4" else {"kind": "std"}
-        dims = self._frame_dims()
-        if model.get("kind") == "esr" and dims and dims[2] > dims[0] * 1.05 and upscaler_exe() is None:
-            if not self._ask_install():
-                return
-            return self._install_upscaler(then=self._save_still)
         t = self._player_pos() or 0.0
         self._stop_playback()
         outdir = Path(self.outdir.text().strip() or Path.home() / "Downloads")
@@ -3417,59 +3458,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not local:
                     self.update_done.wait()
                 f = export_still(src, t, fps, dst, local=local, height=height, aspect=aspect, box=box, up=up,
-                                 model=model, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, emit=self.emit)
+                                 ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, emit=self.emit)
                 self.emit("done", [str(f)])
             except Exception as ex:  # noqa: BLE001
                 self.emit("error", clean_error(ex))
         threading.Thread(target=work, daemon=True).start()
-
-    def _ask_install(self):
-        return QtWidgets.QMessageBox.question(
-            self, "AI upscaler",
-            f"The AI upscaler (Real-ESRGAN, ≈ {UPSCALER_MB} MB) isn't installed yet.\n\nDownload and install it now? "
-            "It runs on your graphics card.") == QtWidgets.QMessageBox.StandardButton.Yes
-
-    def _install_upscaler(self, then=None):
-        if self._esr_job is not None:
-            return
-        self._esr_job = then or (lambda: None)
-        self._frame_info()
-        self._on_status("Downloading the AI upscaler …")
-        self._on_progress(0)
-
-        def work():
-            try:
-                install_upscaler(lambda pct: self.emit("esr", ("progress", pct)))
-                self.emit("esr", ("done", None))
-            except Exception as ex:  # noqa: BLE001
-                self.emit("esr", ("error", clean_error(ex)))
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_esr(self, val):
-        kind, v = val
-        if kind == "progress":
-            if not self.busy:
-                self._on_progress(v)
-                self._on_status(f"Downloading the AI upscaler … {v:.0f} %")
-            self.btn_esr.setText(f"Downloading … {v:.0f} %")
-            return
-        job, self._esr_job = self._esr_job, None
-        self.btn_esr.setEnabled(True)
-        self.btn_esr.setText(f"Install AI upscaler (≈ {UPSCALER_MB} MB)")
-        self._frame_info()
-        dlg = getattr(self, "settings_dlg", None)
-        if dlg is not None:
-            dlg.refresh_esr()
-        if kind == "error":
-            self._on_error("AI upscaler: " + v)
-            return
-        self._on_log("✓ AI upscaler installed.")
-        if not self.busy:
-            self._on_progress(100)
-            self._on_status("✓  AI upscaler installed.")
-            set_state(self.status, "ok")
-        if job:
-            job()
 
     def _sign_in(self):
         """Opens the default browser (own profile) on the YouTube sign-in; the login is picked up by itself."""
@@ -3559,7 +3552,6 @@ class MainWindow(QtWidgets.QMainWindow):
         fx = {
             "aspect": aspect, "boxes": boxes,
             "up": UPSCALES.get(self.cb_up.currentText()) if mode == "mp4" else None,
-            "model": self._model(),
             "vol": [tuple(q) for q in self.vol_pts] if mode in ("mp4", "mp3") else [],
             "subs": {"cues": self.sub_cues, "mode": None if sub_mode == "none" else sub_mode,
                      "lang": self.sub_lang, "style": dict(self.sub_style)} if self.sub_cues else None,
@@ -3592,10 +3584,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_thumb.setChecked(bool(c.get("save_thumb", False)))
         self.outdir.setText(c.get("outdir") or str(Path.home() / "Downloads"))
         self.vol.setValue(int(c.get("volume", 80)))
+        self._vol_restore = self.vol.value() or int(c.get("vol_restore") or 80)
+        self._vol_settle.stop()
+        self.btn_mute.set_level(self.vol.value())
         self.seg_join.set_value("separate" if c.get("join") == "separate" else "join")
         pick(self.cb_up, "upscale", UPSCALES, "Off")
-        if c.get("model"):
-            self._fill_models(select=c.get("model"))
         self.seg_aspect.set_value(c.get("aspect") if c.get("aspect") in ASPECTS else "Off")
         self.seg_submode.set_value(c.get("sub_mode") if c.get("sub_mode") in ("none", "burn", "track") else "none")
         self.cb_srt.setChecked(bool(c.get("save_srt", False)))
@@ -3628,8 +3621,8 @@ class MainWindow(QtWidgets.QMainWindow):
             gif_width=self.cb_gif_w.currentText(), gif_fps=self.cb_gif_fps.currentText(),
             gif_colors=self.cb_gif_col.currentText(), outdir=self.outdir.text().strip(),
             mode=self.seg.value(), theme=self.theme, accent=self.accent, save_thumb=self.cb_thumb.isChecked(),
-            volume=self.vol.value(), join=self.seg_join.value(),
-            aspect=self.seg_aspect.value(), upscale=self.cb_up.currentText(), model=self.cb_model.currentText(),
+            volume=self.vol.value(), vol_restore=self._vol_restore, join=self.seg_join.value(),
+            aspect=self.seg_aspect.value(), upscale=self.cb_up.currentText(),
             sub_mode=self.seg_submode.value(), save_srt=self.cb_srt.isChecked(),
             geometry=bytes(self.saveGeometry().toBase64()).decode())
         try:
@@ -3645,6 +3638,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.set_colors(c)
         self.thumb.set_colors(c)
         self.lane.set_colors(c)
+        self.btn_mute.set_colors(c)
         if self.canvas is not None:
             self.canvas.set_colors(c)
         set_dark_titlebar(self, c["dark"])
@@ -3665,6 +3659,42 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_auto_preview(self, on):
         self.cfg["auto_preview"] = bool(on)
+        save_cfg(self.cfg)
+
+    def _keep_pv(self) -> bool:
+        return bool(self.cfg.get("keep_previews", False))
+
+    def _set_dir(self, key, path):
+        """New folder for the history or the small preview copies (None = default); what is there moves along."""
+        new = Path(path) if path else DEFAULT_PATHS[key]
+        old = Path(PATHS[key])
+        if key == "history":
+            try:
+                n = history_move(new)
+            except OSError as ex:
+                return self._on_error(f"The history could not be moved: {clean_error(ex)}")
+            self._on_log(f"History is now kept in {new} ({n} link{'s' if n != 1 else ''}).")
+        else:
+            try:
+                new.mkdir(parents=True, exist_ok=True)
+            except OSError as ex:
+                return self._on_error(f"Invalid folder: {clean_error(ex)}")
+            PATHS["preview"] = new
+            files = preview_files(old) if old.resolve() != new.resolve() else []
+            self._on_log(f"Small preview copies are now kept in {new}.")
+            if files:
+                def move():
+                    done = 0
+                    for f in files:
+                        try:
+                            shutil.move(str(f), str(new / f.name))
+                            done += 1
+                        except OSError:          # still open in the player
+                            pass
+                    self.emit("log", f"Moved {done} of {len(files)} preview cop{'ies' if len(files) != 1 else 'y'} "
+                                     "to the new folder.")
+                threading.Thread(target=move, daemon=True).start()
+        self.cfg[f"{key}_dir"] = str(new) if path else ""
         save_cfg(self.cfg)
 
     def _settings(self):
@@ -4125,6 +4155,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if url in self._pv_cache and Path(self._pv_cache[url]).exists():
             self._load_player(self._pv_cache[url], True, kind="copy")
             return
+        kept = find_preview(info)
+        if kept is not None:              # copy from an earlier time (Settings → keep the small copies)
+            self._pv_cache[url] = str(kept)
+            self._load_player(str(kept), True, kind="copy")
+            return
         auto = self.cfg.get("auto_preview", True)
         dur = info.get("duration") or 0
         if self._pv_mode() == "stream" and self._can_stream(url):
@@ -4173,9 +4208,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thumb.set_overlay("Loading video preview …", 0.0)
         self.vview.show_video(False)
         self.transport.hide()
-        outdir = self._pv_dir / f"p{req}"
+        root = preview_dir()
+        outdir = root / f".dl_{req}"
         ffmpeg = self.ffmpeg
         dur = self.info.get("duration") if self._is_info_current() else None
+        name = preview_name({**self.info, "duration": dur}) if self._is_info_current() else f"video [p{req}] preview 360p"
 
         def em(kind, val=None):
             if kind == "progress" and val is not None:
@@ -4184,9 +4221,17 @@ class MainWindow(QtWidgets.QMainWindow):
         def work():
             try:
                 self.update_done.wait()
-                path = preview_video(url, outdir, ffmpeg=ffmpeg, emit=em, duration=dur)
+                tmp = preview_video(url, outdir, ffmpeg=ffmpeg, emit=em, duration=dur)
+                path = root / (name + tmp.suffix)
+                try:
+                    os.replace(tmp, path)
+                except OSError:          # an older copy with this name is still open -> use the new one as it is
+                    path = tmp
+                else:
+                    shutil.rmtree(outdir, ignore_errors=True)
                 self.emit("pv_ready", (req, url, str(path)))
             except Exception as ex:  # noqa: BLE001
+                shutil.rmtree(outdir, ignore_errors=True)
                 self.emit("pv_err", (req, clean_error(ex)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -4249,7 +4294,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         msg = self.player.errorString()
         if self._pv_kind == "stream" and self._is_info_current():
-            self._on_log(f"Streaming the preview failed ({msg}) – downloading a small copy instead.")
+            yt = self._proxy.last_error if self._proxy is not None else ""
+            self._on_log(f"Streaming the preview failed ({msg}{'; YouTube: ' + yt if yt else ''}) – downloading a "
+                         "small copy instead.")
             self._stream_failed.add(self.info_url)
             self.player.setSource(QtCore.QUrl())
             if self.aplayer is not None:
@@ -4307,7 +4354,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.aplayer.pause()
 
     def _on_volume(self, v):
+        self.btn_mute.set_level(v)
+        self._vol_settle.start()            # remember the level once it stays put (not the steps on the way to 0)
         self._apply_gain(force=True)
+
+    def _remember_vol(self):
+        if self.vol.value() > 0 and not self.vol.isSliderDown():
+            self._vol_restore = self.vol.value()
+
+    def _toggle_mute(self):
+        v = self.vol.value()
+        if v > 0:
+            self._vol_settle.stop()
+            self._vol_restore = v
+            self.vol.setValue(0)
+        else:
+            self.vol.setValue(self._vol_restore if self._vol_restore > 0 else 80)
+            self._vol_settle.stop()
 
     def _toggle_play(self):
         if not self._has_media():
@@ -4735,8 +4798,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if fx_needed(mode, fx):
             if not self._is_info_current() or not dur:
                 return self._on_error("Wait until the video info is loaded (needed for crop, volume and subtitles).")
-            if not self._check_ai():
-                return
             return self._start_multi(url, single=((s or 0.0), e if e is not None else dur), name=name)
         lp = local_path(url)
         if lp and self._is_local():
@@ -4791,17 +4852,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if srt:
             kw["_srt"] = ([((s or 0.0), e if e is not None else (dur or 1e9))], srt, True)
         threading.Thread(target=self._worker, args=(fn, args, name, thumb, bool(lp), kw), daemon=True).start()
-
-    def _check_ai(self):
-        """AI enlarging picked but the upscaler is missing -> offer to install it (then start again)."""
-        if self.seg.value() != "mp4" or not self._ai_wanted():
-            return True
-        dims = self._frame_dims()
-        if not dims or dims[2] <= dims[0] * 1.05 or upscaler_exe() is not None:
-            return True
-        if self._ask_install():
-            self._install_upscaler(then=self.start)
-        return False
 
     def _is_info_current(self):
         return bool(self.info) and self.info_url == self.url.text().strip()
@@ -4865,8 +4915,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._on_error(f"Invalid folder: {ex}")
         ext = self._ext(mode)
         fx = self._fx(mode)
-        if fx_needed(mode, fx) and not single and not self._check_ai():
-            return
         if single:
             name = name or unique_name(outdir, self._default_name(*single) or "clip", ext)
         else:
@@ -5168,7 +5216,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pl.setSource(QtCore.QUrl())
         if self._proxy is not None:
             self._proxy.close()
-        shutil.rmtree(self._pv_dir, ignore_errors=True)
+        preview_cleanup(self._keep_pv())
         e.accept()
         QtCore.QTimer.singleShot(0, lambda: os._exit(0))
 

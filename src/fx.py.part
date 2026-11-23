@@ -430,7 +430,7 @@ def _clip_names(outdir, name, labels, join, ext, base):
 
 
 def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx, ffmpeg, ffprobe, emit, info=None):
-    """Clips -> pieces in a good intermediate quality -> crop / scale (AI upscale) / volume curve / subtitles
+    """Clips -> pieces in a good intermediate quality -> crop / scale / volume curve / subtitles
     in one more encode. join: all clips in one file, else one file per clip."""
     n = len(clips)
     ext = _kind_ext(kind, params)
@@ -447,7 +447,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
     elif kind == "gif" and mode == "track":
         mode = "burn"
     vol = fx.get("vol") or []
-    model = fx.get("model") or {"kind": "std"}
     steps = n + len(groups)
     step = [0]
 
@@ -489,12 +488,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
                 crops.append(crop_rect(boxes[k], inf["width"], inf["height"], aspect) if aspect else None)
             cw, ch = (crops[0][0], crops[0][1]) if aspect else (infos[0]["width"], infos[0]["height"])
             W, H = target_dims(cw, ch, fx.get("up") if kind == "mp4" else None, aspect)
-            if kind == "mp4" and model.get("kind") == "esr" and W > cw * 1.05:
-                for j, (p, cr) in enumerate(zip(ps, crops)):
-                    ps[j] = ai_upscale_video(p, cr, (W, H), model, tmp, f"{gi}_{j}", ffmpeg=ffmpeg,
-                                             ffprobe=ffprobe, emit=gemit)
-                    crops[j] = None
-                infos = [media_info(p, ffprobe) for p in ps]
             segs, off = [], 0.0
             for k, inf in zip(g, infos):
                 segs.append((clips[k][0], clips[k][1], off))
@@ -531,238 +524,6 @@ def export_fx(kind, src, clips, labels, outdir, *, local, join, name, params, fx
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ----------------------------------------------------------------------------- AI upscaler (Real-ESRGAN)
-
-def upscaler_exe() -> Path | None:
-    for name in ("realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan"):
-        p = UPSCALER_DIR / name
-        if p.is_file() and (UPSCALER_DIR / "models").is_dir():
-            return p
-    return None
-
-
-def install_upscaler(progress=None) -> Path:
-    """Downloads Real-ESRGAN (ncnn / Vulkan – runs on NVIDIA, AMD and Intel graphics, no CUDA needed)."""
-    import hashlib
-    import urllib.request
-    import zipfile
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    zpath = APP_DIR / "upscaler_download.zip"
-    h = hashlib.sha256()
-    req = urllib.request.Request(UPSCALER_URL, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r, open(zpath, "wb") as f:
-            total = int(r.headers.get("Content-Length") or 0) or UPSCALER_MB * 1048576
-            done = 0
-            while True:
-                chunk = r.read(1 << 18)
-                if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
-                done += len(chunk)
-                if progress:
-                    progress(min(99.0, done / total * 100))
-        if h.hexdigest() != UPSCALER_SHA256:
-            raise RuntimeError("The download is damaged (checksum does not match) – please try again.")
-        tmp = UPSCALER_DIR.with_name("upscaler_new")
-        shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
-        with zipfile.ZipFile(zpath) as z:
-            for m in z.infolist():
-                nm = m.filename.replace("\\", "/")
-                if nm.endswith("/") or ".." in nm:
-                    continue
-                if nm.startswith("models/") or nm.lower().endswith((".exe", ".dll")):
-                    out = tmp / nm
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    with z.open(m) as src, open(out, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-        shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
-        os.replace(tmp, UPSCALER_DIR)
-    finally:
-        zpath.unlink(missing_ok=True)
-    if progress:
-        progress(100.0)
-    exe = upscaler_exe()
-    if not exe:
-        raise RuntimeError("The upscaler could not be installed.")
-    return exe
-
-
-def remove_upscaler() -> None:
-    shutil.rmtree(UPSCALER_DIR, ignore_errors=True)
-
-
-def list_custom_models() -> list:
-    """Own models: [{'name', 'scale'}] (files: CUSTOM_MODELS_DIR/<name>.param + .bin)."""
-    try:
-        items = json.loads((CUSTOM_MODELS_DIR / "models.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    return [x for x in items if isinstance(x, dict) and (CUSTOM_MODELS_DIR / f"{x.get('name')}.param").is_file()
-            and (CUSTOM_MODELS_DIR / f"{x.get('name')}.bin").is_file()]
-
-
-def import_model(param_path, scale=None) -> dict:
-    """Copies an ncnn model (.param + .bin next to it) into the app. The scale is read from the name
-    (4x-UltraSharp, RealESRGAN_x2plus …) if not given, else 4."""
-    src = Path(param_path)
-    if src.suffix.lower() == ".bin":
-        src = src.with_suffix(".param")
-    binf = src.with_suffix(".bin")
-    if not src.is_file() or not binf.is_file():
-        raise RuntimeError("A model needs two files with the same name: NAME.param and NAME.bin.")
-    head = src.read_text(encoding="utf-8", errors="replace")[:200]
-    if not head.strip().startswith("7767517"):
-        raise RuntimeError("This is not an ncnn model (.param). Real-ESRGAN needs ncnn models, not .pth / .onnx.")
-    name = re.sub(r"[^\w.+-]+", "-", src.stem).strip("-") or "model"
-    if "realesr-animevideov3" in name or name in {m[1] for m in MODELS.values()}:
-        name += "-own"
-    if not scale:
-        m = re.search(r"(?i)(?:^|[^a-z0-9])(?:x([1-8])|([1-8])x)(?=[^a-z0-9]|plus|$)", src.stem)
-        scale = int(m.group(1) or m.group(2)) if m else 4
-    CUSTOM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, CUSTOM_MODELS_DIR / f"{name}.param")
-    shutil.copyfile(binf, CUSTOM_MODELS_DIR / f"{name}.bin")
-    items = [x for x in list_custom_models() if x["name"] != name] + [{"name": name, "scale": int(scale)}]
-    (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
-    return {"name": name, "scale": int(scale)}
-
-
-def remove_model(name) -> None:
-    for ext in (".param", ".bin"):
-        (CUSTOM_MODELS_DIR / f"{name}{ext}").unlink(missing_ok=True)
-    items = [x for x in list_custom_models() if x["name"] != name]
-    if CUSTOM_MODELS_DIR.is_dir():
-        (CUSTOM_MODELS_DIR / "models.json").write_text(json.dumps(items, indent=1), encoding="utf-8")
-
-
-def model_spec(label) -> dict:
-    """Menu entry -> {'kind': 'std'} or {'kind': 'esr', 'name', 'scale', 'dir'}."""
-    if label in MODELS:
-        kind, name, scale = MODELS[label]
-        return {"kind": kind, "name": name, "scale": scale, "dir": None, "label": label}
-    for x in list_custom_models():
-        if label == f"Own · {x['name']}":
-            return {"kind": "esr", "name": x["name"], "scale": x["scale"], "dir": str(CUSTOM_MODELS_DIR),
-                    "label": label}
-    return {"kind": "std", "label": label}
-
-
-def _esr_model(model, need):
-    """-> (model name, scale, folder). The anime video model can do 2×/3×/4×, the others their own scale."""
-    if isinstance(model, str):     # old style: "real" / "anime"
-        model = model_spec("AI · anime video" if model == "anime" else "AI · real footage")
-    name = model.get("name") or "realesrgan-x4plus"
-    if name == "realesr-animevideov3":
-        scale = 2 if need <= 2 else 3 if need <= 3 else 4
-    else:
-        scale = int(model.get("scale") or 4)
-    return name, scale, model.get("dir")
-
-
-def _run_esr(src_dir, out_dir, model, scale, on_tick=None, model_dir=None):
-    exe = upscaler_exe()
-    if not exe:
-        raise RuntimeError("The AI upscaler is not installed – Settings → AI upscaler → Install.")
-    cmd = [str(exe), "-i", str(src_dir), "-o", str(out_dir), "-n", model, "-s", str(scale), "-f", "png",
-           "-m", str(model_dir or exe.parent / "models")]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=str(exe.parent),
-                            creationflags=NO_WINDOW)
-    err: list[bytes] = []
-    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
-    reader.start()
-    while proc.poll() is None:
-        if on_tick:
-            on_tick()
-        time.sleep(0.4)
-    reader.join(5)
-    if proc.returncode != 0:
-        lines = [x for x in b"".join(err).decode("utf-8", "replace").splitlines()
-                 if x.strip() and not re.match(r"^\s*\d+(\.\d+)?%\s*$", x)]
-        tail = "\n".join(lines[-4:])
-        hint = (" Your graphics card needs Vulkan support (current NVIDIA / AMD / Intel driver)."
-                if re.search(r"vulkan|gpu|device", tail, re.I) or not tail else "")
-        raise RuntimeError(f"AI upscaling failed.{hint}" + (f"\n{tail}" if tail else ""))
-
-
-def ai_upscale_video(piece, crop, size, model, tmp, tag, *, ffmpeg, ffprobe, emit) -> Path:
-    """One piece -> frames (cropped) -> Real-ESRGAN in batches -> scaled to `size` and encoded again.
-    Batches keep the disk usage small (big PNG frames are deleted as soon as they are encoded)."""
-    inf = media_info(piece, ffprobe)
-    W, H = size
-    cw, ch = (crop[0], crop[1]) if crop else (inf["width"], inf["height"])
-    name, scale, mdir = _esr_model(model, max(W / cw, H / ch))
-    label_ = (model.get("label") if isinstance(model, dict) else "") or name
-    fin = Path(tmp) / f"esr_in_{tag}"
-    fin.mkdir(parents=True, exist_ok=True)
-    emit("status", "Preparing frames for AI upscaling …")
-    emit("progress", None)
-    vf = [f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
-    r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(piece),
-                        *(["-vf", ",".join(vf)] if vf else []), "-fps_mode", "passthrough",
-                        str(fin / "%06d.png")], capture_output=True, creationflags=NO_WINDOW)
-    if r.returncode != 0:
-        raise RuntimeError("FFmpeg error:\n" + r.stderr.decode("utf-8", "replace").strip()[-400:])
-    frames = sorted(fin.glob("*.png"))
-    total = len(frames)
-    if not total:
-        raise RuntimeError("No frames to upscale.")
-    per = max(1, (cw * scale) * (ch * scale) * 2)     # rough PNG size of one upscaled frame
-    batch = int(min(200, max(8, 1.5e9 // per)))
-    dst = Path(tmp) / f"esr_{tag}.mp4"
-    enc = subprocess.Popen(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", inf["rate"],
-         "-c:v", "png", "-i", "-", "-i", str(piece), "-map", "0:v:0", "-map", "1:a:0?",
-         "-vf", f"scale={W}:{H}:flags=lanczos,setsar=1", "-c:v", "libx264", "-preset", "medium",
-         "-crf", str(PIECE_CRF - 2), "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(dst)],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-    t0 = time.time()
-    done = 0
-    try:
-        for b0 in range(0, total, batch):
-            bin_ = Path(tmp) / f"esr_b_{tag}"
-            bout = Path(tmp) / f"esr_o_{tag}"
-            for d in (bin_, bout):
-                shutil.rmtree(d, ignore_errors=True)
-                d.mkdir()
-            chunk = frames[b0:b0 + batch]
-            for f in chunk:
-                os.replace(f, bin_ / f.name)
-
-            def tick(b0=b0, bout=bout):
-                k = b0 + len(list(bout.glob("*.png")))
-                el = time.time() - t0
-                eta = el / k * (total - k) if k else 0
-                emit("progress", k / total * 100)
-                emit("status", f"AI upscaling ({label_}) · "
-                               f"frame {k}/{total}" + (f" · {int(eta) // 60}:{int(eta) % 60:02d} left" if k else ""))
-            _run_esr(bin_, bout, name, scale, tick, mdir)
-            for f in chunk:
-                out = bout / f.name
-                if not out.is_file():
-                    raise RuntimeError(f"AI upscaling stopped at frame {done + 1}.")
-                enc.stdin.write(out.read_bytes())
-                out.unlink()
-                done += 1
-            shutil.rmtree(bin_, ignore_errors=True)
-            shutil.rmtree(bout, ignore_errors=True)
-        enc.stdin.close()
-        rc = enc.wait()
-        if rc != 0:
-            raise RuntimeError("FFmpeg error:\n" + enc.stderr.read().decode("utf-8", "replace").strip()[-400:])
-    except BaseException:
-        try:
-            enc.kill()
-        except OSError:
-            pass
-        raise
-    finally:
-        shutil.rmtree(fin, ignore_errors=True)
-    return dst
-
-
 # ----------------------------------------------------------------------------- still frame
 
 def _cookie_header(s) -> str:
@@ -776,16 +537,57 @@ def _cookie_header(s) -> str:
     return "; ".join(out)
 
 
+def _still_format(height, direct=False) -> dict:
+    """Best picture up to `height`, H.264 / MP4 first (quick to seek). direct: only plain files (no HLS / DASH
+    playlists) – the local proxy can only pass those on."""
+    lim = f"[height<={height}]" if height else ""
+    alts = [f"bv*{lim}", f"b{lim}"] + (["bv*", "b"] if lim else [])
+    if direct:
+        alts = [x + "[protocol^=http][protocol!*=dash]" for x in alts] + alts
+    fmt = "/".join(alts)
+    return {"format": fmt, "format_sort": [f"res:{height}" if height else "res", "fps", "vcodec:h264", "ext:mp4"]}
+
+
 def media_url(url, height=None) -> dict:
     """The best picture up to `height` as a stream item (address + the HTTP headers yt-dlp uses) – for single
-    frames. Prefers H.264 / MP4 (quick to seek)."""
-    fmt = f"bv*[height<={height}]/b[height<={height}]/bv*/b" if height else "bv*/b"
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "format": fmt,
-            "format_sort": [f"res:{height}" if height else "res", "fps", "vcodec:h264", "ext:mp4"],
-            "logger": _Silent(), **YDL_EXTRA}
+    frames."""
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+            "logger": _Silent(), **_still_format(height, direct=True), **YDL_EXTRA}
     info = ydl_extract(opts, url, download=False)
     f = (info.get("requested_formats") or [info])[0]
     return _stream_fmt(f, info)
+
+
+def section_file(url, height, seek, outdir, *, ffmpeg, emit) -> Path:
+    """Second way for single frames: yt-dlp cuts a short piece starting exactly at `seek` (the same way clips are
+    downloaded), stored lossless -> its first frame is the wanted one."""
+    opts = _base_opts(outdir, "", True, emit, name="frame_piece")
+    opts.update({**_still_format(height), "overwrites": True,
+                 "download_ranges": make_ranges(seek, seek + 0.5),
+                 "force_keyframes_at_cuts": True,
+                 "external_downloader_args": {"ffmpeg_o": ["-map", "0:v:0", "-c:v", "libx264", "-preset", "ultrafast",
+                                                            "-qp", "0", "-an", "-sn", "-f", "mp4"]}})
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    info = ydl_extract(opts, url, download=True)
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("No piece was downloaded.")
+    return Path(files[0])
+
+
+def picture_file(url, height, outdir, *, ffmpeg, emit) -> Path:
+    """Last way for single frames: yt-dlp downloads the whole picture-only file (no sound) – works wherever
+    downloads work."""
+    opts = _base_opts(outdir, "", False, emit, name="frame_source")
+    opts.update({**_still_format(height), "overwrites": True})
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    info = ydl_extract(opts, url, download=True)
+    files = collect_files(info)
+    if not files:
+        raise RuntimeError("The video could not be downloaded.")
+    return Path(files[0])
 
 
 def _png_size(path):
@@ -795,42 +597,65 @@ def _png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
-def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model=None, ffmpeg, ffprobe, emit,
-                 short=None, enlarge=None) -> Path:
-    """The frame shown in the preview at time t, in full quality, as PNG (with crop / size / AI upscaling)."""
+def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, ffmpeg, ffprobe, emit,
+                 short=None) -> Path:
+    """The frame shown in the preview at time t, in full quality, as PNG (with crop / size)."""
     import tempfile
     fps = fps if fps and fps > 1 else 30.0
     frame = int(t * fps + 1e-3)
     seek = max(0.0, frame / fps - 0.5 / fps)        # first frame at or after this = the frame on screen
-    proxy = None
     with tempfile.TemporaryDirectory(prefix="ytclip_still_") as td:
         raw = Path(td) / "frame.png"
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
-        if local:
-            inp = str(src)
-        else:
-            # YouTube refuses FFmpeg's own big requests (403) – the small local proxy fetches the needed parts
-            # in pieces with yt-dlp's headers, exactly like the preview player
-            emit("status", "Finding the full-quality video …")
-            proxy = StreamProxy()
-            inp = proxy.add(media_url(src, height))
-        emit("status", "Grabbing the frame …")
-        cmd += ["-ss", f"{seek:.4f}", "-i", inp, "-frames:v", "1", "-update", "1", str(raw)]
-        try:
+
+        def grab(inp, at=None):
+            at = seek if at is None else at
+            cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *(["-ss", f"{at:.4f}"] if at else []),
+                   "-i", str(inp), "-frames:v", "1", "-update", "1", str(raw)]
             r = subprocess.run(cmd, capture_output=True, timeout=300, creationflags=NO_WINDOW)
-        finally:
-            if proxy is not None:
+            ok = r.returncode == 0 and raw.is_file() and raw.stat().st_size > 0
+            return ok, r.stderr.decode("utf-8", "replace").strip()
+
+        def why(err, extra=""):
+            last = (err.splitlines()[-1] if err else "") or "no picture"
+            return f"{extra}; {last}" if extra else last
+
+        if local:
+            emit("status", "Grabbing the frame …")
+            ok, err = grab(src)
+        else:
+            # 1) YouTube refuses FFmpeg's own requests (403) – the small local proxy fetches only the needed parts
+            #    in pieces through yt-dlp's network code, like the preview player (fast, nothing downloaded)
+            emit("status", "Finding the full-quality video …")
+            item = media_url(src, height)
+            proxy = StreamProxy()
+            try:
+                emit("status", "Grabbing the frame …")
+                ok, err = grab(proxy.add(item))
+            finally:
                 proxy.close()
-        if r.returncode != 0 or not raw.is_file():
-            raise RuntimeError("Could not grab the frame:\n" + r.stderr.decode("utf-8", "replace").strip()[-300:])
+            if not ok:
+                # 2) a half-second piece, cut by yt-dlp like a clip download
+                emit("log", f"Reading the frame straight from YouTube didn't work ({why(err, proxy.last_error)}) – "
+                            "downloading a short piece instead.")
+                emit("status", "Downloading a short piece for the frame …")
+                emit("progress", None)
+                try:
+                    ok, err = grab(section_file(src, height, seek, Path(td) / "piece", ffmpeg=ffmpeg, emit=emit), 0)
+                except Exception as ex:  # noqa: BLE001
+                    ok, err = False, clean_error(ex)
+            if not ok:
+                # 3) the whole picture-only file (slow for long videos, but works wherever downloads work)
+                emit("log", f"The short piece didn't work either ({why(err)}) – downloading the picture-only file.")
+                emit("status", "Downloading the video (picture only) for the frame …")
+                emit("progress", None)
+                ok, err = grab(picture_file(src, height, Path(td) / "src", ffmpeg=ffmpeg, emit=emit))
+        if not ok:
+            raise RuntimeError("Could not grab the frame:\n" + err[-300:])
         W, H = _png_size(raw)
         crop = crop_rect(box, W, H, aspect) if aspect else None
         cw, ch = (crop[0], crop[1]) if crop else (W, H)
         if up is None and short:
             up = ("short", short)
-        if model is None and enlarge in ("real", "anime"):
-            model = model_spec("AI · anime video" if enlarge == "anime" else "AI · real footage")
-        model = model or {"kind": "std"}
         ow, oh = target_dims(cw, ch, up, aspect)
         img = raw
         if crop:
@@ -838,18 +663,6 @@ def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model
             subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-vf",
                             f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}", str(img)],
                            check=True, capture_output=True, creationflags=NO_WINDOW)
-        if model.get("kind") == "esr" and ow > cw * 1.05:
-            emit("status", "AI upscaling the frame …")
-            emit("progress", None)
-            din, dout = Path(td) / "esr_in", Path(td) / "esr_out"
-            din.mkdir()
-            dout.mkdir()
-            shutil.copy(img, din / "f.png")
-            name, scale, mdir = _esr_model(model, max(ow / cw, oh / ch))
-            _run_esr(din, dout, name, scale, model_dir=mdir)
-            img = dout / "f.png"
-            if not img.is_file():
-                raise RuntimeError("AI upscaling produced no image.")
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(img)]
         if _png_size(img) != (ow, oh):
             cmd += ["-vf", f"scale={ow}:{oh}:flags=lanczos"]
@@ -861,27 +674,44 @@ def export_still(src, t, fps, dst, *, local, height, aspect, box, up=None, model
 
 # ----------------------------------------------------------------------------- history of links
 
-def history_load() -> list:
+def history_dir() -> Path:
+    return Path(PATHS["history"])
+
+
+def _history_file(root=None) -> Path:
+    return Path(root or history_dir()) / "history.json"
+
+
+def _thumbs(root=None) -> Path:
+    return Path(root or history_dir()) / "thumbnails"
+
+
+def _is_thumb(p: Path) -> bool:
+    return p.suffix.lower() == ".jpg" and re.fullmatch(r"[0-9a-f]{16}", p.stem) is not None
+
+
+def history_load(root=None) -> list:
     try:
-        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        data = json.loads(_history_file(root).read_text(encoding="utf-8"))
         return [x for x in data if isinstance(x, dict) and x.get("url")]
     except (OSError, ValueError):
         return []
 
 
-def _history_save(items) -> None:
+def _history_save(items, root=None) -> None:
     try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = HISTORY_FILE.with_suffix(".tmp")
+        f = _history_file(root)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
         tmp.write_text(json.dumps(items[:HISTORY_MAX], indent=1, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, HISTORY_FILE)
+        os.replace(tmp, f)
     except OSError:
         pass
 
 
 def history_thumb_path(url) -> Path:
     import hashlib
-    return HISTORY_DIR / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
+    return _thumbs() / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ".jpg")
 
 
 def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
@@ -891,8 +721,8 @@ def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
              "site": {"Youtube": "YouTube", "YoutubeTab": "YouTube"}.get(info.get("site") or "", info.get("site") or "")}
     if thumb_jpg:
         try:
-            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
             p = history_thumb_path(url)
+            p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(thumb_jpg)
             entry["thumb"] = p.name
         except OSError:
@@ -900,7 +730,7 @@ def history_add(url, info, thumb_jpg: bytes | None = None) -> None:
     items.insert(0, entry)
     for old in items[HISTORY_MAX:]:
         if old.get("thumb"):
-            (HISTORY_DIR / old["thumb"]).unlink(missing_ok=True)
+            (_thumbs() / old["thumb"]).unlink(missing_ok=True)
     _history_save(items)
 
 
@@ -908,13 +738,81 @@ def history_remove(url) -> None:
     items = history_load()
     for x in items:
         if x.get("url") == url and x.get("thumb"):
-            (HISTORY_DIR / x["thumb"]).unlink(missing_ok=True)
+            (_thumbs() / x["thumb"]).unlink(missing_ok=True)
     _history_save([x for x in items if x.get("url") != url])
 
 
+def _clear_history_at(root) -> None:
+    """Removes only what the app wrote (history.json + its small pictures) – the folder may be the user's own."""
+    _history_file(root).unlink(missing_ok=True)
+    Path(_history_file(root).with_suffix(".tmp")).unlink(missing_ok=True)
+    th = _thumbs(root)
+    if th.is_dir():
+        for f in th.iterdir():
+            if _is_thumb(f):
+                f.unlink(missing_ok=True)
+        try:
+            th.rmdir()
+        except OSError:
+            pass
+
+
 def history_clear() -> None:
-    shutil.rmtree(HISTORY_DIR, ignore_errors=True)
-    HISTORY_FILE.unlink(missing_ok=True)
+    _clear_history_at(history_dir())
+
+
+def history_stats(root=None) -> dict:
+    items = history_load(root)
+    th = _thumbs(root)
+    size = sum(f.stat().st_size for f in th.iterdir() if _is_thumb(f)) if th.is_dir() else 0
+    f = _history_file(root)
+    return {"links": len(items), "bytes": size + (f.stat().st_size if f.is_file() else 0)}
+
+
+def history_migrate() -> None:
+    """Up to 2.7: APP_DIR/history.json + the pictures loose in APP_DIR/history -> everything in one folder."""
+    root = DEFAULT_PATHS["history"]
+    old = APP_DIR / "history.json"
+    try:
+        if old.is_file() and not _history_file(root).exists():
+            root.mkdir(parents=True, exist_ok=True)
+            os.replace(old, _history_file(root))
+        if root.is_dir():
+            for f in root.iterdir():
+                if _is_thumb(f):
+                    _thumbs(root).mkdir(exist_ok=True)
+                    os.replace(f, _thumbs(root) / f.name)
+    except OSError:
+        pass
+
+
+def history_move(new_root) -> int:
+    """Moves the history (links + pictures) into another folder; a history already there is merged.
+    -> number of links in the new folder."""
+    old_root, new_root = history_dir(), Path(new_root)
+    if old_root.resolve() == new_root.resolve():
+        return len(history_load())
+    new_root.mkdir(parents=True, exist_ok=True)
+    mine, there = history_load(old_root), history_load(new_root)
+    urls = {x["url"] for x in there}
+    merged = sorted(there + [x for x in mine if x["url"] not in urls], key=lambda x: -float(x.get("added") or 0))
+    for x in mine:
+        if x.get("thumb") and (_thumbs(old_root) / x["thumb"]).is_file():
+            dst = _thumbs(new_root) / x["thumb"]
+            if not dst.exists():
+                dst.parent.mkdir(exist_ok=True)
+                shutil.move(str(_thumbs(old_root) / x["thumb"]), str(dst))
+    _history_save(merged, new_root)
+    _clear_history_at(old_root)
+    PATHS["history"] = new_root
+    return len(merged[:HISTORY_MAX])
+
+
+def remove_old_upscaler() -> None:
+    """The AI upscaler is gone since 2.8 – its download (≈ 45 MB) and added models are removed once."""
+    for name in ("upscaler", "upscaler_new", "models"):
+        shutil.rmtree(APP_DIR / name, ignore_errors=True)
+    (APP_DIR / "upscaler_download.zip").unlink(missing_ok=True)
 
 
 # ---- YouTube login (own sign-in window -> cookies.txt for yt-dlp)
