@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.13"
+APP_VERSION = "2.9.14"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -3670,6 +3670,36 @@ def chromium_browsers() -> list:
     return out
 
 
+def all_browsers() -> list:
+    """Every installed browser the sign-in can use (Chrome-like + Firefox-like) -> [{'name', 'kind', 'exe'}]."""
+    out = list(chromium_browsers())
+    seen = {b["exe"].lower() for b in out}
+
+    def add(b):
+        if b and Path(b["exe"]).exists() and b["exe"].lower() not in seen:
+            seen.add(b["exe"].lower())
+            out.append(b)
+    d = default_browser()
+    if d and d["kind"] == "firefox":
+        add(d)
+    if WIN:
+        import winreg
+        for exe in ("firefox.exe", "librewolf.exe", "waterfox.exe", "floorp.exe", "zen.exe"):
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
+                        add(_browser_from_exe(winreg.QueryValueEx(k, "")[0]))
+                except OSError:
+                    continue
+    else:
+        for name in ("firefox", "librewolf"):
+            exe = shutil.which(name)
+            if exe:
+                b = _browser_from_exe(name)
+                add(b and {**b, "exe": exe})
+    return out
+
+
 def open_in_browser(b, url, profile=None) -> bool:
     """Opens url as a new tab in the browser that is already running (or starts it) – in the given profile, so
     Chrome's "Who's using Chrome?" picker doesn't come in between. url None: a new window (new tab page).
@@ -6802,6 +6832,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.lbl_login = label("", "muted")
         self.lbl_login.setWordWrap(True)
         right.addWidget(self.lbl_login)
+        br = QtWidgets.QHBoxLayout()
+        br.setSpacing(8)
+        br.addWidget(label("Browser", "field"))
+        self.cb_browser = QtWidgets.QComboBox()
+        self.cb_browser.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self.cb_browser, "Browser for the sign-in",
+            "Where “Sign in” opens. Chrome, Edge, Brave, Opera and Vivaldi: a tab with your accounts (the sign-in "
+            "extension is added once per browser). Firefox: an own window, sign in with e-mail and password.")
+        self._fill_browsers()
+        self.cb_browser.currentIndexChanged.connect(self._browser_picked)
+        br.addWidget(self.cb_browser, 1)
+        right.addLayout(br)
         lr = QtWidgets.QHBoxLayout()
         lr.setSpacing(6)
         self.btn_login = QtWidgets.QPushButton()
@@ -6866,7 +6908,10 @@ class SettingsDialog(QtWidgets.QDialog):
         b = self.main._login_browser()
         bname = b["name"] if b else "Chrome"
         self.btn_cookies.setEnabled(not pending and si is None)
-        self.btn_login2.setVisible(not st["signed_in"] and not pending and si is None)
+        self.cb_browser.setEnabled(not pending and si is None)
+        ch = self.main._chosen_browser()
+        own_window = ch is not None and ch["kind"] != "chromium"       # Firefox & co
+        self.btn_login2.setVisible(not st["signed_in"] and not pending and si is None and not own_window)
         self.btn_cookies.setVisible(not st["signed_in"] or pending or si is not None)
         self.lbl_login_tip.setVisible(not st["signed_in"])
         if si is not None:
@@ -6908,6 +6953,13 @@ class SettingsDialog(QtWidgets.QDialog):
         else:
             self.lbl_login.setText("Not signed in. Only needed for age-restricted or members-only videos – "
                                    "your login stays on this PC.")
+            if own_window:
+                self.btn_login.setText(f"Sign in with {ch['name']} …")
+                self.btn_login.setEnabled(True)
+                tip(self.btn_login, "Sign in", f"Opens {ch['name']} in an own, empty window – sign in there with "
+                                               "e-mail and password. The window and its data are deleted right after "
+                                               "the sign-in; when the login expires, sign in again.")
+                return
             self.btn_login.setText(f"Sign in with {bname} …")
             self.btn_login.setEnabled(b is not None)
             wb = self.main._window_browser()
@@ -7035,6 +7087,32 @@ class SettingsDialog(QtWidgets.QDialog):
         else:
             st.setText(f"version {ver} · " + ("up to date ✓" if rel else "no update check (offline?)"))
             act.setVisible(False)
+
+    def _fill_browsers(self):
+        self.cb_browser.blockSignals(True)
+        self.cb_browser.clear()
+        d = default_browser()
+        self.cb_browser.addItem(f"Default browser ({d['name']})" if d else "Default browser", "")
+        names = [b["name"] for b in all_browsers()]
+        for b in all_browsers():
+            dup = names.count(b["name"]) > 1
+            self.cb_browser.addItem(b["name"] + (f"  –  {Path(b['exe']).parent.name}" if dup else "")
+                                    + ("" if b["kind"] == "chromium" else "  (own window)"), b["exe"])
+        cur = self.main.cfg.get("login_browser") or ""
+        i = self.cb_browser.findData(cur)
+        self.cb_browser.setCurrentIndex(i if i >= 0 else 0)
+        self.cb_browser.blockSignals(False)
+
+    def _browser_picked(self, _i=None):
+        exe = self.cb_browser.currentData() or ""
+        if exe == (self.main.cfg.get("login_browser") or ""):
+            return
+        self.main.cfg["login_browser"] = exe
+        self.main.cfg.pop("chrome_profile", None)       # profiles belong to a browser
+        save_cfg(self.main.cfg)
+        b = self.main._window_browser()
+        self.main._on_log(f"Sign-in browser: {b['name'] if b else 'default browser'}")
+        self.show_login_state()
 
     def _ai_install(self, key):
         if key in self.ai_busy:
@@ -8900,8 +8978,19 @@ class MainWindow(QtWidgets.QMainWindow):
         """An extension from 2.9.2 asks (without the key) and the new one doesn't: Chrome has to reload it."""
         return time.time() - self.login_bridge.old_ext < 120 and not self._ext_connected(120)
 
+    def _chosen_browser(self):
+        """The browser picked in Settings → YouTube login (None: the default one)."""
+        exe = self.cfg.get("login_browser")
+        if not exe:
+            return None
+        return next((b for b in all_browsers() if b["exe"].lower() == str(exe).lower()), None)
+
     def _login_browser(self):
-        """The Chrome-like browser for the sign-in: the default one if it is one, else an installed one."""
+        """The Chrome-like browser for the sign-in with the extension: the picked one, else the default one if it is
+        one, else an installed one."""
+        ch = self._chosen_browser()
+        if ch is not None:
+            return ch if ch["kind"] == "chromium" else None
         bs = chromium_browsers()
         return bs[0] if bs else None
 
@@ -8911,13 +9000,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.login_bridge.port is None:
             return self._on_error("The sign-in can't start: the ports 47815–47817 on this PC are taken by another "
                                   "program. Restart the PC or use Settings → YouTube login → Load cookies.txt.")
+        ch = self._chosen_browser()
+        if ch is not None and ch["kind"] != "chromium":     # Firefox & co: no extension -> own window
+            return self._sign_in_window()
         b = self._login_browser()
         if b is None:
             return self._on_error("The sign-in needs Chrome, Edge, Brave, Opera or Vivaldi – none was found. You can "
                                   "use Settings → YouTube login → Load cookies.txt instead.")
         self._pending_signin = time.time()
         self._login_state_changed()
-        if self._ext_connected():
+        ext_b = self.cfg.get("ext_browser")
+        if self._ext_connected() and (not ext_b or ext_b.lower() == b["exe"].lower()):
             self._open_login_tab(b)
             return
         dlg = ExtSetupDialog(self, b)
@@ -8970,6 +9063,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._login_warned = False
             if first:
                 b = self._login_browser()
+                if b:
+                    self.cfg["ext_browser"] = b["exe"]          # the extension lives in this browser
                 with_ext = [p["dir"] for p in browser_profiles(b) if p["ext"]]
                 if len(with_ext) == 1:
                     self.cfg["chrome_profile"] = with_ext[0]     # the sign-in opens there from now on
@@ -9048,6 +9143,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._login_state_changed()
 
     def _window_browser(self):
+        ch = self._chosen_browser()
+        if ch is not None:
+            return ch
         if not hasattr(self, "_default_browser"):
             self._default_browser = default_browser()
         return self._default_browser

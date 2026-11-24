@@ -1,8 +1,8 @@
 {
-  "version": "2.9.13",
+  "version": "2.9.14",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "5be75c199d837938007ed57d428e0943f7687745feaf1e521027809dd9fc8564",
-  "notes": "Live YouTube button also before a preview is loaded (next to 'Load small copy'); no Subtitles tab for audio",
+  "sha256": "9ddb0212dd7b09cd712573e757991588a51d6ebb17882543571d0610407e35e5",
+  "notes": "Settings \u2192 YouTube login: pick the browser for the sign-in (Chrome, Edge, Brave, Opera, Vivaldi, Firefox \u2026)",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
@@ -11,5 +11,5 @@
   "extra": [
     "icon.ico"
   ],
-  "setup_sha256": "68d725e9485f5e5743f765db23cbed28e4fede813e74f5f47ec01b5d01cbd040"
+  "setup_sha256": "21dee6b68425b6005e7b188ef6fb2e33b80e4ade8c5a9a64bc3c55e725027a3c"
 }

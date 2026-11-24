@@ -1685,6 +1685,36 @@ def chromium_browsers() -> list:
     return out
 
 
+def all_browsers() -> list:
+    """Every installed browser the sign-in can use (Chrome-like + Firefox-like) -> [{'name', 'kind', 'exe'}]."""
+    out = list(chromium_browsers())
+    seen = {b["exe"].lower() for b in out}
+
+    def add(b):
+        if b and Path(b["exe"]).exists() and b["exe"].lower() not in seen:
+            seen.add(b["exe"].lower())
+            out.append(b)
+    d = default_browser()
+    if d and d["kind"] == "firefox":
+        add(d)
+    if WIN:
+        import winreg
+        for exe in ("firefox.exe", "librewolf.exe", "waterfox.exe", "floorp.exe", "zen.exe"):
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
+                        add(_browser_from_exe(winreg.QueryValueEx(k, "")[0]))
+                except OSError:
+                    continue
+    else:
+        for name in ("firefox", "librewolf"):
+            exe = shutil.which(name)
+            if exe:
+                b = _browser_from_exe(name)
+                add(b and {**b, "exe": exe})
+    return out
+
+
 def open_in_browser(b, url, profile=None) -> bool:
     """Opens url as a new tab in the browser that is already running (or starts it) – in the given profile, so
     Chrome's "Who's using Chrome?" picker doesn't come in between. url None: a new window (new tab page).
