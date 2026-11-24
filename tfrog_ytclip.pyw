@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 APP = "YouTube Downloader"
-APP_VERSION = "2.9.14"
+APP_VERSION = "2.9.15"
 UPDATE_REPO = "TFrogVFX/youtube-downloader"   # "Update app" loads the newest version from this GitHub repo
 UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 APP_ID = "tfrog.YouTubeDownloader"  # Windows AppUserModelID (own taskbar entry)
@@ -3590,13 +3590,24 @@ def clear_account() -> None:
 
 _CHROMIUM = {"chrome": "Chrome", "msedge": "Edge", "brave": "Brave", "vivaldi": "Vivaldi", "opera": "Opera",
              "launcher": "Opera", "chromium": "Chromium", "google-chrome": "Chrome", "google-chrome-stable": "Chrome",
-             "microsoft-edge": "Edge", "brave-browser": "Brave", "thorium": "Thorium", "yandex": "Yandex"}
+             "microsoft-edge": "Edge", "brave-browser": "Brave", "thorium": "Thorium", "yandex": "Yandex",
+             "browser": "Yandex", "arc": "Arc", "supermium": "Supermium", "opera_gx": "Opera GX", "operagx": "Opera GX",
+             "opera-stable": "Opera", "opera-beta": "Opera", "cent": "Cent", "iron": "Iron"}
 _FIREFOX = {"firefox": "Firefox", "librewolf": "LibreWolf", "waterfox": "Waterfox", "floorp": "Floorp",
             "zen": "Zen"}
 
 
 def _browser_from_exe(exe) -> dict | None:
     stem = Path(exe).stem.lower()
+    low = str(exe).lower().replace("\\", "/")
+    if stem in ("launcher", "opera") or "opera" in stem:
+        if "opera" not in low and stem == "launcher":
+            return None                         # some other program's launcher.exe
+        name = "Opera GX" if "opera gx" in low or "opera_gx" in low or "operagx" in low else \
+            "Opera Air" if "opera air" in low else "Opera"
+        return {"name": name, "kind": "chromium", "exe": str(exe)}
+    if stem == "browser" and "yandex" not in low:
+        return None
     if stem in _CHROMIUM:
         return {"name": _CHROMIUM[stem], "kind": "chromium", "exe": str(exe)}
     if stem in _FIREFOX:
@@ -3643,6 +3654,55 @@ def _has_login(rows) -> bool:
     return "LOGIN_INFO" in names and bool(names & {"SAPISID", "__Secure-3PAPISID", "SID", "__Secure-1PSID"})
 
 
+_APP_PATHS = ("chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.exe", "launcher.exe", "firefox.exe",
+              "librewolf.exe", "waterfox.exe", "floorp.exe", "zen.exe", "browser.exe", "thorium.exe", "arc.exe")
+
+
+def _windows_browsers() -> list:
+    """Every browser Windows knows: the "Start menu internet" list (what Settings → Default apps shows), App Paths
+    and the usual per-user folders (Opera / Opera GX install there)."""
+    import winreg
+    out = []
+
+    def add(exe):
+        exe = str(exe or "").strip().strip('"')
+        if exe and Path(exe).exists():
+            b = _browser_from_exe(exe)
+            if b:
+                out.append(b)
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for base in (r"Software\Clients\StartMenuInternet", r"Software\WOW6432Node\Clients\StartMenuInternet"):
+            try:
+                with winreg.OpenKey(hive, base) as k:
+                    i = 0
+                    while True:
+                        try:
+                            sub = winreg.EnumKey(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        try:
+                            with winreg.OpenKey(k, rf"{sub}\shell\open\command") as c:
+                                cmd = winreg.QueryValueEx(c, "")[0]
+                        except OSError:
+                            continue
+                        add(cmd.split('"')[1] if cmd.startswith('"') else cmd.split(" ")[0])
+            except OSError:
+                continue
+        for exe in _APP_PATHS:
+            try:
+                with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
+                    add(winreg.QueryValueEx(k, "")[0])
+            except OSError:
+                continue
+    la = Path(os.environ.get("LOCALAPPDATA", ""))
+    for rel in (r"Programs\Opera\launcher.exe", r"Programs\Opera GX\launcher.exe", r"Programs\Opera Air\launcher.exe",
+                r"Vivaldi\Application\vivaldi.exe", r"Yandex\YandexBrowser\Application\browser.exe",
+                r"Thorium\Application\thorium.exe", r"Programs\Arc\Arc.exe"):
+        add(la / rel)
+    return out
+
+
 def chromium_browsers() -> list:
     """Installed Chrome-like browsers (the sign-in extension runs in these) -> [{'name', 'kind', 'exe'}]."""
     out, seen = [], set()
@@ -3653,16 +3713,10 @@ def chromium_browsers() -> list:
             out.append(b)
     add(default_browser())
     if WIN:
-        import winreg
-        for exe in ("chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.exe"):
-            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-                try:
-                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
-                        add(_browser_from_exe(winreg.QueryValueEx(k, "")[0]))
-                except OSError:
-                    continue
+        for b in _windows_browsers():
+            add(b)
     else:
-        for name in ("google-chrome", "chromium", "microsoft-edge", "brave-browser"):
+        for name in ("google-chrome", "chromium", "microsoft-edge", "brave-browser", "opera", "vivaldi"):
             exe = shutil.which(name)
             if exe:
                 b = _browser_from_exe(name)
@@ -3683,14 +3737,8 @@ def all_browsers() -> list:
     if d and d["kind"] == "firefox":
         add(d)
     if WIN:
-        import winreg
-        for exe in ("firefox.exe", "librewolf.exe", "waterfox.exe", "floorp.exe", "zen.exe"):
-            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-                try:
-                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
-                        add(_browser_from_exe(winreg.QueryValueEx(k, "")[0]))
-                except OSError:
-                    continue
+        for b in _windows_browsers():
+            add(b)
     else:
         for name in ("firefox", "librewolf"):
             exe = shutil.which(name)
@@ -3895,8 +3943,11 @@ def write_extension() -> Path:
 
 
 def extensions_page(b) -> str:
-    return {"Edge": "edge://extensions/", "Brave": "brave://extensions/", "Opera": "opera://extensions",
-            "Vivaldi": "vivaldi://extensions/"}.get((b or {}).get("name"), "chrome://extensions/")
+    name = (b or {}).get("name") or ""
+    if name.startswith("Opera"):
+        return "opera://extensions"
+    return {"Edge": "edge://extensions/", "Brave": "brave://extensions/", "Vivaldi": "vivaldi://extensions/",
+            "Yandex": "browser://extensions/"}.get(name, "chrome://extensions/")
 
 
 def cookie_rows(cookies) -> list:

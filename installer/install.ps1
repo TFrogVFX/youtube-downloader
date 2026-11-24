@@ -8,7 +8,7 @@ param([switch]$Exe, [switch]$Gui, [ValidateSet('all', 'check', 'python', 'ffmpeg
 
 $ErrorActionPreference = 'Continue'
 $AppName = 'YouTube Downloader'
-$AppVersion = '2.9.14'
+$AppVersion = '2.9.15'
 $OldNames = @('tfrog YT Clip')
 $AppDir  = Join-Path $env:LOCALAPPDATA 'tfrog_ytclip'
 $Script  = 'tfrog_ytclip.pyw'

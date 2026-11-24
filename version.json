@@ -1,8 +1,8 @@
 {
-  "version": "2.9.14",
+  "version": "2.9.15",
   "file": "tfrog_ytclip.pyw",
-  "sha256": "9ddb0212dd7b09cd712573e757991588a51d6ebb17882543571d0610407e35e5",
-  "notes": "Settings \u2192 YouTube login: pick the browser for the sign-in (Chrome, Edge, Brave, Opera, Vivaldi, Firefox \u2026)",
+  "sha256": "5a1cf020a4c54317bcb6098c6d78e0293cfaaa96312d1ada701b742a92046078",
+  "notes": "Sign-in browser list: Opera, Opera GX and every browser Windows knows (Start menu internet list + usual install folders)",
   "pip": [
     "yt-dlp[default]",
     "PySide6-Essentials",
@@ -11,5 +11,5 @@
   "extra": [
     "icon.ico"
   ],
-  "setup_sha256": "21dee6b68425b6005e7b188ef6fb2e33b80e4ade8c5a9a64bc3c55e725027a3c"
+  "setup_sha256": "fe1bbf59721a837d639240fa90741e3e351f84035655c3caa85ba235ec997c0d"
 }
